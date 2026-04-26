@@ -162,10 +162,20 @@ function padBleed(img, dpi, bleedMm) {
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
 function buildJobs(deck, opts) {
+  // Archidekt defines deck inclusion via the primary (first) category of each
+  // card. The deck-level `categories` array tells us which categories have
+  // includedInDeck=false (e.g. Maybeboard, Sideboard, Cut). A card tagged
+  // ["Land", "Maybeboard"] is still in the deck because primary = "Land".
+  const excludedPrimary = new Set(
+    (deck.categories || [])
+      .filter((c) => c.includedInDeck === false)
+      .map((c) => c.name)
+  );
   const jobs = [];
   for (const entry of deck.cards || []) {
     const cats = entry.categories || [];
-    if (opts.skipSide && (cats.includes("Sideboard") || cats.includes("Maybeboard"))) continue;
+    const primary = cats[0] || null;
+    if (opts.skipSide && primary && excludedPrimary.has(primary)) continue;
     const card = entry.card || {};
     const oracle = card.oracleCard || {};
     const customUrl =
