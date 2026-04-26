@@ -93,6 +93,55 @@ input[type="text"]:focus, input[type="number"]:focus {
 .opts-grid label { color: var(--muted); }
 .opts-grid input[type="number"] { margin-top: 4px; }
 
+.back-source {
+  margin-top: 4px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+.back-source-label {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.back-source-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.back-source-row input[type="text"] { margin: 0; }
+.upload-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  cursor: pointer;
+}
+.upload-label input[type="file"] {
+  position: absolute;
+  width: 1px; height: 1px; opacity: 0;
+  pointer-events: none;
+}
+.upload-button {
+  padding: 10px 12px;
+  background: #0e1530;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.upload-button:hover { border-color: var(--accent); }
+.back-file-name {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+@media (max-width: 520px) {
+  .back-source-row { grid-template-columns: 1fr; }
+}
+
 button.primary {
   margin-top: 14px;
   width: 100%;
