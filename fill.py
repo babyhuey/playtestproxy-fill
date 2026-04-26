@@ -14,6 +14,7 @@ Pipeline:
      out/fronts/ and out/backs/ with matching slot numbers, ready for
      tcgplaytest's Sequential Backs uploader.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,7 +27,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import requests
 from PIL import Image, ImageOps  # noqa: F401  (ImageOps reserved for future use)
@@ -45,10 +45,10 @@ UA = {"User-Agent": "playtestproxy-fill/0.1 (+local tool)"}
 class CardJob:
     name: str
     qty: int
-    scryfall_uid: Optional[str]
-    custom_image_url: Optional[str]
-    set_code: Optional[str]
-    collector_number: Optional[str]
+    scryfall_uid: str | None
+    custom_image_url: str | None
+    set_code: str | None
+    collector_number: str | None
 
 
 def slug(name: str) -> str:
@@ -72,9 +72,7 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
     # Turtles" but also tagged "Maybeboard" is in the deck; only cards whose
     # primary category is excluded are skipped.
     excluded_primary = {
-        c["name"]
-        for c in (data.get("categories") or [])
-        if c.get("includedInDeck") is False
+        c["name"] for c in (data.get("categories") or []) if c.get("includedInDeck") is False
     }
     jobs: list[CardJob] = []
     for entry in data.get("cards", []):
@@ -128,7 +126,7 @@ def _scryfall_wait() -> None:
         _scryfall_last_call = time.monotonic()
 
 
-def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, Optional[str]]:
+def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str | None]:
     """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
     this carries both faces so the caller can pair them per-slot."""
     _scryfall_wait()
@@ -150,7 +148,7 @@ def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, Optio
 
 def resolve_urls(
     job: CardJob, override_dir: Path, session: requests.Session
-) -> tuple[str, Optional[str]]:
+) -> tuple[str, str | None]:
     """Return (front_url, back_url_or_None). Override files take precedence.
     Override convention: `<slug>.png` for the front, `<slug>.back.png` for the
     back face (DFC). If the override-back doesn't exist but a Scryfall back
@@ -199,17 +197,13 @@ def pad_bleed(img: Image.Image, dpi: int, bleed_mm: float) -> Image.Image:
 
     # Edges — sample a 1px row/col, but offset by `inset` along the edge so
     # we never grab the rounded-corner whitespace.
-    top = art.crop((inset, inset, art_w - inset, inset + 1)).resize(
-        (art_w - 2 * inset, bleed_px)
-    )
+    top = art.crop((inset, inset, art_w - inset, inset + 1)).resize((art_w - 2 * inset, bleed_px))
     canvas.paste(top, (bleed_px + inset, 0))
     bot = art.crop((inset, art_h - inset - 1, art_w - inset, art_h - inset)).resize(
         (art_w - 2 * inset, bleed_px)
     )
     canvas.paste(bot, (bleed_px + inset, canvas_h - bleed_px))
-    left = art.crop((inset, inset, inset + 1, art_h - inset)).resize(
-        (bleed_px, art_h - 2 * inset)
-    )
+    left = art.crop((inset, inset, inset + 1, art_h - inset)).resize((bleed_px, art_h - 2 * inset))
     canvas.paste(left, (0, bleed_px + inset))
     right = art.crop((art_w - inset - 1, inset, art_w - inset, art_h - inset)).resize(
         (bleed_px, art_h - 2 * inset)
@@ -225,12 +219,14 @@ def pad_bleed(img: Image.Image, dpi: int, bleed_mm: float) -> Image.Image:
         (0, 0, inset, inset),
         (canvas_w - bleed_px - inset, 0, art_w - inset - cs, inset),
         (0, canvas_h - bleed_px - inset, inset, art_h - inset - cs),
-        (canvas_w - bleed_px - inset, canvas_h - bleed_px - inset,
-         art_w - inset - cs, art_h - inset - cs),
+        (
+            canvas_w - bleed_px - inset,
+            canvas_h - bleed_px - inset,
+            art_w - inset - cs,
+            art_h - inset - cs,
+        ),
     ]:
-        block = art.crop((sx, sy, sx + cs, sy + cs)).resize(
-            (bleed_px + inset, bleed_px + inset)
-        )
+        block = art.crop((sx, sy, sx + cs, sy + cs)).resize((bleed_px + inset, bleed_px + inset))
         canvas.paste(block, (cx, cy))
     return canvas
 
@@ -257,19 +253,27 @@ def main() -> int:
     ap.add_argument("-o", "--out", default="out", help="Output directory")
     ap.add_argument("--overrides", default="overrides", help="Override images dir")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--no-bleed", action="store_true",
-                    help="Skip bleed padding (use TCGPlaytest XML path instead)")
+    ap.add_argument(
+        "--no-bleed",
+        action="store_true",
+        help="Skip bleed padding (use TCGPlaytest XML path instead)",
+    )
     ap.add_argument("--bleed-mm", type=float, default=BLEED_MM)
     ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--pair-backs", action="store_true",
-                    help="Emit out/backs/ with paired back images for each slot "
-                         "(DFC face-2 for transforms, default playtest back for "
-                         "everything else). Suitable for tcgplaytest's "
-                         "Sequential Backs feature.")
-    ap.add_argument("--default-back",
-                    help="Back image for non-DFC cards when --pair-backs is set. "
-                         "Defaults to assets/default_back.png (a meme back) "
-                         "shipped with the repo.")
+    ap.add_argument(
+        "--pair-backs",
+        action="store_true",
+        help="Emit out/backs/ with paired back images for each slot "
+        "(DFC face-2 for transforms, default playtest back for "
+        "everything else). Suitable for tcgplaytest's "
+        "Sequential Backs feature.",
+    )
+    ap.add_argument(
+        "--default-back",
+        help="Back image for non-DFC cards when --pair-backs is set. "
+        "Defaults to assets/default_back.png (a meme back) "
+        "shipped with the repo.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -283,22 +287,22 @@ def main() -> int:
     overrides.mkdir(exist_ok=True)
 
     # Resolve default back image if pairing.
-    default_back_img: Optional[Image.Image] = None
+    default_back_img: Image.Image | None = None
     if args.pair_backs:
         if args.default_back:
             default_back_img = Image.open(args.default_back).convert("RGB")
             if not args.no_bleed:
                 default_back_img = pad_bleed(default_back_img, args.dpi, args.bleed_mm)
         else:
-            default_back_img = make_default_back(
-                args.dpi, 0 if args.no_bleed else args.bleed_mm
-            )
+            default_back_img = make_default_back(args.dpi, 0 if args.no_bleed else args.bleed_mm)
 
     print(f"Fetching deck {args.deck_id}...")
     jobs = fetch_deck(args.deck_id)
     total_cards = sum(j.qty for j in jobs)
-    print(f"  {len(jobs)} unique cards, {total_cards} total copies"
-          + (" (with paired backs)" if args.pair_backs else ""))
+    print(
+        f"  {len(jobs)} unique cards, {total_cards} total copies"
+        + (" (with paired backs)" if args.pair_backs else "")
+    )
 
     session = requests.Session()
     session.headers.update(UA)
@@ -351,7 +355,7 @@ def main() -> int:
             continue
         slug_name = slug(job.name)
         files: list[str] = []
-        for copy in range(1, job.qty + 1):
+        for _copy in range(1, job.qty + 1):
             slot += 1
             base = f"{slot:03d}_{slug_name}"
             front_path = fronts_dir / f"{base}.png"
@@ -362,26 +366,30 @@ def main() -> int:
                 back_path = backs_dir / f"{base}.png"
                 this_back.save(back_path, "PNG", optimize=True)
                 files.append(str(back_path.relative_to(out_dir)))
-        manifest.append({
-            "name": job.name,
-            "qty": job.qty,
-            "has_back": back_img is not None,
-            "front_source": front_url,
-            "back_source": back_url,
-            "files": files,
-        })
+        manifest.append(
+            {
+                "name": job.name,
+                "qty": job.qty,
+                "has_back": back_img is not None,
+                "front_source": front_url,
+                "back_source": back_url,
+                "files": files,
+            }
+        )
         note = " (DFC, paired back)" if back_img is not None else ""
         print(f"  ok   {tag}{note}")
 
-    (out_dir / "manifest.json").write_text(json.dumps(
-        {
-            "deck_id": args.deck_id,
-            "paired_backs": args.pair_backs,
-            "cards": manifest,
-            "failures": failures,
-        },
-        indent=2,
-    ))
+    (out_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "deck_id": args.deck_id,
+                "paired_backs": args.pair_backs,
+                "cards": manifest,
+                "failures": failures,
+            },
+            indent=2,
+        )
+    )
     if args.pair_backs:
         print(f"\nDone. {slot} card slots written to {fronts_dir}/ and {backs_dir}/")
     else:
