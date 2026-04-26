@@ -7,3 +7,7 @@ browser_profile/
 overrides/*.png
 overrides/*.jpg
 !overrides/.gitkeep
+
+# Local dev artifacts not meant for the repo
+cards.xml
+assets_default_back.png
