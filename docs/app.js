@@ -67,11 +67,14 @@ function setProgress(done, total) {
 }
 
 async function withRetry(fn, attempts = 3, baseDelay = 400) {
+  // 400ms base, exponential — defending against transient corsproxy /
+  // Scryfall hiccups, not against logic bugs. 4xx is final and bypasses retry.
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
       return await fn();
     } catch (e) {
+      if (e instanceof FatalFetchError) throw e;
       lastErr = e;
       if (i === attempts - 1) break;
       await new Promise((r) => setTimeout(r, baseDelay * 2 ** i));
@@ -80,27 +83,52 @@ async function withRetry(fn, attempts = 3, baseDelay = 400) {
   throw lastErr;
 }
 
+class FatalFetchError extends Error {}  // 4xx — don't retry through proxy
+
+async function parseJsonStrict(r) {
+  // corsproxy.io can return 200 with an HTML rate-limit page; r.json() then
+  // throws "Unexpected token <" which is useless. Validate content-type.
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("json")) {
+    const sample = (await r.text()).slice(0, 120);
+    throw new Error(`expected JSON, got ${ct || "no content-type"} — "${sample}"`);
+  }
+  return r.json();
+}
+
 async function fetchJson(url) {
   return withRetry(async () => {
-    // Try direct first; if it CORS-fails, try the proxy.
+    let direct;
     try {
-      const r = await fetch(url, { headers: { Accept: "application/json" } });
-      if (r.ok) return r.json();
-      if (r.status >= 400 && r.status < 500) {
-        throw new Error(`${r.status} ${r.statusText}`);
-      }
-      throw new Error(`status ${r.status}`);
+      direct = await fetch(url, { headers: { Accept: "application/json" } });
     } catch {
-      const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" } });
-      if (!r.ok) throw new Error(`proxy ${r.status} ${r.statusText}`);
-      return r.json();
+      // Network/CORS failure — direct doesn't even produce a response.
+      direct = null;
     }
+    if (direct) {
+      if (direct.ok) return parseJsonStrict(direct);
+      if (direct.status >= 400 && direct.status < 500) {
+        throw new FatalFetchError(`${direct.status} ${direct.statusText}`);
+      }
+      // 5xx → fall through to proxy as a transient retry.
+    }
+    const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" } });
+    if (!r.ok) {
+      // The proxy faithfully forwards upstream status, so 4xx here is also
+      // authoritative (deck not found / private). Surface it as fatal so
+      // the user sees a clean message instead of "proxy 404".
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`proxy ${r.status} ${r.statusText}`);
+    }
+    return parseJsonStrict(r);
   });
 }
 
 async function fetchBlob(url) {
   return withRetry(async () => {
-    // Scryfall CDN has CORS *, so we can fetch images directly.
+    // Scryfall CDN returns CORS * (verified 2026-04), so direct fetch works.
     const r = await fetch(url);
     if (!r.ok) throw new Error(`image ${r.status} ${r.statusText}`);
     return r.blob();
@@ -124,6 +152,9 @@ function blobToImage(blob) {
 }
 
 function padBleed(img, dpi, bleedMm) {
+  // Edge-replicate bleed, sampled inset from the visual edge so transparent
+  // rounded corners (which flatten to white on canvas) don't leak into the
+  // bleed. Mirrors fill.py:pad_bleed.
   const artW = Math.round(CARD_W_IN * dpi);
   const artH = Math.round(CARD_H_IN * dpi);
   const bleed = Math.round((bleedMm / MM_PER_IN) * dpi);
@@ -134,26 +165,43 @@ function padBleed(img, dpi, bleedMm) {
   canvas.width = W;
   canvas.height = H;
   const ctx = canvas.getContext("2d");
-  // Center art.
   ctx.drawImage(img, bleed, bleed, artW, artH);
 
   if (bleed > 0) {
-    // Top edge
-    ctx.drawImage(canvas, bleed, bleed, artW, 1, bleed, 0, artW, bleed);
-    // Bottom edge
-    ctx.drawImage(canvas, bleed, bleed + artH - 1, artW, 1, bleed, bleed + artH, artW, bleed);
-    // Left edge
-    ctx.drawImage(canvas, bleed, bleed, 1, artH, 0, bleed, bleed, artH);
-    // Right edge
-    ctx.drawImage(canvas, bleed + artW - 1, bleed, 1, artH, bleed + artW, bleed, bleed, artH);
-    // Corners (sample the corner pixel of the art)
-    ctx.drawImage(canvas, bleed, bleed, 1, 1, 0, 0, bleed, bleed);
-    ctx.drawImage(canvas, bleed + artW - 1, bleed, 1, 1, bleed + artW, 0, bleed, bleed);
-    ctx.drawImage(canvas, bleed, bleed + artH - 1, 1, 1, 0, bleed + artH, bleed, bleed);
-    ctx.drawImage(
-      canvas, bleed + artW - 1, bleed + artH - 1, 1, 1,
-      bleed + artW, bleed + artH, bleed, bleed
-    );
+    // ~2.5% inset is past MTG's rounded corner radius and inside the border.
+    const inset = Math.max(8, Math.round(0.025 * Math.min(artW, artH)));
+
+    // Edges — sample 1px slice offset by `inset` along the long axis so we
+    // don't pull from the rounded-corner whitespace.
+    ctx.drawImage(canvas,
+      bleed + inset, bleed + inset, artW - 2 * inset, 1,
+      bleed + inset, 0, artW - 2 * inset, bleed);
+    ctx.drawImage(canvas,
+      bleed + inset, bleed + artH - inset - 1, artW - 2 * inset, 1,
+      bleed + inset, bleed + artH, artW - 2 * inset, bleed);
+    ctx.drawImage(canvas,
+      bleed + inset, bleed + inset, 1, artH - 2 * inset,
+      0, bleed + inset, bleed, artH - 2 * inset);
+    ctx.drawImage(canvas,
+      bleed + artW - inset - 1, bleed + inset, 1, artH - 2 * inset,
+      bleed + artW, bleed + inset, bleed, artH - 2 * inset);
+
+    // Corner blocks: sample an inset×inset patch from just inside the art's
+    // corner (after the rounded corner, in the visible border) and stretch
+    // to fill the corner+inset destination square. Source x/y is in canvas
+    // coords, so it must be offset by `bleed` to land inside the art region.
+    const cs = inset;
+    const sz = bleed + inset;
+    const corners = [
+      [0, 0,                                 bleed + inset,            bleed + inset],
+      [bleed + artW - inset, 0,              bleed + artW - inset - cs, bleed + inset],
+      [0, bleed + artH - inset,              bleed + inset,            bleed + artH - inset - cs],
+      [bleed + artW - inset, bleed + artH - inset,
+                                             bleed + artW - inset - cs, bleed + artH - inset - cs],
+    ];
+    for (const [dx, dy, sx, sy] of corners) {
+      ctx.drawImage(canvas, sx, sy, cs, cs, dx, dy, sz, sz);
+    }
   }
 
   return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
@@ -163,21 +211,25 @@ const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath",
 
 async function loadCustomBackBlob() {
   // Order of preference: uploaded file → pasted URL → bundled default.
+  // A failure on the URL path is surfaced loudly to the user — silent
+  // fallback to the bundled meme back is the wrong default.
   const fileEl = $("opt-back-file");
   if (fileEl.files && fileEl.files[0]) return fileEl.files[0];
   const urlEl = $("opt-back-url");
   const url = (urlEl.value || "").trim();
   if (url) {
-    // Direct fetch first; if CORS blocks, fall back to corsproxy.
     try {
       const r = await fetch(url);
       if (r.ok) return r.blob();
-      throw new Error(`status ${r.status}`);
+      // Most random hosts won't allow direct CORS; try the proxy before failing.
     } catch {
-      const r = await fetch(CORS_PROXY(url));
-      if (!r.ok) throw new Error(`Custom-back fetch failed: ${r.status}`);
-      return r.blob();
+      // Fall through to proxy attempt.
     }
+    const proxied = await fetch(CORS_PROXY(url));
+    if (!proxied.ok) {
+      throw new Error(`Custom-back URL failed (${proxied.status}). Check the URL or upload the image instead.`);
+    }
+    return proxied.blob();
   }
   const r = await fetch("assets/default_back.png");
   if (!r.ok) throw new Error("default_back.png missing from /assets");
@@ -272,11 +324,13 @@ async function processJob(state, job, opts, zip, gallery) {
       zip.file(`backs/${base}.png`, useBack);
       written.push(`backs/${base}.png`);
     } else {
-      // No pairing: fronts only at root, with face suffix for DFC backs as separate cards.
+      // No pairing mode: emit fronts only at root. DFC backs become their
+      // own separate cards (next to their fronts, suffixed _back) so the
+      // user prints both faces as physical cards.
       zip.file(`${base}.png`, frontPadded);
       written.push(`${base}.png`);
       if (back) {
-        const backBase = `${slotStr}_${slug((job.dfcBackName || job.name) + "_back")}`;
+        const backBase = `${slotStr}_${slug(job.name + "_back")}`;
         zip.file(`${backBase}.png`, backPadded);
         written.push(`${backBase}.png`);
       }
@@ -322,7 +376,16 @@ async function run() {
   try {
     deck = await fetchJson(ARCHIDEKT(id));
   } catch (e) {
-    setStatus(`Failed to fetch deck: ${e.message}`, "error");
+    // 4xx is authoritative — the deck doesn't exist or is private. Don't
+    // bury the user under generic "fetch failed" wording.
+    if (e instanceof FatalFetchError) {
+      setStatus(
+        `Archidekt returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`,
+        "error"
+      );
+    } else {
+      setStatus(`Failed to fetch deck: ${e.message}`, "error");
+    }
     els.go.disabled = false;
     return;
   }

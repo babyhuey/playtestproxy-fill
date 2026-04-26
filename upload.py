@@ -29,6 +29,20 @@ from playwright.async_api import async_playwright, Page
 DESIGN_URL = "https://www.tcgplaytest.com/?view=design"
 EXTS = {".png", ".jpg", ".jpeg"}
 
+# UI strings hardcoded by tcgplaytest. Hoisted here so a future site update
+# only needs one fix. The two bleed-modal titles cover the front and back
+# steps respectively (the back step capitalises differently).
+BLEED_MODAL_TITLES = (
+    "Do Your Images Have Print Bleed",
+    "Does Your Card Back Have Print Bleed",
+)
+BLEED_OPTION_PRE_BLED = "3mm Bleed added"  # closest to fill.py's 2mm output
+PROCESSING_TEXTS = ("Applying Bleed Settings", "Processing card")  # plural varies
+DISMISS_LABELS = ("Got It", "Got it!", "OK")
+NEXT_BACK_BUTTON = re.compile(r"Next.*Customize Back", re.I)
+SAVE_DRAFT_BUTTON = re.compile(r"Save Draft", re.I)
+COOKIE_ACCEPT = "Accept"
+
 
 def collect_files(d: Path) -> list[Path]:
     files = sorted(p for p in d.iterdir() if p.suffix.lower() in EXTS and p.is_file())
@@ -40,21 +54,24 @@ def collect_files(d: Path) -> list[Path]:
 async def get_card_count(page: Page) -> int | None:
     """Read the 'N Cards' indicator from the page text. None if missing."""
     text = await page.evaluate("() => document.body.innerText")
-    m = re.search(r"(\d+)\s+Cards?\s*•", text)
+    m = re.search(r"(\d+)\s+Cards?\b", text)
     return int(m.group(1)) if m else None
 
 
+async def _processing_visible(page: Page) -> bool:
+    js = (
+        "(texts) => texts.some(t => document.body.innerText.includes(t))"
+    )
+    return await page.evaluate(js, list(PROCESSING_TEXTS))
+
+
 async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 180) -> int:
-    """Poll until the 'Applying Bleed Settings...' overlay is gone AND the count
-    reaches `expected` (or stops climbing for several seconds)."""
+    """Poll until the processing overlay is gone AND the count reaches
+    `expected` (or stops climbing for several seconds)."""
     last = -1
     stable_for = 0
     for i in range(timeout_s):
-        # Detect the processing overlay
-        processing = await page.evaluate(
-            "() => document.body.innerText.includes('Applying Bleed Settings')"
-            " || document.body.innerText.includes('Processing cards')"
-        )
+        processing = await _processing_visible(page)
         count = await get_card_count(page)
         if count == expected and not processing:
             return count
@@ -72,9 +89,8 @@ async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 1
 async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
     """On the Customize Back step, push back images into the Sequential Backs
     file input. Returns True on success."""
-    # Navigate to the back step.
     try:
-        await page.get_by_role("button", name=re.compile("Next.*Customize Back", re.I)).click(timeout=5000)
+        await page.get_by_role("button", name=NEXT_BACK_BUTTON).click(timeout=5000)
     except Exception as e:
         print(f"  could not click Next→Customize Back: {e}")
         return False
@@ -105,32 +121,27 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
 
     print(f"  uploading {len(back_files)} sequential backs...")
     await target.set_input_files([str(p) for p in back_files])
-    # Wait for Bleed-Settings processing. The back step has its own variant
-    # of the modal: "Does Your Card Back Have Print Bleed?".
+    # Wait for whichever bleed-modal variant appears (front/back step text
+    # differs).
     for _ in range(60):
         visible = await page.evaluate(
-            "() => Array.from(document.querySelectorAll('*'))"
-            ".some(e => /(Do Your Images Have Print Bleed|Does Your Card Back Have Print Bleed)/"
-            ".test(e.innerText || ''))"
+            "(titles) => titles.some(t => document.body.innerText.includes(t))",
+            list(BLEED_MODAL_TITLES),
         )
         if visible:
             try:
-                await page.get_by_text("3mm Bleed added", exact=False).first.click(timeout=3000)
-                print("  selected: 3mm Bleed added (backs)")
+                await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(timeout=3000)
+                print(f"  selected: {BLEED_OPTION_PRE_BLED} (backs)")
                 break
             except Exception:
                 pass
         await asyncio.sleep(1)
     for _ in range(180):
-        still = await page.evaluate(
-            "() => document.body.innerText.includes('Applying Bleed Settings')"
-            " || document.body.innerText.includes('Processing card')"
-        )
-        if not still:
+        if not await _processing_visible(page):
             break
         await asyncio.sleep(1)
     # Dismiss any "Got It" / confirmation modal.
-    for label in ("Got It", "OK", "Got it!"):
+    for label in DISMISS_LABELS:
         try:
             await page.get_by_role("button", name=label).click(timeout=2000)
             break
@@ -149,8 +160,13 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
     files = collect_files(fronts_dir)
     back_files = collect_files(backs_dir) if backs_dir else []
     if backs_dir and len(back_files) != len(files):
-        print(f"WARN: front count ({len(files)}) != back count ({len(back_files)}); "
-              "Sequential Backs requires matching counts.")
+        # Sequential Backs assigns image N → slot N. A count mismatch means
+        # every card after the first divergence gets the wrong back; far
+        # better to abort than silently misalign the order.
+        raise SystemExit(
+            f"front count ({len(files)}) != back count ({len(back_files)}) — "
+            f"Sequential Backs needs matching counts. Re-run fill.py --pair-backs."
+        )
     print(f"Found {len(files)} fronts in {fronts_dir}"
           + (f" + {len(back_files)} backs in {backs_dir}" if backs_dir else ""))
 
@@ -170,9 +186,8 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
 
         await page.goto(DESIGN_URL, wait_until="networkidle")
 
-        # Cookie banner.
         try:
-            await page.get_by_role("button", name="Accept").click(timeout=3000)
+            await page.get_by_role("button", name=COOKIE_ACCEPT).click(timeout=3000)
         except Exception:
             pass
 
@@ -197,10 +212,9 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
         else:
             chunks = [files]
 
-        # The "Do Your Images Have Print Bleed?" modal can appear at any point
-        # after set_input_files (sometimes immediately, sometimes after the
-        # canvas2d processing finishes). Run a watcher in parallel that clicks
-        # "3mm Bleed added" whenever the modal becomes visible.
+        # The bleed modal can appear at any point after set_input_files
+        # (sometimes immediately, sometimes after canvas2d processing
+        # finishes). Watch in parallel and click as soon as it shows.
         clicked_modal = {"done": False}
 
         async def modal_watcher() -> None:
@@ -209,16 +223,18 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
                     return
                 try:
                     visible = await page.evaluate(
-                        "() => Array.from(document.querySelectorAll('*'))"
-                        ".some(e => (e.innerText || '').includes('Do Your Images Have Print Bleed'))"
+                        "(titles) => titles.some(t => document.body.innerText.includes(t))",
+                        list(BLEED_MODAL_TITLES),
                     )
                 except Exception:
+                    # page.evaluate can raise if the page is mid-navigation
+                    # — treat as "not visible yet" and retry.
                     visible = False
                 if visible:
                     try:
-                        await page.get_by_text("3mm Bleed added", exact=False).first.click(timeout=3000)
+                        await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(timeout=3000)
                         clicked_modal["done"] = True
-                        print("  selected: 3mm Bleed added (images already have bleed)")
+                        print(f"  selected: {BLEED_OPTION_PRE_BLED} (images already have bleed)")
                         return
                     except Exception as e:
                         print(f"  modal click failed: {e}")
@@ -234,29 +250,25 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
             count = await wait_for_processing_done(page, running_total)
             print(f"  count: {count}/{running_total}")
 
-        # Give the watcher a few more seconds in case the modal appears late.
-        for _ in range(15):
+        # The modal sometimes renders late (slow networks, lazy-rendered
+        # toast). Give the watcher a generous post-upload window.
+        for _ in range(45):
             if clicked_modal["done"]:
                 break
             await asyncio.sleep(1)
         watcher_task.cancel()
         try:
             await watcher_task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
 
-        # After the modal click, the site runs "Applying Bleed Settings..."
+        # After the modal click the site runs the bleed-trim pipeline and
         # then shows a "Bleed Trimmed Successfully" confirmation.
         for _ in range(120):
-            still = await page.evaluate(
-                "() => document.body.innerText.includes('Applying Bleed Settings')"
-                " || document.body.innerText.includes('Processing cards')"
-            )
-            if not still:
+            if not await _processing_visible(page):
                 break
             await asyncio.sleep(1)
-        # Dismiss the "Bleed Trimmed Successfully" modal if present.
-        for label in ("Got It", "OK", "Got it!"):
+        for label in DISMISS_LABELS:
             try:
                 await page.get_by_role("button", name=label).click(timeout=2000)
                 print(f"  dismissed: {label}")
@@ -264,17 +276,20 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
             except Exception:
                 pass
 
-        # Final verification.
         final = await get_card_count(page) or 0
         print(f"\nFINAL: {final}/{len(files)} fronts registered")
-
-        # If we have paired backs, drive the Sequential Backs step.
-        if backs_dir and back_files and final == len(files):
+        if final != len(files):
+            # Failing loud here is better than uploading misaligned backs
+            # against a partially-loaded front deck.
+            print(f"WARNING: only {final}/{len(files)} cards registered. "
+                  "Sequential Backs and Save Draft skipped — investigate the "
+                  "upload before continuing.")
+        elif backs_dir and back_files:
             await upload_sequential_backs(page, back_files)
 
-        if save_draft:
+        if save_draft and final == len(files):
             try:
-                await page.get_by_role("button", name=re.compile("Save Draft", re.I)).click(timeout=5000)
+                await page.get_by_role("button", name=SAVE_DRAFT_BUTTON).click(timeout=5000)
                 await page.wait_for_timeout(2000)
                 print("Save Draft clicked.")
             except Exception as e:

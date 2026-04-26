@@ -7,8 +7,12 @@ Pipeline:
   1. Fetch deck JSON from Archidekt.
   2. For each card: resolve image URL (override > custom > Scryfall).
   3. Download.
-  4. Pad with 3mm bleed (edge-extend) so TCGPlaytest's bleed expectation is satisfied.
-  5. Write one image per copy: out/<NN>_<safename>.png
+  4. Pad with 2mm bleed (edge-replicated, sampled inset from rounded corners).
+     The upload step picks tcgplaytest's "3mm Bleed added" option — the closest
+     match — and the site silently trims the 1mm difference.
+  5. Write one image per copy. With --pair-backs the output splits into
+     out/fronts/ and out/backs/ with matching slot numbers, ready for
+     tcgplaytest's Sequential Backs uploader.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import io
 import json
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -24,7 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps  # noqa: F401  (ImageOps reserved for future use)
 
 ARCHIDEKT_DECK = "https://archidekt.com/api/decks/{}/"
 SCRYFALL_CARD = "https://api.scryfall.com/cards/{}"
@@ -53,6 +58,12 @@ def slug(name: str) -> str:
 
 def fetch_deck(deck_id: str) -> list[CardJob]:
     r = requests.get(ARCHIDEKT_DECK.format(deck_id), headers=UA, timeout=30)
+    if 400 <= r.status_code < 500:
+        # Authoritative — deck doesn't exist or is private.
+        raise SystemExit(
+            f"Archidekt returned {r.status_code} for deck {deck_id}. "
+            "Check that the deck exists and is public."
+        )
     r.raise_for_status()
     data = r.json()
     # Archidekt determines whether a card counts toward the deck via its
@@ -75,6 +86,8 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
         oracle = card.get("oracleCard") or {}
         # Custom card detection: Archidekt customs typically have `customImageUrl` or
         # similar; fall back to detecting missing uid.
+        # Archidekt's custom-card image lives under one of these keys
+        # depending on which client created the deck.
         custom_url = (
             card.get("customImageUrl")
             or entry.get("customImageUrl")
@@ -97,11 +110,28 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
 
 SINGLE_PIECE_LAYOUTS = {"split", "flip", "adventure", "aftermath", "fuse"}
 
+# Scryfall asks for 50–100ms between API requests. With ThreadPoolExecutor a
+# per-thread sleep would let `workers × 12.5/s` slip through, well over their
+# 10/s ceiling, and trigger 429s that look like flaky failures. This lock
+# serialises the rate-limit gate across all workers.
+_scryfall_lock = threading.Lock()
+_scryfall_last_call = 0.0
+_SCRYFALL_MIN_INTERVAL = 0.10
+
+
+def _scryfall_wait() -> None:
+    global _scryfall_last_call
+    with _scryfall_lock:
+        delta = time.monotonic() - _scryfall_last_call
+        if delta < _SCRYFALL_MIN_INTERVAL:
+            time.sleep(_SCRYFALL_MIN_INTERVAL - delta)
+        _scryfall_last_call = time.monotonic()
+
 
 def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, Optional[str]]:
     """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
     this carries both faces so the caller can pair them per-slot."""
-    time.sleep(0.08)
+    _scryfall_wait()
     r = session.get(SCRYFALL_CARD.format(uid), timeout=30)
     r.raise_for_status()
     d = r.json()
@@ -147,41 +177,61 @@ def fetch_image(url: str, session: requests.Session) -> Image.Image:
 
 
 def pad_bleed(img: Image.Image, dpi: int, bleed_mm: float) -> Image.Image:
-    """Resize art to 2.48"x3.46" then extend each edge by bleed_mm using
-    edge replication (no background color, just stretch the outer pixels).
-    Final canvas: (2.48 + 2*bleed)" x (3.46 + 2*bleed)".
-    """
+    """Resize art to 2.48"x3.46" and extend each edge by bleed_mm using
+    edge replication. We sample slightly inset from the visible edge — this
+    avoids the rounded-corner artifact on Scryfall PNGs (transparent corners
+    flatten to white in RGB, so sampling row 0 or column 0 picks up white
+    ends; sampling a few pixels in lands inside the actual card border).
+    Final canvas: (2.48 + 2*bleed)" x (3.46 + 2*bleed)"."""
     art_w = int(round(CARD_W_IN * dpi))
     art_h = int(round(CARD_H_IN * dpi))
     bleed_px = int(round((bleed_mm / MM_PER_IN) * dpi))
     art = img.resize((art_w, art_h), Image.LANCZOS)
-    canvas_w = art_w + 2 * bleed_px
-    canvas_h = art_h + 2 * bleed_px
-    # Edge replicate via PIL: paste art, then fill borders by stretching edges.
-    canvas = Image.new("RGB", (canvas_w, canvas_h))
+    canvas = Image.new("RGB", (art_w + 2 * bleed_px, art_h + 2 * bleed_px))
     canvas.paste(art, (bleed_px, bleed_px))
-    if bleed_px > 0:
-        # top
-        top = art.crop((0, 0, art_w, 1)).resize((art_w, bleed_px))
-        canvas.paste(top, (bleed_px, 0))
-        # bottom
-        bot = art.crop((0, art_h - 1, art_w, art_h)).resize((art_w, bleed_px))
-        canvas.paste(bot, (bleed_px, canvas_h - bleed_px))
-        # left
-        left = art.crop((0, 0, 1, art_h)).resize((bleed_px, art_h))
-        canvas.paste(left, (0, bleed_px))
-        # right
-        right = art.crop((art_w - 1, 0, art_w, art_h)).resize((bleed_px, art_h))
-        canvas.paste(right, (canvas_w - bleed_px, bleed_px))
-        # corners — pick the corner pixel
-        for cx, cy, sx, sy in [
-            (0, 0, 0, 0),
-            (canvas_w - bleed_px, 0, art_w - 1, 0),
-            (0, canvas_h - bleed_px, 0, art_h - 1),
-            (canvas_w - bleed_px, canvas_h - bleed_px, art_w - 1, art_h - 1),
-        ]:
-            corner = art.crop((sx, sy, sx + 1, sy + 1)).resize((bleed_px, bleed_px))
-            canvas.paste(corner, (cx, cy))
+    if bleed_px <= 0:
+        return canvas
+
+    # Inset = 2.5% of the shorter dim. ~20px at 300dpi — comfortably past
+    # MTG's rounded-corner radius (~3% of card width) and into the border.
+    inset = max(8, int(0.025 * min(art_w, art_h)))
+    canvas_w, canvas_h = canvas.size
+
+    # Edges — sample a 1px row/col, but offset by `inset` along the edge so
+    # we never grab the rounded-corner whitespace.
+    top = art.crop((inset, inset, art_w - inset, inset + 1)).resize(
+        (art_w - 2 * inset, bleed_px)
+    )
+    canvas.paste(top, (bleed_px + inset, 0))
+    bot = art.crop((inset, art_h - inset - 1, art_w - inset, art_h - inset)).resize(
+        (art_w - 2 * inset, bleed_px)
+    )
+    canvas.paste(bot, (bleed_px + inset, canvas_h - bleed_px))
+    left = art.crop((inset, inset, inset + 1, art_h - inset)).resize(
+        (bleed_px, art_h - 2 * inset)
+    )
+    canvas.paste(left, (0, bleed_px + inset))
+    right = art.crop((art_w - inset - 1, inset, art_w - inset, art_h - inset)).resize(
+        (bleed_px, art_h - 2 * inset)
+    )
+    canvas.paste(right, (canvas_w - bleed_px, bleed_px + inset))
+
+    # Corner regions: bleed_px + inset on each side. Sample an `inset × inset`
+    # block from inside the border so the color matches the actual border tone
+    # (black on most MTG cards, white on old-frame cards, gold on Secret Lairs,
+    # etc.) rather than the transparent-corner-becomes-white artifact.
+    cs = inset  # corner sample size
+    for cx, cy, sx, sy in [
+        (0, 0, inset, inset),
+        (canvas_w - bleed_px - inset, 0, art_w - inset - cs, inset),
+        (0, canvas_h - bleed_px - inset, inset, art_h - inset - cs),
+        (canvas_w - bleed_px - inset, canvas_h - bleed_px - inset,
+         art_w - inset - cs, art_h - inset - cs),
+    ]:
+        block = art.crop((sx, sy, sx + cs, sy + cs)).resize(
+            (bleed_px + inset, bleed_px + inset)
+        )
+        canvas.paste(block, (cx, cy))
     return canvas
 
 
@@ -217,8 +267,9 @@ def main() -> int:
                          "everything else). Suitable for tcgplaytest's "
                          "Sequential Backs feature.")
     ap.add_argument("--default-back",
-                    help="PNG to use as the back for non-DFC cards when --pair-backs "
-                         "is set. If omitted, a generated 'PLAYTEST' placeholder is used.")
+                    help="Back image for non-DFC cards when --pair-backs is set. "
+                         "Defaults to assets/default_back.png (a meme back) "
+                         "shipped with the repo.")
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -255,6 +306,16 @@ def main() -> int:
     manifest: list[dict] = []
     failures: list[tuple[str, str]] = []
 
+    # Catch only the IO/network/decoder exceptions that genuinely correspond
+    # to a per-card failure. Programming errors (TypeError, AttributeError,
+    # etc.) propagate so they aren't silently logged as "card failed".
+    network_errors = (
+        requests.RequestException,
+        OSError,
+        RuntimeError,
+        Image.UnidentifiedImageError,
+    )
+
     def process(idx: int, job: CardJob):
         try:
             front_url, back_url = resolve_urls(job, overrides, session)
@@ -267,7 +328,7 @@ def main() -> int:
                 if not args.no_bleed:
                     back_img = pad_bleed(back_img, args.dpi, args.bleed_mm)
             return idx, job, front_img, back_img, front_url, back_url, None
-        except Exception as e:
+        except network_errors as e:
             return idx, job, None, None, None, None, f"ERROR: {e}"
 
     # Each card-copy gets its own slot number; slot indices match between
