@@ -55,10 +55,21 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
     r = requests.get(ARCHIDEKT_DECK.format(deck_id), headers=UA, timeout=30)
     r.raise_for_status()
     data = r.json()
+    # Archidekt determines whether a card counts toward the deck via its
+    # *primary* (first) category. The deck-level `categories` array maps
+    # category name → includedInDeck. A card with primary "Teenage Mutant Ninja
+    # Turtles" but also tagged "Maybeboard" is in the deck; only cards whose
+    # primary category is excluded are skipped.
+    excluded_primary = {
+        c["name"]
+        for c in (data.get("categories") or [])
+        if c.get("includedInDeck") is False
+    }
     jobs: list[CardJob] = []
     for entry in data.get("cards", []):
         cats = entry.get("categories") or []
-        if "Maybeboard" in cats or "Sideboard" in cats:
+        primary = cats[0] if cats else None
+        if primary in excluded_primary:
             continue
         card = entry.get("card") or {}
         oracle = card.get("oracleCard") or {}
