@@ -185,37 +185,20 @@ def pad_bleed(img: Image.Image, dpi: int, bleed_mm: float) -> Image.Image:
     return canvas
 
 
-def make_default_back(dpi: int, bleed_mm: float) -> Image.Image:
-    """Generate a neutral playtest back: dark navy with a centered "PLAYTEST"
-    word so it's clearly distinguishable on the table and contains no
-    copyrighted markings."""
-    from PIL import ImageDraw, ImageFont
+DEFAULT_BACK_FILE = Path(__file__).parent / "assets" / "default_back.png"
 
-    art_w = int(round(CARD_W_IN * dpi))
-    art_h = int(round(CARD_H_IN * dpi))
-    bleed_px = int(round((bleed_mm / MM_PER_IN) * dpi))
-    W, H = art_w + 2 * bleed_px, art_h + 2 * bleed_px
-    img = Image.new("RGB", (W, H), (20, 28, 56))
-    draw = ImageDraw.Draw(img)
-    inner_margin = int(0.12 * art_w)
-    draw.rectangle(
-        (bleed_px + inner_margin, bleed_px + inner_margin,
-         W - bleed_px - inner_margin, H - bleed_px - inner_margin),
-        outline=(120, 140, 200), width=4,
-    )
-    text = "PLAYTEST"
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            size=int(0.09 * art_h),
+
+def make_default_back(dpi: int, bleed_mm: float) -> Image.Image:
+    """Default back image: the bundled `assets/default_back.png` (the
+    "You Wouldn't Proxy a Magic Card" meme back). Resized + bleed-padded
+    to match the rest of the deck. Override via --default-back."""
+    if not DEFAULT_BACK_FILE.exists():
+        raise FileNotFoundError(
+            f"Bundled default back missing: {DEFAULT_BACK_FILE}. "
+            "Pass --default-back to provide your own."
         )
-    except (OSError, IOError):
-        font = ImageFont.load_default()
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw = bbox[2] - bbox[0]
-    th = bbox[3] - bbox[1]
-    draw.text(((W - tw) // 2, (H - th) // 2), text, fill=(180, 200, 240), font=font)
-    return img
+    img = Image.open(DEFAULT_BACK_FILE).convert("RGB")
+    return pad_bleed(img, dpi, bleed_mm)
 
 
 def main() -> int:

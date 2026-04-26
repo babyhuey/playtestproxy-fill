@@ -24,7 +24,18 @@
         <label>Bleed (mm) <input id="opt-bleed" type="number" step="0.5" min="0" max="6" value="2"></label>
         <label>DPI <input id="opt-dpi" type="number" min="150" max="600" step="50" value="300"></label>
         <label class="check"><input id="opt-skip-side" type="checkbox" checked> Skip Sideboard / Maybeboard</label>
-        <label class="check"><input id="opt-pair-backs" type="checkbox" checked> Pair backs (DFC face-2 + placeholder for others)</label>
+        <label class="check"><input id="opt-pair-backs" type="checkbox" checked> Pair backs (DFC face-2 + default for others)</label>
+      </div>
+      <div class="back-source">
+        <div class="back-source-label">Default back for non-DFC cards (optional override)</div>
+        <div class="back-source-row">
+          <label class="upload-label">
+            <input id="opt-back-file" type="file" accept="image/*">
+            <span class="upload-button">Upload image</span>
+            <span id="back-file-name" class="back-file-name">— bundled "You Wouldn't Proxy a Magic Card" —</span>
+          </label>
+          <input id="opt-back-url" type="text" placeholder="…or paste an image URL">
+        </div>
       </div>
     </details>
 

@@ -161,29 +161,35 @@ function padBleed(img, dpi, bleedMm) {
 
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
-function makeDefaultBackBlob(dpi, bleedMm) {
-  // Same as fill.py:make_default_back — navy canvas, thin frame, "PLAYTEST"
-  // word centered. No copyrighted markings.
-  const artW = Math.round(CARD_W_IN * dpi);
-  const artH = Math.round(CARD_H_IN * dpi);
-  const bleed = Math.round((bleedMm / MM_PER_IN) * dpi);
-  const W = artW + 2 * bleed;
-  const H = artH + 2 * bleed;
-  const c = document.createElement("canvas");
-  c.width = W; c.height = H;
-  const ctx = c.getContext("2d");
-  ctx.fillStyle = "rgb(20,28,56)";
-  ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = "rgb(120,140,200)";
-  ctx.lineWidth = 4;
-  const m = Math.round(0.12 * artW);
-  ctx.strokeRect(bleed + m, bleed + m, W - 2 * bleed - 2 * m, H - 2 * bleed - 2 * m);
-  ctx.fillStyle = "rgb(180,200,240)";
-  ctx.font = `bold ${Math.round(0.09 * artH)}px sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("PLAYTEST", W / 2, H / 2);
-  return new Promise((res) => c.toBlob(res, "image/png"));
+async function loadCustomBackBlob() {
+  // Order of preference: uploaded file → pasted URL → bundled default.
+  const fileEl = $("opt-back-file");
+  if (fileEl.files && fileEl.files[0]) return fileEl.files[0];
+  const urlEl = $("opt-back-url");
+  const url = (urlEl.value || "").trim();
+  if (url) {
+    // Direct fetch first; if CORS blocks, fall back to corsproxy.
+    try {
+      const r = await fetch(url);
+      if (r.ok) return r.blob();
+      throw new Error(`status ${r.status}`);
+    } catch {
+      const r = await fetch(CORS_PROXY(url));
+      if (!r.ok) throw new Error(`Custom-back fetch failed: ${r.status}`);
+      return r.blob();
+    }
+  }
+  const r = await fetch("assets/default_back.png");
+  if (!r.ok) throw new Error("default_back.png missing from /assets");
+  return r.blob();
+}
+
+async function makeDefaultBackBlob(dpi, bleedMm) {
+  // Resize the source to card art dims and pad with bleed so it lines up
+  // with the rest of the deck.
+  const blob = await loadCustomBackBlob();
+  const img = await blobToImage(blob);
+  return padBleed(img, dpi, bleedMm);
 }
 
 function buildJobs(deck, opts) {
@@ -411,6 +417,13 @@ els.go.addEventListener("click", () => {
 
 els.input.addEventListener("keydown", (e) => {
   if (e.key === "Enter") els.go.click();
+});
+
+$("opt-back-file").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  $("back-file-name").textContent = f
+    ? f.name
+    : '— bundled "You Wouldn\'t Proxy a Magic Card" —';
 });
 
 els.download.addEventListener("click", () => {
