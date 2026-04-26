@@ -3,17 +3,19 @@
 Usage:
     python upload.py <images_dir> [--headless] [--user-data ./browser_profile]
 
-Opens a Chromium window, navigates to the design page, dismisses cookies,
-and pushes every PNG/JPG in <images_dir> into the front uploader.
+If <images_dir> contains `fronts/` and `backs/` subfolders (output of
+`fill.py --pair-backs`), the script also uploads the backs via the
+Sequential Backs feature on Step 2 — pairing each back with the card
+in the same slot. Otherwise it just uploads fronts.
 
 Sequence (learned by inspecting the live site):
-  1. set_input_files on the hidden image input.
-  2. The site shows a "Do Your Images Have Print Bleed?" modal — click
-     "Standard Card (no bleed added)" because fill.py already bakes in 3mm.
-  3. The site then runs "Applying Bleed Settings..." — wait until it's gone.
-  4. Verify the card count text reflects the number of files uploaded.
-  5. Leave the browser open so the user can finish customize back / preview /
-     checkout. With --user-data the draft persists across runs.
+  1. Set files on the image input on Step 1 (Customize Front).
+  2. Click "3mm Bleed added" on the bleed-prompt modal (matches our padded
+     output from fill.py:pad_bleed).
+  3. Wait for "Applying Bleed Settings..." to clear; dismiss "Got It" toast.
+  4. If backs/ exists: click Next, find the Sequential Backs file input,
+     set files, wait for processing.
+  5. Save Draft. Leave browser open with --user-data so it persists.
 """
 from __future__ import annotations
 
@@ -67,10 +69,90 @@ async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 1
     return last if last >= 0 else 0
 
 
+async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
+    """On the Customize Back step, push back images into the Sequential Backs
+    file input. Returns True on success."""
+    # Navigate to the back step.
+    try:
+        await page.get_by_role("button", name=re.compile("Next.*Customize Back", re.I)).click(timeout=5000)
+    except Exception as e:
+        print(f"  could not click Next→Customize Back: {e}")
+        return False
+    await page.wait_for_timeout(2500)
+
+    # The back step has multiple file inputs. We want the "Sequential Backs"
+    # one specifically — labelled with "Upload Sequential Backs" / "(N cards)".
+    inputs = await page.query_selector_all('input[type="file"]')
+    target = None
+    for el in inputs:
+        accept = (await el.get_attribute("accept")) or ""
+        multiple = await el.get_attribute("multiple")
+        if "image" in accept.lower() and multiple is not None:
+            target = el  # the multi-image input is Sequential Backs
+            break
+    if target is None:
+        # fall back: the second image input on this step
+        image_inputs = []
+        for el in inputs:
+            a = (await el.get_attribute("accept")) or ""
+            if "image" in a.lower():
+                image_inputs.append(el)
+        if len(image_inputs) >= 2:
+            target = image_inputs[1]
+    if target is None:
+        print("  could not find Sequential Backs input")
+        return False
+
+    print(f"  uploading {len(back_files)} sequential backs...")
+    await target.set_input_files([str(p) for p in back_files])
+    # Wait for Bleed-Settings processing. The back step has its own variant
+    # of the modal: "Does Your Card Back Have Print Bleed?".
+    for _ in range(60):
+        visible = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('*'))"
+            ".some(e => /(Do Your Images Have Print Bleed|Does Your Card Back Have Print Bleed)/"
+            ".test(e.innerText || ''))"
+        )
+        if visible:
+            try:
+                await page.get_by_text("3mm Bleed added", exact=False).first.click(timeout=3000)
+                print("  selected: 3mm Bleed added (backs)")
+                break
+            except Exception:
+                pass
+        await asyncio.sleep(1)
+    for _ in range(180):
+        still = await page.evaluate(
+            "() => document.body.innerText.includes('Applying Bleed Settings')"
+            " || document.body.innerText.includes('Processing card')"
+        )
+        if not still:
+            break
+        await asyncio.sleep(1)
+    # Dismiss any "Got It" / confirmation modal.
+    for label in ("Got It", "OK", "Got it!"):
+        try:
+            await page.get_by_role("button", name=label).click(timeout=2000)
+            break
+        except Exception:
+            pass
+    await asyncio.sleep(2)
+    return True
+
+
 async def run(images_dir: Path, headed: bool, user_data: Path | None,
               save_draft: bool, batch_size: int) -> int:
-    files = collect_files(images_dir)
-    print(f"Found {len(files)} images in {images_dir}")
+    # Detect fronts/backs layout from `fill.py --pair-backs`. If absent,
+    # treat the dir itself as fronts.
+    fronts_dir = images_dir / "fronts" if (images_dir / "fronts").is_dir() else images_dir
+    backs_dir = images_dir / "backs" if (images_dir / "backs").is_dir() else None
+    files = collect_files(fronts_dir)
+    back_files = collect_files(backs_dir) if backs_dir else []
+    if backs_dir and len(back_files) != len(files):
+        print(f"WARN: front count ({len(files)}) != back count ({len(back_files)}); "
+              "Sequential Backs requires matching counts.")
+    print(f"Found {len(files)} fronts in {fronts_dir}"
+          + (f" + {len(back_files)} backs in {backs_dir}" if backs_dir else ""))
 
     async with async_playwright() as p:
         if user_data:
@@ -184,7 +266,11 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
 
         # Final verification.
         final = await get_card_count(page) or 0
-        print(f"\nFINAL: {final}/{len(files)} cards registered")
+        print(f"\nFINAL: {final}/{len(files)} fronts registered")
+
+        # If we have paired backs, drive the Sequential Backs step.
+        if backs_dir and back_files and final == len(files):
+            await upload_sequential_backs(page, back_files)
 
         if save_draft:
             try:

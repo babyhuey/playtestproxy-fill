@@ -161,6 +161,31 @@ function padBleed(img, dpi, bleedMm) {
 
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
+function makeDefaultBackBlob(dpi, bleedMm) {
+  // Same as fill.py:make_default_back — navy canvas, thin frame, "PLAYTEST"
+  // word centered. No copyrighted markings.
+  const artW = Math.round(CARD_W_IN * dpi);
+  const artH = Math.round(CARD_H_IN * dpi);
+  const bleed = Math.round((bleedMm / MM_PER_IN) * dpi);
+  const W = artW + 2 * bleed;
+  const H = artH + 2 * bleed;
+  const c = document.createElement("canvas");
+  c.width = W; c.height = H;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "rgb(20,28,56)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "rgb(120,140,200)";
+  ctx.lineWidth = 4;
+  const m = Math.round(0.12 * artW);
+  ctx.strokeRect(bleed + m, bleed + m, W - 2 * bleed - 2 * m, H - 2 * bleed - 2 * m);
+  ctx.fillStyle = "rgb(180,200,240)";
+  ctx.font = `bold ${Math.round(0.09 * artH)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText("PLAYTEST", W / 2, H / 2);
+  return new Promise((res) => c.toBlob(res, "image/png"));
+}
+
 function buildJobs(deck, opts) {
   // Archidekt defines deck inclusion via the primary (first) category of each
   // card. The deck-level `categories` array tells us which categories have
@@ -191,44 +216,69 @@ function buildJobs(deck, opts) {
   return jobs;
 }
 
-async function resolveFaces(job, opts) {
-  if (job.customUrl) return [["", job.customUrl]];
+async function resolveUrls(job) {
+  // Returns { front, back }. `back` is null unless this is a DFC.
+  if (job.customUrl) return { front: job.customUrl, back: null };
   if (!job.uid) throw new Error("no Scryfall UID and no custom image");
-  // Polite rate-limit: Scryfall asks 50-100ms.
   await new Promise((r) => setTimeout(r, 80));
   const data = await fetchJson(SCRYFALL(job.uid));
-  if (data.image_uris) return [["", data.image_uris.png]];
+  if (data.image_uris) return { front: data.image_uris.png, back: null };
   const faces = data.card_faces || [];
   if (faces.length && faces.every((f) => f.image_uris)) {
-    if (SINGLE_PIECE_LAYOUTS.has(data.layout || "") || !opts.dfc) {
-      return [["", faces[0].image_uris.png]];
+    if (SINGLE_PIECE_LAYOUTS.has(data.layout || "")) {
+      return { front: faces[0].image_uris.png, back: null };
     }
-    return [
-      [slug(faces[0].name || "front"), faces[0].image_uris.png],
-      [slug(faces[1].name || "back"), faces[1].image_uris.png],
-    ];
+    return { front: faces[0].image_uris.png, back: faces[1].image_uris.png };
   }
-  if (faces.length && faces[0].image_uris) return [["", faces[0].image_uris.png]];
+  if (faces.length && faces[0].image_uris) {
+    return { front: faces[0].image_uris.png, back: null };
+  }
   throw new Error(`no image_uris for ${data.name || job.uid}`);
 }
 
-async function processJob(idx, job, opts, zip, gallery) {
-  const faces = await resolveFaces(job, opts);
-  const base = `${String(idx + 1).padStart(3, "0")}_${slug(job.name)}`;
+async function processJob(state, job, opts, zip, gallery) {
+  // state.slot is mutated to assign sequential slot numbers across all jobs
+  // so fronts/<NNN>.png and backs/<NNN>.png stay aligned for tcgplaytest's
+  // Sequential Backs feature.
+  const { front, back } = await resolveUrls(job);
+
+  const frontBlob = await fetchBlob(front);
+  const frontImg = await blobToImage(frontBlob);
+  const frontPadded = opts.bleed > 0 ? await padBleed(frontImg, opts.dpi, opts.bleed) : frontBlob;
+
+  let backPadded = null;
+  if (back) {
+    const backBlob = await fetchBlob(back);
+    const backImg = await blobToImage(backBlob);
+    backPadded = opts.bleed > 0 ? await padBleed(backImg, opts.dpi, opts.bleed) : backBlob;
+  }
+
+  const slugName = slug(job.name);
   const written = [];
-  for (const [faceLabel, url] of faces) {
-    const blob = await fetchBlob(url);
-    const img = await blobToImage(blob);
-    const padded = opts.bleed > 0 ? await padBleed(img, opts.dpi, opts.bleed) : blob;
-    const facePart = faceLabel ? `_${faceLabel}` : "";
-    for (let copy = 1; copy <= job.qty; copy++) {
-      const copyPart = job.qty > 1 ? `_c${copy}` : "";
-      const fname = `${base}${facePart}${copyPart}.png`;
-      zip.file(fname, padded);
-      written.push(fname);
+  for (let copy = 1; copy <= job.qty; copy++) {
+    state.slot += 1;
+    const slotStr = String(state.slot).padStart(3, "0");
+    const base = `${slotStr}_${slugName}`;
+    if (opts.pairBacks) {
+      zip.file(`fronts/${base}.png`, frontPadded);
+      written.push(`fronts/${base}.png`);
+      const useBack = backPadded || state.defaultBack;
+      zip.file(`backs/${base}.png`, useBack);
+      written.push(`backs/${base}.png`);
+    } else {
+      // No pairing: fronts only at root, with face suffix for DFC backs as separate cards.
+      zip.file(`${base}.png`, frontPadded);
+      written.push(`${base}.png`);
+      if (back) {
+        const backBase = `${slotStr}_${slug((job.dfcBackName || job.name) + "_back")}`;
+        zip.file(`${backBase}.png`, backPadded);
+        written.push(`${backBase}.png`);
+      }
     }
-    // Add one thumb per face (not per copy) to keep gallery quick.
-    addThumb(gallery, padded, `${job.name}${faceLabel ? " — " + faceLabel : ""}${job.qty > 1 ? ` ×${job.qty}` : ""}`);
+  }
+  addThumb(gallery, frontPadded, `${job.name}${job.qty > 1 ? ` ×${job.qty}` : ""}`);
+  if (back) {
+    addThumb(gallery, backPadded, `${job.name} (back)`);
   }
   return written;
 }
@@ -275,7 +325,7 @@ async function run() {
     bleed: parseFloat(els.bleed.value) || 0,
     dpi: parseInt(els.dpi.value, 10) || 300,
     skipSide: els.skipSide.checked,
-    dfc: els.dfc.checked,
+    pairBacks: $("opt-pair-backs").checked,
   };
   const jobs = buildJobs(deck, opts);
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
@@ -286,10 +336,16 @@ async function run() {
   const failures = [];
   let done = 0;
 
+  // Pre-generate the default back placeholder if pairing is on.
+  const state = {
+    slot: 0,
+    defaultBack: opts.pairBacks ? await makeDefaultBackBlob(opts.dpi, opts.bleed) : null,
+  };
+
   // Process sequentially to be polite to Scryfall and to keep memory low.
   for (let i = 0; i < jobs.length; i++) {
     try {
-      await processJob(i, jobs[i], opts, zip, els.gallery);
+      await processJob(state, jobs[i], opts, zip, els.gallery);
     } catch (e) {
       failures.push({ name: jobs[i].name, error: e.message });
     }
