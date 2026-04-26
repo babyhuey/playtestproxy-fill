@@ -66,28 +66,45 @@ function setProgress(done, total) {
   els.progress.value = done;
 }
 
-async function fetchJson(url) {
-  // Try direct first; if it CORS-fails, try the proxy.
-  try {
-    const r = await fetch(url, { headers: { Accept: "application/json" } });
-    if (r.ok) return r.json();
-    if (r.status >= 400 && r.status < 500) {
-      // Genuine error, no point proxying.
-      throw new Error(`${r.status} ${r.statusText}`);
+async function withRetry(fn, attempts = 3, baseDelay = 400) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i === attempts - 1) break;
+      await new Promise((r) => setTimeout(r, baseDelay * 2 ** i));
     }
-    throw new Error(`status ${r.status}`);
-  } catch {
-    const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" } });
-    if (!r.ok) throw new Error(`proxy ${r.status} ${r.statusText}`);
-    return r.json();
   }
+  throw lastErr;
+}
+
+async function fetchJson(url) {
+  return withRetry(async () => {
+    // Try direct first; if it CORS-fails, try the proxy.
+    try {
+      const r = await fetch(url, { headers: { Accept: "application/json" } });
+      if (r.ok) return r.json();
+      if (r.status >= 400 && r.status < 500) {
+        throw new Error(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`status ${r.status}`);
+    } catch {
+      const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" } });
+      if (!r.ok) throw new Error(`proxy ${r.status} ${r.statusText}`);
+      return r.json();
+    }
+  });
 }
 
 async function fetchBlob(url) {
-  // Scryfall CDN has CORS *, so we can fetch images directly.
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`image ${r.status} ${r.statusText}`);
-  return r.blob();
+  return withRetry(async () => {
+    // Scryfall CDN has CORS *, so we can fetch images directly.
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`image ${r.status} ${r.statusText}`);
+    return r.blob();
+  });
 }
 
 function blobToImage(blob) {
