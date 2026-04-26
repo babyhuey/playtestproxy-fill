@@ -6,8 +6,13 @@
 // - Bundles everything into a ZIP for the user to drop into TCGPlaytest.
 
 const ARCHIDEKT = (id) => `https://archidekt.com/api/decks/${id}/`;
+const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const CORS_PROXY = (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`;
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
+
+const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
+const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
+const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
 
 const CARD_W_IN = 2.48;
 const CARD_H_IN = 3.46;
@@ -35,11 +40,15 @@ const els = {
 let lastZipBlob = null;
 let lastZipName = "deck.zip";
 
-function parseDeckId(s) {
-  const trimmed = s.trim();
-  const m = trimmed.match(/archidekt\.com\/decks\/(\d+)/i);
-  if (m) return m[1];
-  if (/^\d+$/.test(trimmed)) return trimmed;
+function detectSource(input) {
+  // Returns { source, id } or null. Mirrors fill.py:detect_source.
+  const s = (input || "").trim();
+  let m = s.match(ARCHIDEKT_RE);
+  if (m) return { source: "archidekt", id: m[1] };
+  m = s.match(MOXFIELD_RE);
+  if (m) return { source: "moxfield", id: m[1] };
+  if (/^\d+$/.test(s)) return { source: "archidekt", id: s };
+  if (/^[A-Za-z0-9_-]{12,}$/.test(s)) return { source: "moxfield", id: s };
   return null;
 }
 
@@ -244,11 +253,9 @@ async function makeDefaultBackBlob(dpi, bleedMm) {
   return padBleed(img, dpi, bleedMm);
 }
 
-function buildJobs(deck, opts) {
-  // Archidekt defines deck inclusion via the primary (first) category of each
-  // card. The deck-level `categories` array tells us which categories have
-  // includedInDeck=false (e.g. Maybeboard, Sideboard, Cut). A card tagged
-  // ["Land", "Maybeboard"] is still in the deck because primary = "Land".
+function buildJobsArchidekt(deck, opts) {
+  // Inclusion follows each card's *primary* (first) category against
+  // deck.categories[].includedInDeck.
   const excludedPrimary = new Set(
     (deck.categories || [])
       .filter((c) => c.includedInDeck === false)
@@ -270,6 +277,32 @@ function buildJobs(deck, opts) {
       uid: card.uid || null,
       customUrl,
     });
+  }
+  return jobs;
+}
+
+function buildJobsMoxfield(deck) {
+  // Moxfield's `cards` is a dict keyed by an internal id. Iteration order
+  // isn't stable across responses, so we sort by name for deterministic
+  // slot numbering — same convention as the Python fetcher.
+  const jobs = [];
+  const boards = deck.boards || {};
+  for (const boardName of MOXFIELD_DECK_BOARDS) {
+    const cards = (boards[boardName] || {}).cards || {};
+    const entries = Object.values(cards).sort((a, b) => {
+      const an = (a.card || {}).name || "";
+      const bn = (b.card || {}).name || "";
+      return an.localeCompare(bn);
+    });
+    for (const entry of entries) {
+      const card = entry.card || {};
+      jobs.push({
+        name: card.name || `moxfield-${card.id}`,
+        qty: Number(entry.quantity || 1),
+        uid: card.scryfall_id || null,
+        customUrl: null,
+      });
+    }
   }
   return jobs;
 }
@@ -358,11 +391,13 @@ function addThumb(gallery, blob, label) {
 }
 
 async function run() {
-  const id = parseDeckId(els.input.value);
-  if (!id) {
-    setStatus("Please paste an Archidekt deck URL or numeric id.", "error");
+  const detected = detectSource(els.input.value);
+  if (!detected) {
+    setStatus("Paste an Archidekt or Moxfield deck URL or id.", "error");
     return;
   }
+  const { source, id } = detected;
+  const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
 
   els.go.disabled = true;
   els.result.hidden = true;
@@ -370,17 +405,16 @@ async function run() {
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
   setProgress(0, 0);
-  setStatus("Fetching deck from Archidekt...");
+  setStatus(`Fetching deck from ${sourceLabel}...`);
 
+  const url = source === "archidekt" ? ARCHIDEKT(id) : MOXFIELD(id);
   let deck;
   try {
-    deck = await fetchJson(ARCHIDEKT(id));
+    deck = await fetchJson(url);
   } catch (e) {
-    // 4xx is authoritative — the deck doesn't exist or is private. Don't
-    // bury the user under generic "fetch failed" wording.
     if (e instanceof FatalFetchError) {
       setStatus(
-        `Archidekt returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`,
+        `${sourceLabel} returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`,
         "error"
       );
     } else {
@@ -396,7 +430,9 @@ async function run() {
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
   };
-  const jobs = buildJobs(deck, opts);
+  const jobs = source === "archidekt"
+    ? buildJobsArchidekt(deck, opts)
+    : buildJobsMoxfield(deck);
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
   setStatus(`Deck "${deck.name}" — ${jobs.length} unique cards, ${totalCopies} copies. Building...`);
   setProgress(0, jobs.length);

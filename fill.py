@@ -14,6 +14,7 @@ Pipeline:
      out/fronts/ and out/backs/ with matching slot numbers, ready for
      tcgplaytest's Sequential Backs uploader.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,6 +33,7 @@ import requests
 from PIL import Image, ImageOps  # noqa: F401  (ImageOps reserved for future use)
 
 ARCHIDEKT_DECK = "https://archidekt.com/api/decks/{}/"
+MOXFIELD_DECK = "https://api2.moxfield.com/v3/decks/all/{}"
 SCRYFALL_CARD = "https://api.scryfall.com/cards/{}"
 
 CARD_W_IN, CARD_H_IN = 2.48, 3.46  # MTG card art area target before bleed
@@ -56,7 +58,51 @@ def slug(name: str) -> str:
     return s[:80] or "card"
 
 
-def fetch_deck(deck_id: str) -> list[CardJob]:
+# Source detection ---------------------------------------------------------
+# Each source: regex(es) that match its deck URL, plus a fetcher that takes
+# the bare id and returns CardJob list. The dispatcher picks the first match;
+# a pure-numeric id falls through to Archidekt for backwards compat.
+
+_ARCHIDEKT_RE = re.compile(r"archidekt\.com/decks/(\d+)", re.I)
+_MOXFIELD_RE = re.compile(r"moxfield\.com/decks/([A-Za-z0-9_-]{12,})", re.I)
+
+
+def detect_source(input_str: str) -> tuple[str, str]:
+    """Return (source_name, deck_id) for a deck URL or bare id.
+
+    Recognised:
+      - Archidekt URL -> ("archidekt", "<numeric>")
+      - Moxfield URL  -> ("moxfield",  "<public-id>")
+      - Numeric id    -> ("archidekt", id)   (legacy CLI usage)
+      - Alphanumeric  -> ("moxfield",  id)
+    """
+    s = input_str.strip()
+    m = _ARCHIDEKT_RE.search(s)
+    if m:
+        return "archidekt", m.group(1)
+    m = _MOXFIELD_RE.search(s)
+    if m:
+        return "moxfield", m.group(1)
+    if s.isdigit():
+        return "archidekt", s
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,}", s):
+        return "moxfield", s
+    raise SystemExit(
+        f"Could not recognise '{input_str}' as an Archidekt or Moxfield deck. "
+        "Paste the full URL or the deck id."
+    )
+
+
+def fetch_deck(input_str: str) -> list[CardJob]:
+    source, deck_id = detect_source(input_str)
+    if source == "archidekt":
+        return _fetch_archidekt(deck_id)
+    if source == "moxfield":
+        return _fetch_moxfield(deck_id)
+    raise SystemExit(f"Unknown source: {source}")
+
+
+def _fetch_archidekt(deck_id: str) -> list[CardJob]:
     r = requests.get(ARCHIDEKT_DECK.format(deck_id), headers=UA, timeout=30)
     if 400 <= r.status_code < 500:
         # Authoritative — deck doesn't exist or is private.
@@ -97,7 +143,9 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
         ed = card.get("edition") or {}
         jobs.append(
             CardJob(
-                name=oracle.get("name") or card.get("displayName") or f"card-{card.get('id')}",
+                name=oracle.get("name")
+                or card.get("displayName")
+                or f"card-{card.get('id')}",
                 qty=int(entry.get("quantity") or 1),
                 scryfall_uid=uid if uid and not custom_url else None,
                 custom_image_url=custom_url,
@@ -105,6 +153,61 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
                 collector_number=card.get("collectorNumber"),
             )
         )
+    return jobs
+
+
+# Moxfield boards that count toward the playtest deck. Tokens / planes /
+# schemes / attractions / stickers / contraptions are gameplay accessories
+# that aren't part of the deck proper; sideboard and maybeboard are
+# explicit user-selected exclusions.
+_MOXFIELD_DECK_BOARDS = ("commanders", "mainboard", "companions", "signatureSpells")
+
+# Browser-style headers needed because the Moxfield API rejects plain-Python
+# user-agents at the edge (Cloudflare).
+_MOXFIELD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Origin": "https://www.moxfield.com",
+    "Referer": "https://www.moxfield.com/",
+}
+
+
+def _fetch_moxfield(public_id: str) -> list[CardJob]:
+    r = requests.get(
+        MOXFIELD_DECK.format(public_id), headers=_MOXFIELD_HEADERS, timeout=30
+    )
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"Moxfield returned {r.status_code} for deck {public_id}. "
+            "Check that the deck exists and is public."
+        )
+    r.raise_for_status()
+    data = r.json()
+    boards = data.get("boards") or {}
+    jobs: list[CardJob] = []
+    for board_name in _MOXFIELD_DECK_BOARDS:
+        cards = (boards.get(board_name) or {}).get("cards", {})
+        # Moxfield's `cards` is a dict keyed by an internal id; iteration
+        # order is not stable across API responses. Sort by card name for
+        # deterministic slot numbering across runs.
+        for entry in sorted(
+            cards.values(), key=lambda e: (e.get("card") or {}).get("name") or ""
+        ):
+            card = entry.get("card") or {}
+            uid = card.get("scryfall_id")
+            jobs.append(
+                CardJob(
+                    name=card.get("name") or f"moxfield-{card.get('id')}",
+                    qty=int(entry.get("quantity") or 1),
+                    scryfall_uid=uid,
+                    custom_image_url=None,  # Moxfield's custom-art workflow uses Scryfall
+                    set_code=card.get("set"),
+                    collector_number=card.get("cn"),
+                )
+            )
     return jobs
 
 
@@ -128,7 +231,9 @@ def _scryfall_wait() -> None:
         _scryfall_last_call = time.monotonic()
 
 
-def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, Optional[str]]:
+def scryfall_image_urls(
+    uid: str, session: requests.Session
+) -> tuple[str, Optional[str]]:
     """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
     this carries both faces so the caller can pair them per-slot."""
     _scryfall_wait()
@@ -225,8 +330,12 @@ def pad_bleed(img: Image.Image, dpi: int, bleed_mm: float) -> Image.Image:
         (0, 0, inset, inset),
         (canvas_w - bleed_px - inset, 0, art_w - inset - cs, inset),
         (0, canvas_h - bleed_px - inset, inset, art_h - inset - cs),
-        (canvas_w - bleed_px - inset, canvas_h - bleed_px - inset,
-         art_w - inset - cs, art_h - inset - cs),
+        (
+            canvas_w - bleed_px - inset,
+            canvas_h - bleed_px - inset,
+            art_w - inset - cs,
+            art_h - inset - cs,
+        ),
     ]:
         block = art.crop((sx, sy, sx + cs, sy + cs)).resize(
             (bleed_px + inset, bleed_px + inset)
@@ -253,23 +362,35 @@ def make_default_back(dpi: int, bleed_mm: float) -> Image.Image:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("deck_id", help="Archidekt deck id (the number in the URL)")
+    ap.add_argument(
+        "deck",
+        help="Deck URL or id. Recognised: Archidekt URL, Moxfield URL, a numeric "
+        "Archidekt id, or a Moxfield public id.",
+    )
     ap.add_argument("-o", "--out", default="out", help="Output directory")
     ap.add_argument("--overrides", default="overrides", help="Override images dir")
     ap.add_argument("--dpi", type=int, default=300)
-    ap.add_argument("--no-bleed", action="store_true",
-                    help="Skip bleed padding (use TCGPlaytest XML path instead)")
+    ap.add_argument(
+        "--no-bleed",
+        action="store_true",
+        help="Skip bleed padding (use TCGPlaytest XML path instead)",
+    )
     ap.add_argument("--bleed-mm", type=float, default=BLEED_MM)
     ap.add_argument("--workers", type=int, default=6)
-    ap.add_argument("--pair-backs", action="store_true",
-                    help="Emit out/backs/ with paired back images for each slot "
-                         "(DFC face-2 for transforms, default playtest back for "
-                         "everything else). Suitable for tcgplaytest's "
-                         "Sequential Backs feature.")
-    ap.add_argument("--default-back",
-                    help="Back image for non-DFC cards when --pair-backs is set. "
-                         "Defaults to assets/default_back.png (a meme back) "
-                         "shipped with the repo.")
+    ap.add_argument(
+        "--pair-backs",
+        action="store_true",
+        help="Emit out/backs/ with paired back images for each slot "
+        "(DFC face-2 for transforms, default playtest back for "
+        "everything else). Suitable for tcgplaytest's "
+        "Sequential Backs feature.",
+    )
+    ap.add_argument(
+        "--default-back",
+        help="Back image for non-DFC cards when --pair-backs is set. "
+        "Defaults to assets/default_back.png (a meme back) "
+        "shipped with the repo.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -294,11 +415,13 @@ def main() -> int:
                 args.dpi, 0 if args.no_bleed else args.bleed_mm
             )
 
-    print(f"Fetching deck {args.deck_id}...")
-    jobs = fetch_deck(args.deck_id)
+    print(f"Fetching deck {args.deck}...")
+    jobs = fetch_deck(args.deck)
     total_cards = sum(j.qty for j in jobs)
-    print(f"  {len(jobs)} unique cards, {total_cards} total copies"
-          + (" (with paired backs)" if args.pair_backs else ""))
+    print(
+        f"  {len(jobs)} unique cards, {total_cards} total copies"
+        + (" (with paired backs)" if args.pair_backs else "")
+    )
 
     session = requests.Session()
     session.headers.update(UA)
@@ -362,26 +485,30 @@ def main() -> int:
                 back_path = backs_dir / f"{base}.png"
                 this_back.save(back_path, "PNG", optimize=True)
                 files.append(str(back_path.relative_to(out_dir)))
-        manifest.append({
-            "name": job.name,
-            "qty": job.qty,
-            "has_back": back_img is not None,
-            "front_source": front_url,
-            "back_source": back_url,
-            "files": files,
-        })
+        manifest.append(
+            {
+                "name": job.name,
+                "qty": job.qty,
+                "has_back": back_img is not None,
+                "front_source": front_url,
+                "back_source": back_url,
+                "files": files,
+            }
+        )
         note = " (DFC, paired back)" if back_img is not None else ""
         print(f"  ok   {tag}{note}")
 
-    (out_dir / "manifest.json").write_text(json.dumps(
-        {
-            "deck_id": args.deck_id,
-            "paired_backs": args.pair_backs,
-            "cards": manifest,
-            "failures": failures,
-        },
-        indent=2,
-    ))
+    (out_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "deck_id": args.deck,
+                "paired_backs": args.pair_backs,
+                "cards": manifest,
+                "failures": failures,
+            },
+            indent=2,
+        )
+    )
     if args.pair_backs:
         print(f"\nDone. {slot} card slots written to {fronts_dir}/ and {backs_dir}/")
     else:
