@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>playtestproxy-fill — Archidekt → TCGPlaytest</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🃏</text></svg>">
+</head>
+<body>
+<header>
+  <h1>playtestproxy-fill</h1>
+  <p class="tag">Archidekt deck → print-ready images for <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com</a></p>
+</header>
+
+<main>
+  <section class="card">
+    <label for="deck-input">Archidekt deck URL or ID</label>
+    <input id="deck-input" type="text" placeholder="https://archidekt.com/decks/21170685/the_slop_pile  or  21170685" autocomplete="off">
+
+    <details class="opts">
+      <summary>Options</summary>
+      <div class="opts-grid">
+        <label>Bleed (mm) <input id="opt-bleed" type="number" step="0.5" min="0" max="6" value="2"></label>
+        <label>DPI <input id="opt-dpi" type="number" min="150" max="600" step="50" value="300"></label>
+        <label class="check"><input id="opt-skip-side" type="checkbox" checked> Skip Sideboard / Maybeboard</label>
+        <label class="check"><input id="opt-dfc" type="checkbox" checked> Both faces for double-faced cards</label>
+      </div>
+    </details>
+
+    <button id="go" class="primary">Fetch &amp; build</button>
+    <div id="status" class="status"></div>
+    <progress id="progress" max="1" value="0" hidden></progress>
+
+    <div id="result" class="result" hidden>
+      <div class="result-row">
+        <span id="result-summary"></span>
+        <button id="download-zip" class="primary">Download ZIP</button>
+      </div>
+      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag the images into the Fronts uploader. When the bleed modal appears choose <strong>"3mm Bleed added"</strong>.</p>
+      <div id="gallery" class="gallery"></div>
+    </div>
+
+    <div id="failures" class="failures" hidden>
+      <h3>Failures</h3>
+      <ul id="failures-list"></ul>
+    </div>
+  </section>
+
+  <section class="card help">
+    <h2>How it works</h2>
+    <ol>
+      <li>Fetches the deck JSON from Archidekt's API (via a public CORS proxy).</li>
+      <li>For each card, pulls the exact printing's PNG from Scryfall — Secret Lair / alt-art selections come through faithfully.</li>
+      <li>Pads each image with bleed using a Canvas (edge-replicated).</li>
+      <li>Bundles everything into a ZIP for you to download.</li>
+    </ol>
+    <p class="hint small">Source: <a href="https://github.com/babyhuey/playtestproxy-fill" target="_blank" rel="noopener">github.com/babyhuey/playtestproxy-fill</a> — also includes a Python CLI + Playwright auto-uploader.</p>
+  </section>
+</main>
+
+<footer>
+  <span>No data leaves your browser except API requests to Archidekt &amp; Scryfall.</span>
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="app.js"></script>
+</body>
+</html>
