@@ -10,13 +10,13 @@
 <body>
 <header>
   <h1>playtestproxy-fill</h1>
-  <p class="tag">Archidekt deck → print-ready images for <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com</a></p>
+  <p class="tag">Archidekt or Moxfield deck → print-ready images for <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com</a></p>
 </header>
 
 <main>
   <section class="card">
-    <label for="deck-input">Archidekt deck URL or ID</label>
-    <input id="deck-input" type="text" placeholder="https://archidekt.com/decks/21170685/the_slop_pile  or  21170685" autocomplete="off">
+    <label for="deck-input">Archidekt or Moxfield deck URL or ID</label>
+    <input id="deck-input" type="text" placeholder="archidekt.com/decks/21170685  or  moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg" autocomplete="off">
 
     <details class="opts">
       <summary>Options</summary>
@@ -61,7 +61,7 @@
   <section class="card help">
     <h2>How it works</h2>
     <ol>
-      <li>Fetches the deck JSON from Archidekt's API (via a public CORS proxy).</li>
+      <li>Fetches the deck JSON from Archidekt or Moxfield (via a public CORS proxy — both APIs are locked to their own origins).</li>
       <li>For each card, pulls the exact printing's PNG from Scryfall — Secret Lair / alt-art selections come through faithfully.</li>
       <li>Pads each image with bleed using a Canvas (edge-replicated).</li>
       <li>Bundles everything into a ZIP for you to download.</li>
