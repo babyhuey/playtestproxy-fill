@@ -24,7 +24,7 @@
         <label>Bleed (mm) <input id="opt-bleed" type="number" step="0.5" min="0" max="6" value="2"></label>
         <label>DPI <input id="opt-dpi" type="number" min="150" max="600" step="50" value="300"></label>
         <label class="check"><input id="opt-skip-side" type="checkbox" checked> Skip Sideboard / Maybeboard</label>
-        <label class="check"><input id="opt-dfc" type="checkbox" checked> Both faces for double-faced cards</label>
+        <label class="check"><input id="opt-pair-backs" type="checkbox" checked> Pair backs (DFC face-2 + placeholder for others)</label>
       </div>
     </details>
 
@@ -37,7 +37,7 @@
         <span id="result-summary"></span>
         <button id="download-zip" class="primary">Download ZIP</button>
       </div>
-      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag the images into the Fronts uploader. When the bleed modal appears choose <strong>"3mm Bleed added"</strong>.</p>
+      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1. Choose <strong>"3mm Bleed added"</strong>. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong>. The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.)</p>
       <div id="gallery" class="gallery"></div>
     </div>
 
