@@ -12,3 +12,6 @@ overrides/*.jpg
 cards.xml
 assets_default_back.png
 docs/version.json
+.coverage
+coverage.xml
+.pytest_cache/
