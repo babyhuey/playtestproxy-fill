@@ -7,12 +7,22 @@
 
 const ARCHIDEKT = (id) => `https://archidekt.com/api/decks/${id}/`;
 const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
+const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
 const CORS_PROXY = (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`;
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
+const SCRYFALL_NAMED = "https://api.scryfall.com/cards/named";
+const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn}`;
 
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
 const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
+const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
+const DECKSTATS_RE = /deckstats\.net\/decks\/(\d+)\/(\d+)/i;
+const MTGGOLDFISH_RE = /mtggoldfish\.com\/(?:deck|archetype)\/(\d+)/i;
 const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
+
+// "1 Card Name" / "4x Lightning Bolt" / "1 Sol Ring (CMM) 343" — same as fill.py.
+const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+(.+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w*★]+))?)?\s*$/;
+const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard)\s*:?\s*$/i;
 
 const CARD_W_IN = 2.48;
 const CARD_H_IN = 3.46;
@@ -41,14 +51,20 @@ let lastZipBlob = null;
 let lastZipName = "deck.zip";
 
 function detectSource(input) {
-  // Returns { source, id } or null. Mirrors fill.py:detect_source.
+  // Returns { source, args: [...] } or null. Mirrors fill.py:detect_source.
   const s = (input || "").trim();
   let m = s.match(ARCHIDEKT_RE);
-  if (m) return { source: "archidekt", id: m[1] };
+  if (m) return { source: "archidekt", args: [m[1]] };
   m = s.match(MOXFIELD_RE);
-  if (m) return { source: "moxfield", id: m[1] };
-  if (/^\d+$/.test(s)) return { source: "archidekt", id: s };
-  if (/^[A-Za-z0-9_-]{12,}$/.test(s)) return { source: "moxfield", id: s };
+  if (m) return { source: "moxfield", args: [m[1]] };
+  m = s.match(TAPPEDOUT_RE);
+  if (m) return { source: "tappedout", args: [m[1]] };
+  m = s.match(DECKSTATS_RE);
+  if (m) return { source: "deckstats", args: [m[1], m[2]] };
+  m = s.match(MTGGOLDFISH_RE);
+  if (m) return { source: "mtggoldfish", args: [m[1]] };
+  if (/^\d+$/.test(s)) return { source: "archidekt", args: [s] };
+  if (/^[A-Za-z0-9_-]{12,}$/.test(s)) return { source: "moxfield", args: [s] };
   return null;
 }
 
@@ -253,6 +269,92 @@ async function makeDefaultBackBlob(dpi, bleedMm) {
   return padBleed(img, dpi, bleedMm);
 }
 
+// --- Plain-text decklist support ----------------------------------------
+
+function parseDecklist(text) {
+  const out = [];
+  let inExcluded = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line.trim()) continue;
+    const sec = line.match(SECTION_HEADER);
+    if (sec) {
+      const name = sec[1].toLowerCase();
+      inExcluded = !["deck", "main", "mainboard"].includes(name);
+      continue;
+    }
+    if (line.trim().startsWith("//") || line.trim().startsWith("#")) continue;
+    if (inExcluded || line.trim().startsWith("SB:")) continue;
+    const m = line.match(DECKLIST_LINE);
+    if (!m) continue;
+    out.push({
+      qty: Number(m[1]),
+      name: m[2].trim().replace(/,$/, ""),
+      set: (m[3] || "").toLowerCase() || null,
+      cn: m[4] || null,
+    });
+  }
+  return out;
+}
+
+async function scryfallLookupNamed(name, setCode, cn) {
+  // Scryfall has open CORS, so direct fetch is fine.
+  if (setCode && cn) {
+    const r = await fetch(SCRYFALL_BY_SET(setCode, cn));
+    if (r.ok) return (await r.json()).id;
+  }
+  const params = new URLSearchParams({ exact: name });
+  if (setCode) params.set("set", setCode);
+  let r = await fetch(`${SCRYFALL_NAMED}?${params}`);
+  if (r.ok) return (await r.json()).id;
+  if (r.status === 404 && setCode) {
+    r = await fetch(`${SCRYFALL_NAMED}?exact=${encodeURIComponent(name)}`);
+    if (r.ok) return (await r.json()).id;
+  }
+  return null;
+}
+
+async function buildJobsFromDecklist(text, onProgress) {
+  const parsed = parseDecklist(text);
+  if (!parsed.length) throw new Error("Couldn't parse any cards from the decklist.");
+  const jobs = [];
+  const unresolved = [];
+  for (let i = 0; i < parsed.length; i++) {
+    const p = parsed[i];
+    onProgress?.(i + 1, parsed.length, p.name);
+    // 80ms politeness gap — Scryfall asks for 50–100ms between requests.
+    await new Promise((r) => setTimeout(r, 80));
+    const uid = await scryfallLookupNamed(p.name, p.set, p.cn);
+    if (!uid) {
+      unresolved.push(p.name);
+      continue;
+    }
+    jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
+  }
+  return { jobs, unresolved };
+}
+
+async function fetchTappedOutText(slug) {
+  // ?fmt=txt returns text/plain. Site CORS-blocks, so go through the proxy.
+  const url = TAPPEDOUT_TXT(slug);
+  let r;
+  try {
+    r = await fetch(url);
+  } catch {
+    r = null;
+  }
+  if (!r || !r.ok) {
+    r = await fetch(CORS_PROXY(url));
+    if (!r.ok) {
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`TappedOut fetch failed: ${r.status}`);
+    }
+  }
+  return r.text();
+}
+
 function buildJobsArchidekt(deck, opts) {
   // Inclusion follows each card's *primary* (first) category against
   // deck.categories[].includedInDeck.
@@ -390,39 +492,78 @@ function addThumb(gallery, blob, label) {
   gallery.appendChild(wrap);
 }
 
-async function run() {
+async function loadJobs(opts) {
+  // Returns { jobs, deckLabel, unresolved? }. Throws on fatal user input.
+  const mode = $("mode-text-pane").hidden ? "url" : "text";
+
+  if (mode === "text") {
+    const text = $("decklist-input").value;
+    if (!text.trim()) throw new Error("Paste a decklist first.");
+    setStatus("Resolving cards via Scryfall...");
+    const total = (text.match(/^\s*\d+\s/gm) || []).length;
+    setProgress(0, total || 1);
+    const { jobs, unresolved } = await buildJobsFromDecklist(text, (i, n, name) => {
+      setProgress(i, n);
+      setStatus(`Resolving ${i}/${n}: ${name}`);
+    });
+    return { jobs, deckLabel: "Pasted decklist", unresolved };
+  }
+
   const detected = detectSource(els.input.value);
   if (!detected) {
-    setStatus("Paste an Archidekt or Moxfield deck URL or id.", "error");
-    return;
+    throw new Error("Paste an Archidekt, Moxfield, or TappedOut URL/id.");
   }
-  const { source, id } = detected;
-  const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
+  const { source, args } = detected;
 
+  if (source === "deckstats" || source === "mtggoldfish") {
+    throw new Error(
+      `${source === "deckstats" ? "Deckstats" : "MTGGoldfish"} blocks programmatic ` +
+      "fetches behind a Cloudflare challenge. Switch to “Paste decklist” and " +
+      "paste the deck text from the site's export."
+    );
+  }
+
+  if (source === "tappedout") {
+    setStatus("Fetching decklist from TappedOut...");
+    const text = await fetchTappedOutText(args[0]);
+    setStatus("Resolving cards via Scryfall...");
+    const total = (text.match(/^\s*\d+\s/gm) || []).length;
+    setProgress(0, total || 1);
+    const { jobs, unresolved } = await buildJobsFromDecklist(text, (i, n, name) => {
+      setProgress(i, n);
+      setStatus(`Resolving ${i}/${n}: ${name}`);
+    });
+    return { jobs, deckLabel: `TappedOut · ${args[0]}`, unresolved };
+  }
+
+  const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
+  setStatus(`Fetching deck from ${sourceLabel}...`);
+  const url = source === "archidekt" ? ARCHIDEKT(args[0]) : MOXFIELD(args[0]);
+  let deck;
+  try {
+    deck = await fetchJson(url);
+  } catch (e) {
+    if (e instanceof FatalFetchError) {
+      throw new Error(
+        `${sourceLabel} returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`
+      );
+    }
+    throw new Error(`Failed to fetch deck: ${e.message}`);
+  }
+  const jobs = source === "archidekt"
+    ? buildJobsArchidekt(deck, opts)
+    : buildJobsMoxfield(deck);
+  return { jobs, deckLabel: deck.name || sourceLabel };
+}
+
+async function run() {
   els.go.disabled = true;
   els.result.hidden = true;
   els.failures.hidden = true;
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
   setProgress(0, 0);
-  setStatus(`Fetching deck from ${sourceLabel}...`);
-
-  const url = source === "archidekt" ? ARCHIDEKT(id) : MOXFIELD(id);
-  let deck;
-  try {
-    deck = await fetchJson(url);
-  } catch (e) {
-    if (e instanceof FatalFetchError) {
-      setStatus(
-        `${sourceLabel} returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`,
-        "error"
-      );
-    } else {
-      setStatus(`Failed to fetch deck: ${e.message}`, "error");
-    }
-    els.go.disabled = false;
-    return;
-  }
+  setStatus("Loading deck...");
 
   const opts = {
     bleed: parseFloat(els.bleed.value) || 0,
@@ -430,11 +571,23 @@ async function run() {
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
   };
-  const jobs = source === "archidekt"
-    ? buildJobsArchidekt(deck, opts)
-    : buildJobsMoxfield(deck);
+
+  let jobs;
+  let deckLabel;
+  let initialUnresolved = [];
+  try {
+    const loaded = await loadJobs(opts);
+    jobs = loaded.jobs;
+    deckLabel = loaded.deckLabel;
+    initialUnresolved = loaded.unresolved || [];
+  } catch (e) {
+    setStatus(e.message, "error");
+    els.go.disabled = false;
+    return;
+  }
+
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
-  setStatus(`Deck "${deck.name}" — ${jobs.length} unique cards, ${totalCopies} copies. Building...`);
+  setStatus(`${deckLabel} — ${jobs.length} unique cards, ${totalCopies} copies. Building...`);
   setProgress(0, jobs.length);
 
   const zip = new JSZip();
@@ -466,8 +619,7 @@ async function run() {
     "manifest.json",
     JSON.stringify(
       {
-        deck_id: id,
-        deck_name: deck.name,
+        source: deckLabel,
         unique_cards: jobs.length,
         total_copies: totalCopies,
         options: opts,
@@ -486,7 +638,7 @@ async function run() {
     els.go.disabled = false;
     return;
   }
-  lastZipName = `${slug(deck.name || `deck_${id}`)}_tcgplaytest.zip`;
+  lastZipName = `${slug(deckLabel)}_tcgplaytest.zip`;
 
   const goodCount = jobs.length - failures.length;
   els.resultSummary.textContent = `Built ${goodCount}/${jobs.length} cards (${
@@ -494,6 +646,9 @@ async function run() {
   } files in ZIP)`;
   els.result.hidden = false;
 
+  for (const name of initialUnresolved) {
+    failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
+  }
   if (failures.length) {
     els.failures.hidden = false;
     for (const f of failures) {
@@ -537,3 +692,37 @@ els.download.addEventListener("click", () => {
     URL.revokeObjectURL(a.href);
   }, 100);
 });
+
+// --- Mode toggle (URL/ID vs paste decklist) -----------------------------
+
+function setMode(mode) {
+  const urlActive = mode === "url";
+  $("mode-url").classList.toggle("active", urlActive);
+  $("mode-text").classList.toggle("active", !urlActive);
+  $("mode-url").setAttribute("aria-selected", String(urlActive));
+  $("mode-text").setAttribute("aria-selected", String(!urlActive));
+  $("mode-url-pane").hidden = !urlActive;
+  $("mode-text-pane").hidden = urlActive;
+}
+$("mode-url").addEventListener("click", () => setMode("url"));
+$("mode-text").addEventListener("click", () => setMode("text"));
+
+// --- Version footer ----------------------------------------------------
+// version.json is written by the Pages workflow at deploy time.
+
+(async () => {
+  const el = $("version-info");
+  if (!el) return;
+  try {
+    const r = await fetch("version.json", { cache: "no-store" });
+    if (!r.ok) throw new Error();
+    const v = await r.json();
+    const t = new Date(v.deployed_at).toLocaleString();
+    const sha = (v.commit || "").slice(0, 7);
+    el.innerHTML = sha
+      ? `deployed ${t} · <a href="https://github.com/babyhuey/playtestproxy-fill/commit/${v.commit}" target="_blank" rel="noopener">${sha}</a>`
+      : `deployed ${t}`;
+  } catch {
+    el.textContent = "dev build";
+  }
+})();
