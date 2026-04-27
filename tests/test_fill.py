@@ -202,6 +202,15 @@ class TestParseDecklist:
 </Deck>"""
         assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
 
+    def test_mtgo_dek_without_cards_elements_raises(self):
+        # A well-formed XML document that doesn't contain any <Cards>
+        # children — e.g. a third-party tool that renamed the element.
+        # Returning [] silently would build a 0-card deck without telling
+        # the user we didn't recognise their schema.
+        text = '<?xml version="1.0"?><Deck><Card Quantity="1" Name="Sol Ring"/></Deck>'
+        with pytest.raises(SystemExit, match="no <Cards>"):
+            fill._parse_decklist(text)
+
     def test_mtgo_dek_malformed_raises(self):
         import pytest
 
@@ -434,6 +443,51 @@ def test_fetch_edhrec_missing_blob_errors():
         fill._fetch_edhrec("abc123")
 
 
+def _edhrec_html_with_payload(payload):
+    import json as _json
+
+    return (
+        "<html><body>"
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + _json.dumps(payload)
+        + "</script></body></html>"
+    )
+
+
+@responses.activate
+def test_fetch_edhrec_null_data_surfaces_clean_error():
+    """EDHREC returns the page with `pageProps.data: null` for deleted /
+    private decks. The chained subscript would crash on TypeError; we
+    catch it and emit a friendly extraction error instead."""
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/gone",
+        body=_edhrec_html_with_payload({"props": {"pageProps": {"data": None}}}),
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="Could not extract decklist"):
+        fill._fetch_edhrec("gone")
+
+
+@responses.activate
+def test_fetch_edhrec_schema_drift_detected():
+    """If EDHREC ever ships objects in `deck` instead of strings, str()
+    would silently produce '[object Object]'-equivalents and we'd build
+    a deck of zero cards. Detect the shape change up front."""
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/changed",
+        body=_edhrec_html_with_payload(
+            {"props": {"pageProps": {"data": {"deck": [{"name": "Sol Ring", "qty": 1}]}}}}
+        ),
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="EDHREC deck shape changed"):
+        fill._fetch_edhrec("changed")
+
+
 @responses.activate
 def test_scryfall_lookup_set_and_collector_first():
     """When set+collector are known, hit the more specific endpoint first
@@ -539,7 +593,7 @@ def test_scryfall_token_refs_extracts_tokens_only():
         status=200,
     )
     refs = fill.scryfall_token_refs("bitter", fill.requests.Session())
-    assert refs == [("tok-1", "Faerie Rogue"), ("tok-2", "Treasure")]
+    assert refs == [("tok-1", "Faerie Rogue", ""), ("tok-2", "Treasure", "")]
 
 
 @responses.activate
@@ -594,7 +648,7 @@ def test_token_discovery_dedupes_across_cards():
     s = fill.requests.Session()
     seen: dict[str, fill.CardJob] = {}
     for parent in ["card-a", "card-b"]:
-        for tok_uid, tok_name in fill.scryfall_token_refs(parent, s):
+        for tok_uid, tok_name, _tok_type in fill.scryfall_token_refs(parent, s):
             if tok_uid not in seen:
                 seen[tok_uid] = fill.CardJob(
                     name=f"{tok_name} (token)",
@@ -709,6 +763,64 @@ def test_discover_tokens_dedupes_by_name_across_uids():
     assert failures == []
     assert [j.name for j in new_jobs] == ["Treasure (token)"]
     assert new_jobs[0].scryfall_uid == "treasure-uid-1"
+
+
+@responses.activate
+def test_discover_tokens_keeps_distinct_types_with_same_name():
+    """Two tokens that share a name but have different type_lines (e.g. the
+    1/1 W flying Spirit vs. the Kamigawa colorless Spirit) must NOT
+    collapse — their art is distinct."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-a",
+        json={
+            "id": "card-a",
+            "all_parts": [
+                {
+                    "id": "spirit-w",
+                    "name": "Spirit",
+                    "type_line": "Token Creature — Spirit",
+                    "component": "token",
+                },
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-b",
+        json={
+            "id": "card-b",
+            "all_parts": [
+                {
+                    "id": "spirit-c",
+                    "name": "Spirit",
+                    "type_line": "Token Artifact Creature — Spirit",
+                    "component": "token",
+                },
+            ],
+        },
+        status=200,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("A", "card-a"), J("B", "card-b")],
+        fill.requests.Session(),
+    )
+
+    assert failures == []
+    assert {j.scryfall_uid for j in new_jobs} == {"spirit-w", "spirit-c"}
 
 
 # --- Token pairing -------------------------------------------------------
