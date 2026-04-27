@@ -247,8 +247,49 @@ progress::-moz-progress-bar { background: var(--accent); }
   border-radius: 8px;
   background: rgba(255, 107, 107, 0.08);
 }
-.failures h3 { margin: 0 0 6px; color: var(--danger); font-size: 0.95rem; }
-.failures ul { margin: 0; padding: 0 0 0 1.2em; font-size: 0.85rem; color: var(--muted); }
+.failures h3 { margin: 0; color: var(--danger); font-size: 0.95rem; }
+.failures ul { margin: 6px 0 0; padding: 0 0 0 1.2em; font-size: 0.85rem; color: var(--muted); }
+.failures-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.retry-btn {
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  color: var(--danger);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.retry-btn:hover { background: rgba(255, 107, 107, 0.15); }
+.retry-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.deck-stats {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: #0e1530;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  align-items: center;
+}
+.deck-stats .stat-label { color: var(--muted); margin-right: 6px; }
+.deck-stats .pip {
+  display: inline-block;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  margin-right: 3px;
+  vertical-align: middle;
+  border: 1px solid rgba(255,255,255,0.2);
+}
+.pip.W { background: #f8e8a8; }
+.pip.U { background: #6aa6ff; }
+.pip.B { background: #2a2030; }
+.pip.R { background: #e07b5b; }
+.pip.G { background: #6ec98a; }
+.pip.C { background: #9aa3c0; }
 
 footer {
   text-align: center;
