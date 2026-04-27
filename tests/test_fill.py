@@ -450,6 +450,56 @@ def test_jobs_from_decklist_warns_on_unresolved(capsys):
     assert "Bogus Made Up Card" in out
 
 
+@responses.activate
+def test_scryfall_card_payload_caches():
+    """A second call for the same UID hits the cache, not the network."""
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-cache",
+        json={"id": "uid-cache", "name": "Cached"},
+        status=200,
+    )
+    fill._scryfall_payload_cache.clear()
+    s = fill.requests.Session()
+    a = fill.scryfall_card_payload("uid-cache", s)
+    b = fill.scryfall_card_payload("uid-cache", s)
+    assert a is b
+    assert len(responses.calls) == 1  # only one HTTP request
+
+
+@responses.activate
+def test_scryfall_token_refs_extracts_tokens_only():
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/bitter",
+        json={
+            "id": "bitter",
+            "name": "Bitterblossom",
+            "all_parts": [
+                {"id": "tok-1", "name": "Faerie Rogue", "component": "token"},
+                {"id": "self", "name": "Bitterblossom", "component": "combo_piece"},
+                {"id": "tok-2", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+    refs = fill.scryfall_token_refs("bitter", fill.requests.Session())
+    assert refs == [("tok-1", "Faerie Rogue"), ("tok-2", "Treasure")]
+
+
+@responses.activate
+def test_scryfall_token_refs_no_tokens():
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/bolt",
+        json={"id": "bolt", "name": "Lightning Bolt"},
+        status=200,
+    )
+    assert fill.scryfall_token_refs("bolt", fill.requests.Session()) == []
+
+
 def test_cloudflare_blocked_raises_with_helpful_message():
     with pytest.raises(SystemExit, match="Cloudflare.*--decklist"):
         fill._fetch_cloudflare_blocked("Deckstats", "126143", "4305047")

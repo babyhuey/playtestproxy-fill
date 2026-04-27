@@ -409,12 +409,24 @@ function buildJobsMoxfield(deck) {
   return jobs;
 }
 
+// Module-level cache of full Scryfall card payloads, shared across
+// resolveUrls and token discovery so we don't double-spend the rate limit.
+const _scryfallCache = new Map();
+
+async function scryfallCard(uid) {
+  const hit = _scryfallCache.get(uid);
+  if (hit) return hit;
+  await new Promise((r) => setTimeout(r, 80));
+  const data = await fetchJson(SCRYFALL(uid));
+  _scryfallCache.set(uid, data);
+  return data;
+}
+
 async function resolveUrls(job) {
   // Returns { front, back }. `back` is null unless this is a DFC.
   if (job.customUrl) return { front: job.customUrl, back: null };
   if (!job.uid) throw new Error("no Scryfall UID and no custom image");
-  await new Promise((r) => setTimeout(r, 80));
-  const data = await fetchJson(SCRYFALL(job.uid));
+  const data = await scryfallCard(job.uid);
   if (data.image_uris) return { front: data.image_uris.png, back: null };
   const faces = data.card_faces || [];
   if (faces.length && faces.every((f) => f.image_uris)) {
@@ -427,6 +439,34 @@ async function resolveUrls(job) {
     return { front: faces[0].image_uris.png, back: null };
   }
   throw new Error(`no image_uris for ${data.name || job.uid}`);
+}
+
+async function discoverTokens(jobs) {
+  // Walk all_parts on every main-deck card, dedupe by Scryfall UID, and
+  // return one token job per unique token. One physical token per design
+  // is enough — copies don't add information.
+  const seen = new Map();  // token UID → job
+  for (const job of jobs) {
+    if (!job.uid) continue;
+    let data;
+    try {
+      data = await scryfallCard(job.uid);
+    } catch {
+      continue;
+    }
+    for (const part of data.all_parts || []) {
+      if (part.component !== "token" || !part.id) continue;
+      if (!seen.has(part.id)) {
+        seen.set(part.id, {
+          name: `${part.name || "Token"} (token)`,
+          qty: 1,
+          uid: part.id,
+          customUrl: null,
+        });
+      }
+    }
+  }
+  return [...seen.values()];
 }
 
 async function processJob(state, job, opts, zip, gallery) {
@@ -570,6 +610,7 @@ async function run() {
     dpi: parseInt(els.dpi.value, 10) || 300,
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
+    includeTokens: $("opt-tokens").checked,
   };
 
   let jobs;
@@ -584,6 +625,15 @@ async function run() {
     setStatus(e.message, "error");
     els.go.disabled = false;
     return;
+  }
+
+  if (opts.includeTokens) {
+    setStatus("Discovering tokens / emblems...");
+    const tokens = await discoverTokens(jobs);
+    if (tokens.length) {
+      jobs = [...jobs, ...tokens];
+      deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+    }
   }
 
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
