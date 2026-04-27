@@ -45,6 +45,7 @@ const els = {
   gallery: $("gallery"),
   failures: $("failures"),
   failuresList: $("failures-list"),
+  costEstimate: $("cost-estimate"),
 };
 
 let lastZipBlob = null;
@@ -528,7 +529,7 @@ function fmt(n) {
 }
 
 function renderCostEstimate(numCards) {
-  const el = $("cost-estimate");
+  const el = els.costEstimate;
   if (!el) return;
   if (!numCards) { el.hidden = true; return; }
   const e = estimateCost(numCards);
@@ -609,7 +610,7 @@ async function run() {
   els.failures.hidden = true;
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
-  $("cost-estimate").hidden = true;
+  els.costEstimate.hidden = true;
   setProgress(0, 0);
   setStatus("Loading deck...");
 
