@@ -2,8 +2,9 @@
 // - Fetches an Archidekt deck (via CORS proxy because Archidekt's API is
 //   locked to localhost:3000).
 // - Resolves each card's image via Scryfall (which has open CORS).
-// - Pads with bleed via Canvas.
-// - Bundles everything into a ZIP for the user to drop into TCGPlaytest.
+// - Bundles the unmodified Scryfall PNGs into a ZIP for the user to drop
+//   into TCGPlaytest. tcgplaytest's "No Bleed" upload option handles the
+//   print-bleed expansion server-side.
 
 // Clickjacking defence. GitHub Pages can't set X-Frame-Options and meta-CSP
 // frame-ancestors is ignored by browsers; this is the only real fix for a
@@ -28,6 +29,7 @@ const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
 const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
 const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
+const EDHREC_RE = /edhrec\.com\/deckpreview\/([A-Za-z0-9_-]+)/i;
 const DECKSTATS_RE = /deckstats\.net\/decks\/(\d+)\/(\d+)/i;
 const MTGGOLDFISH_RE = /mtggoldfish\.com\/(?:deck|archetype)\/(\d+)/i;
 const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
@@ -36,16 +38,10 @@ const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatur
 const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+(.+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w*★]+))?)?\s*$/;
 const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard)\s*:?\s*$/i;
 
-const CARD_W_IN = 2.48;
-const CARD_H_IN = 3.46;
-const MM_PER_IN = 25.4;
-
 // DOM
 const $ = (id) => document.getElementById(id);
 const els = {
   input: $("deck-input"),
-  bleed: $("opt-bleed"),
-  dpi: $("opt-dpi"),
   skipSide: $("opt-skip-side"),
   dfc: $("opt-dfc"),
   go: $("go"),
@@ -57,7 +53,9 @@ const els = {
   gallery: $("gallery"),
   failures: $("failures"),
   failuresList: $("failures-list"),
+  retryBtn: $("retry-failures"),
   costEstimate: $("cost-estimate"),
+  deckStats: $("deck-stats"),
 };
 
 let lastZipBlob = null;
@@ -72,6 +70,8 @@ function detectSource(input) {
   if (m) return { source: "moxfield", args: [m[1]] };
   m = s.match(TAPPEDOUT_RE);
   if (m) return { source: "tappedout", args: [m[1]] };
+  m = s.match(EDHREC_RE);
+  if (m) return { source: "edhrec", args: [m[1]] };
   m = s.match(DECKSTATS_RE);
   if (m) return { source: "deckstats", args: [m[1], m[2]] };
   m = s.match(MTGGOLDFISH_RE);
@@ -178,78 +178,6 @@ async function fetchBlob(url) {
   });
 }
 
-function blobToImage(blob) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      resolve(img);
-    };
-    img.onerror = (e) => {
-      URL.revokeObjectURL(url);
-      reject(e);
-    };
-    img.src = url;
-  });
-}
-
-function padBleed(img, dpi, bleedMm) {
-  // Edge-replicate bleed, sampled inset from the visual edge so transparent
-  // rounded corners (which flatten to white on canvas) don't leak into the
-  // bleed. Mirrors fill.py:pad_bleed.
-  const artW = Math.round(CARD_W_IN * dpi);
-  const artH = Math.round(CARD_H_IN * dpi);
-  const bleed = Math.round((bleedMm / MM_PER_IN) * dpi);
-  const W = artW + 2 * bleed;
-  const H = artH + 2 * bleed;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = W;
-  canvas.height = H;
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, bleed, bleed, artW, artH);
-
-  if (bleed > 0) {
-    // ~2.5% inset is past MTG's rounded corner radius and inside the border.
-    const inset = Math.max(8, Math.round(0.025 * Math.min(artW, artH)));
-
-    // Edges — sample 1px slice offset by `inset` along the long axis so we
-    // don't pull from the rounded-corner whitespace.
-    ctx.drawImage(canvas,
-      bleed + inset, bleed + inset, artW - 2 * inset, 1,
-      bleed + inset, 0, artW - 2 * inset, bleed);
-    ctx.drawImage(canvas,
-      bleed + inset, bleed + artH - inset - 1, artW - 2 * inset, 1,
-      bleed + inset, bleed + artH, artW - 2 * inset, bleed);
-    ctx.drawImage(canvas,
-      bleed + inset, bleed + inset, 1, artH - 2 * inset,
-      0, bleed + inset, bleed, artH - 2 * inset);
-    ctx.drawImage(canvas,
-      bleed + artW - inset - 1, bleed + inset, 1, artH - 2 * inset,
-      bleed + artW, bleed + inset, bleed, artH - 2 * inset);
-
-    // Corner blocks: sample an inset×inset patch from just inside the art's
-    // corner (after the rounded corner, in the visible border) and stretch
-    // to fill the corner+inset destination square. Source x/y is in canvas
-    // coords, so it must be offset by `bleed` to land inside the art region.
-    const cs = inset;
-    const sz = bleed + inset;
-    const corners = [
-      [0, 0,                                 bleed + inset,            bleed + inset],
-      [bleed + artW - inset, 0,              bleed + artW - inset - cs, bleed + inset],
-      [0, bleed + artH - inset,              bleed + inset,            bleed + artH - inset - cs],
-      [bleed + artW - inset, bleed + artH - inset,
-                                             bleed + artW - inset - cs, bleed + artH - inset - cs],
-    ];
-    for (const [dx, dy, sx, sy] of corners) {
-      ctx.drawImage(canvas, sx, sy, cs, cs, dx, dy, sz, sz);
-    }
-  }
-
-  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-}
-
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
 async function loadCustomBackBlob() {
@@ -282,12 +210,10 @@ async function loadCustomBackBlob() {
   return r.blob();
 }
 
-async function makeDefaultBackBlob(dpi, bleedMm) {
-  // Resize the source to card art dims and pad with bleed so it lines up
-  // with the rest of the deck.
-  const blob = await loadCustomBackBlob();
-  const img = await blobToImage(blob);
-  return padBleed(img, dpi, bleedMm);
+async function makeDefaultBackBlob() {
+  // Hand the source bytes through verbatim — tcgplaytest applies bleed on
+  // their end after upload, so we don't pre-pad anymore.
+  return loadCustomBackBlob();
 }
 
 // --- Plain-text decklist support ----------------------------------------
@@ -379,6 +305,40 @@ async function buildJobsFromDecklist(text, onProgress) {
     jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
   }
   return { jobs, unresolved };
+}
+
+async function fetchEdhrecDecklist(deckHash) {
+  // EDHREC's /deckpreview/<hash> embeds the decklist in __NEXT_DATA__ as a
+  // list of plain "N Card Name" strings. Pulling the inline blob avoids the
+  // rotating-buildId Next.js data endpoint.
+  const url = `https://edhrec.com/deckpreview/${deckHash}`;
+  let r;
+  try { r = await fetch(url); } catch { r = null; }
+  if (!r || !r.ok) {
+    r = await fetch(CORS_PROXY(url));
+    if (!r.ok) {
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`EDHREC fetch failed: ${r.status}`);
+    }
+  }
+  const html = await r.text();
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]+?)<\/script>/);
+  if (!m) {
+    throw new Error("EDHREC page didn't include __NEXT_DATA__ — site may have changed shape.");
+  }
+  let payload;
+  try {
+    payload = JSON.parse(m[1]);
+  } catch (e) {
+    throw new Error(`EDHREC __NEXT_DATA__ wasn't valid JSON: ${e.message}`);
+  }
+  const deck = payload?.props?.pageProps?.data?.deck;
+  if (!Array.isArray(deck) || !deck.length) {
+    throw new Error("EDHREC payload had no `deck` list.");
+  }
+  return deck.map(String).join("\n");
 }
 
 async function fetchTappedOutText(slug) {
@@ -586,10 +546,11 @@ function pairTokens(tokens) {
 }
 
 async function discoverTokens(jobs) {
-  // Walk all_parts on every main-deck card, dedupe by Scryfall UID, and
-  // return one token job per unique token. One physical token per design
-  // is enough — copies don't add information.
-  const seen = new Map();  // token UID → job
+  // Walk all_parts on every main-deck card and return one job per unique
+  // token. Dedupes by lowercased name so different Scryfall printings of
+  // the same token (e.g. "Treasure", "Faerie Rogue") collapse — otherwise
+  // pair-tokens could land visually identical art on both sides.
+  const seen = new Map();  // lowercased name → job
   let failed = 0;
   for (const job of jobs) {
     if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
@@ -602,8 +563,9 @@ async function discoverTokens(jobs) {
     }
     for (const part of data.all_parts || []) {
       if (part.component !== "token" || !part.id) continue;
-      if (!seen.has(part.id)) {
-        seen.set(part.id, {
+      const key = (part.name || part.id).trim().toLowerCase();
+      if (!seen.has(key)) {
+        seen.set(key, {
           name: `${part.name || "Token"} (token)`,
           qty: 1,
           uid: part.id,
@@ -622,15 +584,7 @@ async function processJob(state, job, opts, zip, gallery) {
   const { front, back } = await resolveUrls(job);
 
   const frontBlob = await fetchBlob(front);
-  const frontImg = await blobToImage(frontBlob);
-  const frontPadded = opts.bleed > 0 ? await padBleed(frontImg, opts.dpi, opts.bleed) : frontBlob;
-
-  let backPadded = null;
-  if (back) {
-    const backBlob = await fetchBlob(back);
-    const backImg = await blobToImage(backBlob);
-    backPadded = opts.bleed > 0 ? await padBleed(backImg, opts.dpi, opts.bleed) : backBlob;
-  }
+  const backBlob = back ? await fetchBlob(back) : null;
 
   const slugName = slug(job.name);
   const written = [];
@@ -639,27 +593,27 @@ async function processJob(state, job, opts, zip, gallery) {
     const slotStr = String(state.slot).padStart(3, "0");
     const base = `${slotStr}_${slugName}`;
     if (opts.pairBacks) {
-      zip.file(`fronts/${base}.png`, frontPadded);
+      zip.file(`fronts/${base}.png`, frontBlob);
       written.push(`fronts/${base}.png`);
-      const useBack = backPadded || state.defaultBack;
+      const useBack = backBlob || state.defaultBack;
       zip.file(`backs/${base}.png`, useBack);
       written.push(`backs/${base}.png`);
     } else {
       // No pairing mode: emit fronts only at root. DFC backs become their
       // own separate cards (next to their fronts, suffixed _back) so the
       // user prints both faces as physical cards.
-      zip.file(`${base}.png`, frontPadded);
+      zip.file(`${base}.png`, frontBlob);
       written.push(`${base}.png`);
       if (back) {
         const backBase = `${slotStr}_${slug(job.name + "_back")}`;
-        zip.file(`${backBase}.png`, backPadded);
+        zip.file(`${backBase}.png`, backBlob);
         written.push(`${backBase}.png`);
       }
     }
   }
-  addThumb(gallery, frontPadded, `${job.name}${job.qty > 1 ? ` ×${job.qty}` : ""}`);
+  addThumb(gallery, frontBlob, `${job.name}${job.qty > 1 ? ` ×${job.qty}` : ""}`);
   if (back) {
-    addThumb(gallery, backPadded, `${job.name} (back)`);
+    addThumb(gallery, backBlob, `${job.name} (back)`);
   }
   return written;
 }
@@ -735,6 +689,162 @@ function renderCostEstimate(numCards) {
   el.hidden = false;
 }
 
+// --- Deck stats badge ---------------------------------------------------
+// Aggregated post-build from the Scryfall payloads we already fetched
+// during processJob. Pure read of `_scryfallCache` — no extra network.
+
+const COLOR_ORDER = ["W", "U", "B", "R", "G"];
+
+async function renderDeckStats(jobs) {
+  const el = els.deckStats;
+  if (!el) return;
+  const colors = new Set();
+  let cmcSum = 0;
+  let cmcCount = 0;
+  const types = { Creature: 0, Instant: 0, Sorcery: 0, Artifact: 0, Enchantment: 0, Planeswalker: 0, Land: 0 };
+  let identified = 0;
+  for (const job of jobs) {
+    if (!job.uid) continue;
+    const inflight = _scryfallCache.get(job.uid);
+    if (!inflight) continue;
+    let card;
+    try { card = await inflight; } catch { continue; }
+    if (!card) continue;
+    identified += 1;
+    for (const c of card.color_identity || []) colors.add(c);
+    const tline = (card.type_line || "").split("//")[0];
+    const isLand = /\bLand\b/.test(tline);
+    if (!isLand && typeof card.cmc === "number") {
+      cmcSum += card.cmc * job.qty;
+      cmcCount += job.qty;
+    }
+    for (const k of Object.keys(types)) {
+      if (new RegExp(`\\b${k}\\b`).test(tline)) {
+        types[k] += job.qty;
+        break;  // pick the first matching primary type
+      }
+    }
+  }
+  if (!identified) { el.hidden = true; return; }
+  el.replaceChildren();
+
+  const colorWrap = document.createElement("span");
+  const colorLabel = document.createElement("span");
+  colorLabel.className = "stat-label";
+  colorLabel.textContent = "Identity:";
+  colorWrap.append(colorLabel);
+  const present = COLOR_ORDER.filter((c) => colors.has(c));
+  if (!present.length) {
+    const pip = document.createElement("span");
+    pip.className = "pip C";
+    pip.title = "Colorless";
+    colorWrap.append(pip);
+  } else {
+    for (const c of present) {
+      const pip = document.createElement("span");
+      pip.className = `pip ${c}`;
+      pip.title = c;
+      colorWrap.append(pip);
+    }
+  }
+  el.append(colorWrap);
+
+  if (cmcCount) {
+    const avg = document.createElement("span");
+    const lbl = document.createElement("span");
+    lbl.className = "stat-label";
+    lbl.textContent = "Avg MV:";
+    avg.append(lbl, (cmcSum / cmcCount).toFixed(2));
+    el.append(avg);
+  }
+
+  const parts = Object.entries(types).filter(([, n]) => n > 0);
+  for (const [name, n] of parts) {
+    const span = document.createElement("span");
+    const lbl = document.createElement("span");
+    lbl.className = "stat-label";
+    lbl.textContent = `${name}:`;
+    span.append(lbl, String(n));
+    el.append(span);
+  }
+  el.hidden = false;
+}
+
+// --- Retry context ------------------------------------------------------
+// Holds enough state across the build → retry boundary that the retry
+// button can re-run only the failed jobs without redoing the whole deck.
+const retryCtx = {
+  state: null,
+  zip: null,
+  opts: null,
+  totalCopies: 0,
+  jobsLen: 0,
+  deckLabel: "",
+};
+
+async function rebuildZipBlob() {
+  setStatus("Re-zipping...");
+  try {
+    lastZipBlob = await retryCtx.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+  } catch (e) {
+    setStatus(`ZIP generation failed: ${e.message}`, "error");
+  }
+}
+
+function renderFailures(failures) {
+  els.failuresList.replaceChildren();
+  if (!failures.length) {
+    els.failures.hidden = true;
+    els.retryBtn.hidden = true;
+    return;
+  }
+  els.failures.hidden = false;
+  for (const f of failures) {
+    const li = document.createElement("li");
+    li.textContent = `${f.name} — ${f.error}`;
+    els.failuresList.appendChild(li);
+  }
+  // Only show retry if at least one failure carries a retryable job (image
+  // fetch failures during processJob). Pre-resolution failures and token
+  // discovery failures don't.
+  const retryable = failures.filter((f) => f.job).length;
+  els.retryBtn.hidden = retryable === 0;
+  els.retryBtn.textContent = `Retry ${retryable} failed card${retryable === 1 ? "" : "s"}`;
+}
+
+let liveFailures = [];
+
+async function retryFailures() {
+  if (!retryCtx.state || !retryCtx.zip) return;
+  els.retryBtn.disabled = true;
+  const remaining = [];
+  const retryable = liveFailures.filter((f) => f.job);
+  const passthrough = liveFailures.filter((f) => !f.job);
+  for (let i = 0; i < retryable.length; i++) {
+    const f = retryable[i];
+    setStatus(`Retrying ${i + 1}/${retryable.length}: ${f.job.name}...`);
+    try {
+      await processJob(retryCtx.state, f.job, retryCtx.opts, retryCtx.zip, els.gallery);
+    } catch (e) {
+      remaining.push({ name: f.job.name, error: e.message, job: f.job });
+    }
+  }
+  liveFailures = [...passthrough, ...remaining];
+  renderFailures(liveFailures);
+  await rebuildZipBlob();
+  const goodCount = retryCtx.jobsLen - liveFailures.filter((f) => f.job).length;
+  els.resultSummary.textContent = `Built ${goodCount}/${retryCtx.jobsLen} cards (${
+    Object.keys(retryCtx.zip.files).length - 1
+  } files in ZIP)`;
+  setStatus(
+    remaining.length
+      ? `Retried — ${remaining.length} still failing.`
+      : "Retried — all recovered. Re-download the ZIP.",
+    remaining.length ? "error" : "ok"
+  );
+  els.retryBtn.disabled = false;
+}
+
 async function loadJobs(opts) {
   // Returns { jobs, deckLabel, unresolved? }. Throws on fatal user input.
   const mode = $("mode-text-pane").hidden ? "url" : "text";
@@ -754,7 +864,7 @@ async function loadJobs(opts) {
 
   const detected = detectSource(els.input.value);
   if (!detected) {
-    throw new Error("Paste an Archidekt, Moxfield, or TappedOut URL/id.");
+    throw new Error("Paste an Archidekt, Moxfield, TappedOut, or EDHREC URL/id.");
   }
   const { source, args } = detected;
 
@@ -766,9 +876,13 @@ async function loadJobs(opts) {
     );
   }
 
-  if (source === "tappedout") {
-    setStatus("Fetching decklist from TappedOut...");
-    const text = await fetchTappedOutText(args[0]);
+  if (source === "tappedout" || source === "edhrec") {
+    const labelMap = { tappedout: "TappedOut", edhrec: "EDHREC" };
+    const human = labelMap[source];
+    setStatus(`Fetching decklist from ${human}...`);
+    const text = source === "tappedout"
+      ? await fetchTappedOutText(args[0])
+      : await fetchEdhrecDecklist(args[0]);
     setStatus("Resolving cards via Scryfall...");
     const total = (text.match(/^\s*\d+\s/gm) || []).length;
     setProgress(0, total || 1);
@@ -776,7 +890,7 @@ async function loadJobs(opts) {
       setProgress(i, n);
       setStatus(`Resolving ${i}/${n}: ${name}`);
     });
-    return { jobs, deckLabel: `TappedOut · ${args[0]}`, unresolved };
+    return { jobs, deckLabel: `${human} · ${args[0]}`, unresolved };
   }
 
   const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
@@ -814,7 +928,12 @@ async function run() {
   els.failures.hidden = true;
   els.gallery.replaceChildren();
   els.failuresList.replaceChildren();
+  els.retryBtn.hidden = true;
   els.costEstimate.hidden = true;
+  els.deckStats.hidden = true;
+  liveFailures = [];
+  retryCtx.state = null;
+  retryCtx.zip = null;
   // SPA: reset the Scryfall payload cache on every fresh run so the Map
   // doesn't grow unbounded across multiple builds in the same tab.
   _scryfallCache.clear();
@@ -822,8 +941,6 @@ async function run() {
   setStatus("Loading deck...");
 
   const opts = {
-    bleed: parseFloat(els.bleed.value) || 0,
-    dpi: parseInt(els.dpi.value, 10) || 300,
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
     includeTokens: $("opt-tokens").checked,
@@ -885,7 +1002,7 @@ async function run() {
   // Pre-generate the default back placeholder if pairing is on.
   const state = {
     slot: 0,
-    defaultBack: opts.pairBacks ? await makeDefaultBackBlob(opts.dpi, opts.bleed) : null,
+    defaultBack: opts.pairBacks ? await makeDefaultBackBlob() : null,
   };
 
   // Process sequentially to be polite to Scryfall and to keep memory low.
@@ -893,7 +1010,8 @@ async function run() {
     try {
       await processJob(state, jobs[i], opts, zip, els.gallery);
     } catch (e) {
-      failures.push({ name: jobs[i].name, error: e.message });
+      // Carry the job so the Retry button can re-run just this one.
+      failures.push({ name: jobs[i].name, error: e.message, job: jobs[i] });
     }
     done++;
     setProgress(done, jobs.length);
@@ -948,14 +1066,14 @@ async function run() {
       error: "Scryfall lookup failed; non-fatal — main deck still built.",
     });
   }
-  if (failures.length) {
-    els.failures.hidden = false;
-    for (const f of failures) {
-      const li = document.createElement("li");
-      li.textContent = `${f.name} — ${f.error}`;
-      els.failuresList.appendChild(li);
-    }
-  }
+  liveFailures = failures;
+  retryCtx.state = state;
+  retryCtx.zip = zip;
+  retryCtx.opts = opts;
+  retryCtx.jobsLen = jobs.length;
+  retryCtx.deckLabel = deckLabel;
+  renderFailures(liveFailures);
+  await renderDeckStats(jobs);
 
   setStatus("Done. Click Download ZIP, then drag-drop into TCGPlaytest.", "ok");
   els.go.disabled = false;
@@ -966,6 +1084,10 @@ els.go.addEventListener("click", () => {
     setStatus(`Unexpected error: ${e.message}`, "error");
     els.go.disabled = false;
   });
+});
+
+els.retryBtn.addEventListener("click", () => {
+  retryFailures().catch((e) => setStatus(`Retry failed: ${e.message}`, "error"));
 });
 
 els.input.addEventListener("keydown", (e) => {

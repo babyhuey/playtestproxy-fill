@@ -47,8 +47,8 @@
     </div>
 
     <div id="mode-url-pane">
-      <label for="deck-input">Archidekt, Moxfield, or TappedOut</label>
-      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  tappedout.net/mtg-decks/…" autocomplete="off">
+      <label for="deck-input">Archidekt, Moxfield, TappedOut, or EDHREC</label>
+      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  tappedout.net/mtg-decks/…  ·  edhrec.com/deckpreview/…" autocomplete="off">
     </div>
 
     <div id="mode-text-pane" hidden>
@@ -65,8 +65,6 @@ Sideboard
     <details class="opts">
       <summary>Options</summary>
       <div class="opts-grid">
-        <label>Bleed (mm) <input id="opt-bleed" type="number" step="0.5" min="0" max="6" value="2"></label>
-        <label>DPI <input id="opt-dpi" type="number" min="150" max="600" step="50" value="300"></label>
         <label class="check"><input id="opt-skip-side" type="checkbox" checked> Skip Sideboard / Maybeboard</label>
         <label class="check"><input id="opt-pair-backs" type="checkbox" checked> Pair backs (DFC face-2 + default for others)</label>
         <label class="check"><input id="opt-tokens" type="checkbox"> Include tokens / emblems (one of each unique)</label>
@@ -95,12 +93,16 @@ Sideboard
         <button id="download-zip" class="primary">Download ZIP</button>
       </div>
       <p id="cost-estimate" class="hint cost-estimate" hidden></p>
-      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1. Choose <strong>"3mm Bleed added"</strong>. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong>. The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.)</p>
+      <div id="deck-stats" class="deck-stats" hidden></div>
+      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1. Choose <strong>"No Bleed"</strong> — tcgplaytest applies the print-bleed expansion server-side. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong>. The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.)</p>
       <div id="gallery" class="gallery"></div>
     </div>
 
     <div id="failures" class="failures" hidden>
-      <h3>Failures</h3>
+      <div class="failures-header">
+        <h3>Failures</h3>
+        <button id="retry-failures" class="retry-btn" hidden>Retry failed cards</button>
+      </div>
       <ul id="failures-list"></ul>
     </div>
   </section>
@@ -110,15 +112,14 @@ Sideboard
     <ol>
       <li>Fetches the deck JSON from Archidekt or Moxfield (via a public CORS proxy — both APIs are locked to their own origins).</li>
       <li>For each card, pulls the exact printing's PNG from Scryfall — Secret Lair / alt-art selections come through faithfully.</li>
-      <li>Pads each image with bleed using a Canvas (edge-replicated).</li>
-      <li>Bundles everything into a ZIP for you to download.</li>
+      <li>Bundles the unmodified Scryfall PNGs into a ZIP for you to download.</li>
     </ol>
     <p class="hint small">Source: <a href="https://github.com/babyhuey/playtestproxy-fill" target="_blank" rel="noopener">github.com/babyhuey/playtestproxy-fill</a> — also includes a Python CLI + Playwright auto-uploader.</p>
   </section>
 </main>
 
 <footer>
-  <span>Deck-builder API traffic (Archidekt, Moxfield, TappedOut) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall and the bundled image are fetched directly.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall and the bundled image are fetched directly.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 

@@ -10,8 +10,8 @@ in the same slot. Otherwise it just uploads fronts.
 
 Sequence (learned by inspecting the live site):
   1. Set files on the image input on Step 1 (Customize Front).
-  2. Click "3mm Bleed added" on the bleed-prompt modal (matches our padded
-     output from fill.py:pad_bleed).
+  2. Click "No Bleed" on the bleed-prompt modal — tcgplaytest expands
+     bleed server-side from the unmodified Scryfall PNGs we ship.
   3. Wait for "Applying Bleed Settings..." to clear; dismiss "Got It" toast.
   4. If backs/ exists: click Next, find the Sequential Backs file input,
      set files, wait for processing.
@@ -38,7 +38,7 @@ BLEED_MODAL_TITLES = (
     "Do Your Images Have Print Bleed",
     "Does Your Card Back Have Print Bleed",
 )
-BLEED_OPTION_PRE_BLED = "3mm Bleed added"  # closest to fill.py's 2mm output
+BLEED_OPTION_PRE_BLED = "No Bleed"  # ship the raw Scryfall PNG; tcgplaytest expands
 PROCESSING_TEXTS = ("Applying Bleed Settings", "Processing card")  # plural varies
 DISMISS_LABELS = ("Got It", "Got it!", "OK")
 NEXT_BACK_BUTTON = re.compile(r"Next.*Customize Back", re.I)
@@ -240,7 +240,7 @@ async def run(
                             timeout=3000
                         )
                         clicked_modal["done"] = True
-                        print(f"  selected: {BLEED_OPTION_PRE_BLED} (images already have bleed)")
+                        print(f"  selected: {BLEED_OPTION_PRE_BLED} (tcgplaytest expands)")
                         return
                     except Exception as e:
                         print(f"  modal click failed: {e}")

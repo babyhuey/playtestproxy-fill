@@ -77,6 +77,12 @@ class TestDetectSource:
             ("budget-mono-blue-control-1",),
         )
 
+    def test_edhrec_url(self):
+        assert fill.detect_source("https://edhrec.com/deckpreview/k39SkKNDKaQEan_AX8CJ8A") == (
+            "edhrec",
+            ("k39SkKNDKaQEan_AX8CJ8A",),
+        )
+
     def test_deckstats_url(self):
         assert fill.detect_source("https://deckstats.net/decks/126143/4305047-some-name") == (
             "deckstats",
@@ -227,48 +233,12 @@ class TestScryfallWait:
 # --- Image pipeline ------------------------------------------------------
 
 
-class TestPadBleed:
-    def _solid_image(self, w=745, h=1040, color=(50, 100, 200)):
-        return Image.new("RGB", (w, h), color)
-
-    def test_output_dimensions(self):
-        img = self._solid_image()
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=2.0)
-        # 2.48" + 2*(2/25.4)" at 300 dpi
-        expected_w = int(round(2.48 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        expected_h = int(round(3.46 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        assert out.size == (expected_w, expected_h)
-
-    def test_no_bleed_short_circuits(self):
-        img = self._solid_image()
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=0)
-        # Just the resized art, no extension.
-        assert out.size == (int(round(2.48 * 300)), int(round(3.46 * 300)))
-
-    def test_corner_color_matches_inner_border(self):
-        # A border-coloured frame around a different-coloured centre — the
-        # bleed corner should pick up the BORDER colour, not the centre,
-        # because we sample inset (past the rounded-corner area) into the border.
-        border = (10, 10, 10)
-        img = Image.new("RGB", (745, 1040), border)
-        # Paint the centre a different colour, but leave the outer 12% as border.
-        centre_color = (255, 255, 255)
-        centre = Image.new("RGB", (520, 815), centre_color)
-        img.paste(centre, (112, 112))
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=2.0)
-        # Sample top-left corner pixel of the bleed canvas: should be border, not white.
-        assert out.getpixel((1, 1)) != centre_color
-        # Allow JPEG-style tolerance (resampling may shift by a few units).
-        r, g, b = out.getpixel((1, 1))
-        assert r < 60 and g < 60 and b < 60
-
-
 class TestMakeDefaultBack:
-    def test_returns_padded_image(self):
-        img = fill.make_default_back(dpi=300, bleed_mm=2.0)
-        expected_w = int(round(2.48 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        expected_h = int(round(3.46 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        assert img.size == (expected_w, expected_h)
+    def test_returns_image(self):
+        img = fill.make_default_back()
+        # Bundled meme back is a normal-sized card image; just assert it loaded.
+        assert img.mode == "RGB"
+        assert img.size[0] > 0 and img.size[1] > 0
 
 
 # --- Mocked fetchers -----------------------------------------------------
@@ -414,6 +384,57 @@ def test_fetch_tappedout_returns_jobs():
 
 
 @responses.activate
+def test_fetch_edhrec_extracts_next_data():
+    """EDHREC's deckpreview page embeds the deck as a list of plain
+    `"N Card Name"` strings inside __NEXT_DATA__. We extract and route
+    through the existing decklist parser."""
+    next_data = {
+        "props": {
+            "pageProps": {
+                "data": {
+                    "deck": ["3 Lightning Bolt", "1 Sol Ring"],
+                }
+            }
+        }
+    }
+    html = (
+        "<html><body>"
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + __import__("json").dumps(next_data)
+        + "</script></body></html>"
+    )
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/abc123",
+        body=html,
+        status=200,
+        content_type="text/html",
+    )
+    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/cards/named",
+            json={"id": uid, "name": name},
+            status=200,
+        )
+    jobs = fill._fetch_edhrec("abc123")
+    assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
+
+
+@responses.activate
+def test_fetch_edhrec_missing_blob_errors():
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/abc123",
+        body="<html>no next data here</html>",
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="__NEXT_DATA__"):
+        fill._fetch_edhrec("abc123")
+
+
+@responses.activate
 def test_scryfall_lookup_set_and_collector_first():
     """When set+collector are known, hit the more specific endpoint first
     and skip the named fallback."""
@@ -456,7 +477,7 @@ def test_make_default_back_missing_file_raises(monkeypatch, tmp_path):
     """If the bundled default_back.png is missing, give a clear error."""
     monkeypatch.setattr(fill, "DEFAULT_BACK_FILE", tmp_path / "absent.png")
     with pytest.raises(FileNotFoundError, match="Bundled default back missing"):
-        fill.make_default_back(dpi=300, bleed_mm=2.0)
+        fill.make_default_back()
 
 
 @responses.activate
@@ -639,6 +660,55 @@ def test_discover_tokens_end_to_end():
     assert "CardC" in failures[0]
     # No HTTP call for the Custom job: only card-a, card-b, card-c got hit.
     assert len(responses.calls) == 3
+
+
+@responses.activate
+def test_discover_tokens_dedupes_by_name_across_uids():
+    """Different Scryfall printings of the same token (e.g. "Treasure" from
+    different sets) carry distinct UIDs but identical art. Dedupe by name
+    so --pair-tokens can't land copy/copy on a single card."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-a",
+        json={
+            "id": "card-a",
+            "all_parts": [
+                {"id": "treasure-uid-1", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-b",
+        json={
+            "id": "card-b",
+            "all_parts": [
+                {"id": "treasure-uid-2", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("CardA", "card-a"), J("CardB", "card-b")],
+        fill.requests.Session(),
+    )
+
+    assert failures == []
+    assert [j.name for j in new_jobs] == ["Treasure (token)"]
+    assert new_jobs[0].scryfall_uid == "treasure-uid-1"
 
 
 # --- Token pairing -------------------------------------------------------
