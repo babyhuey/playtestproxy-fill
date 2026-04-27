@@ -31,11 +31,16 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Stamp version.json
-        # Written into the artifact so the footer can show "deployed at X · sha".
+        # Written into the artifact so the footer can show the merge time +
+        # commit. `committed_at` comes from the head commit (the merge commit
+        # for a squashed PR), which is what the user actually cares about
+        # ("when was the site last updated?"). `deployed_at` is the workflow
+        # run time and is usually within seconds of the commit.
         run: |
           cat > docs/version.json <<EOF
           {
             "commit": "${{ github.sha }}",
+            "committed_at": "${{ github.event.head_commit.timestamp }}",
             "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "ref": "${{ github.ref_name }}"
           }
