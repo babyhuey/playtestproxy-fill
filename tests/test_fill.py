@@ -554,29 +554,58 @@ def test_token_discovery_dedupes_across_cards():
     assert seen["treasure-uid"].name == "Treasure (token)"
 
 
-def test_token_discovery_skips_jobs_without_uid():
-    """Custom-art cards (no scryfall_uid) must be skipped silently — the
-    main()-loop short-circuits on a falsy uid before calling Scryfall."""
-    job = fill.CardJob(
-        name="Custom",
-        qty=1,
-        scryfall_uid=None,
-        custom_image_url="https://example.com/x.png",
-        set_code=None,
-        collector_number=None,
+@responses.activate
+def test_discover_tokens_end_to_end():
+    """`_discover_tokens` walks every job, skips no-UID jobs without an HTTP
+    call, dedupes tokens across cards, and reports network failures rather
+    than aborting the run. Exercises the production code path the way
+    main() drives it."""
+    fill._scryfall_payload_cache.clear()
+    # card-a and card-b both emit the same Treasure UID — must dedupe.
+    for cid in ("card-a", "card-b"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [
+                    {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+                ],
+            },
+            status=200,
+        )
+    # card-c: 500 error → recorded as failure but doesn't abort discovery.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-c",
+        json={"err": "boom"},
+        status=500,
     )
-    queried = []
 
-    def fake_refs(uid, session):
-        queried.append(uid)
-        return []
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
 
-    seen: dict = {}
-    if job.scryfall_uid:
-        for u, n in fake_refs(job.scryfall_uid, None):
-            seen.setdefault(u, n)
-    assert queried == []
-    assert seen == {}
+    jobs = [
+        J("CardA", "card-a"),
+        J("Custom", None),  # no UID — skipped without HTTP
+        J("CardB", "card-b"),
+        J("CardC", "card-c"),
+    ]
+    new_jobs, failures = fill._discover_tokens(jobs, fill.requests.Session())
+
+    assert [j.name for j in new_jobs] == ["Treasure (token)"]
+    assert new_jobs[0].scryfall_uid == "treasure-uid"
+    assert len(failures) == 1
+    assert "CardC" in failures[0]
+    # No HTTP call for the Custom job: only card-a, card-b, card-c got hit.
+    assert len(responses.calls) == 3
 
 
 def test_cloudflare_blocked_raises_with_helpful_message():

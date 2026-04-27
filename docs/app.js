@@ -621,6 +621,7 @@ async function run() {
   let jobs;
   let deckLabel;
   let initialUnresolved = [];
+  let tokenDiscoveryFailed = 0;
   try {
     const loaded = await loadJobs(opts);
     jobs = loaded.jobs;
@@ -640,8 +641,8 @@ async function run() {
       deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
     }
     if (failed) {
-      // Surface as a soft failure — same shape Python prints to stdout.
-      initialUnresolved = [...initialUnresolved, ...Array(failed).fill("[token discovery]")];
+      // One aggregated row instead of N opaque "[token discovery]" entries.
+      tokenDiscoveryFailed = failed;
     }
   }
 
@@ -707,6 +708,12 @@ async function run() {
 
   for (const name of initialUnresolved) {
     failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
+  }
+  if (tokenDiscoveryFailed) {
+    failures.push({
+      name: `Token discovery skipped on ${tokenDiscoveryFailed} card${tokenDiscoveryFailed === 1 ? "" : "s"}`,
+      error: "Scryfall lookup failed; non-fatal — main deck still built.",
+    });
   }
   if (failures.length) {
     els.failures.hidden = false;

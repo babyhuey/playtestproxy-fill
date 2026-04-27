@@ -426,6 +426,36 @@ def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str |
     raise RuntimeError(f"No image_uris for {uid} ({d.get('name')})")
 
 
+def _discover_tokens(
+    jobs: list[CardJob], session: requests.Session
+) -> tuple[list[CardJob], list[str]]:
+    """Walk every main-deck card's all_parts, dedupe tokens by Scryfall UID,
+    and return (new_token_jobs, failure_messages). Cards without a
+    scryfall_uid (Archidekt customs) are skipped silently. Network/runtime
+    failures on any one card are recorded but don't abort discovery."""
+    token_jobs: dict[str, CardJob] = {}
+    failures: list[str] = []
+    for job in jobs:
+        if not job.scryfall_uid:
+            continue
+        try:
+            refs = scryfall_token_refs(job.scryfall_uid, session)
+        except (requests.RequestException, RuntimeError) as e:
+            failures.append(f"{job.name}: {e}")
+            continue
+        for token_uid, token_name in refs:
+            if token_uid not in token_jobs:
+                token_jobs[token_uid] = CardJob(
+                    name=f"{token_name} (token)",
+                    qty=1,
+                    scryfall_uid=token_uid,
+                    custom_image_url=None,
+                    set_code=None,
+                    collector_number=None,
+                )
+    return list(token_jobs.values()), failures
+
+
 def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str]]:
     """Return [(token_uid, token_name), ...] for tokens this card creates.
     Filters to `component == "token"`. Scryfall classifies emblems as tokens
@@ -629,32 +659,10 @@ def main() -> int:
     session.headers.update(UA)
 
     if args.include_tokens:
-        # Walk every main-deck card's all_parts, dedupe by Scryfall UID, and
-        # append a qty=1 CardJob for each unique token. One physical token
-        # per design is enough for play — copies don't add information.
-        token_jobs: dict[str, CardJob] = {}
-        token_failures: list[str] = []
-        for job in jobs:
-            if not job.scryfall_uid:
-                continue
-            try:
-                refs = scryfall_token_refs(job.scryfall_uid, session)
-            except (requests.RequestException, RuntimeError) as e:
-                token_failures.append(f"{job.name}: {e}")
-                continue
-            for token_uid, token_name in refs:
-                if token_uid not in token_jobs:
-                    token_jobs[token_uid] = CardJob(
-                        name=f"{token_name} (token)",
-                        qty=1,
-                        scryfall_uid=token_uid,
-                        custom_image_url=None,
-                        set_code=None,
-                        collector_number=None,
-                    )
+        token_jobs, token_failures = _discover_tokens(jobs, session)
         if token_jobs:
             print(f"  + {len(token_jobs)} unique tokens / emblems")
-            jobs = list(jobs) + list(token_jobs.values())
+            jobs = list(jobs) + token_jobs
         if token_failures:
             print(f"  (skipped token discovery on {len(token_failures)} cards)")
 
