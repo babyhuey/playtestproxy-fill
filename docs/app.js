@@ -787,8 +787,8 @@ async function run() {
   els.go.disabled = true;
   els.result.hidden = true;
   els.failures.hidden = true;
-  els.gallery.innerHTML = "";
-  els.failuresList.innerHTML = "";
+  els.gallery.replaceChildren();
+  els.failuresList.replaceChildren();
   els.costEstimate.hidden = true;
   // SPA: reset the Scryfall payload cache on every fresh run so the Map
   // doesn't grow unbounded across multiple builds in the same tab.
