@@ -78,9 +78,10 @@ class TestDetectSource:
         )
 
     def test_edhrec_url(self):
-        assert fill.detect_source(
-            "https://edhrec.com/deckpreview/k39SkKNDKaQEan_AX8CJ8A"
-        ) == ("edhrec", ("k39SkKNDKaQEan_AX8CJ8A",))
+        assert fill.detect_source("https://edhrec.com/deckpreview/k39SkKNDKaQEan_AX8CJ8A") == (
+            "edhrec",
+            ("k39SkKNDKaQEan_AX8CJ8A",),
+        )
 
     def test_deckstats_url(self):
         assert fill.detect_source("https://deckstats.net/decks/126143/4305047-some-name") == (
