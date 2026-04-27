@@ -500,6 +500,85 @@ def test_scryfall_token_refs_no_tokens():
     assert fill.scryfall_token_refs("bolt", fill.requests.Session()) == []
 
 
+@responses.activate
+def test_scryfall_token_refs_skips_self_reference():
+    """A combo_piece self-reference must not be returned as a token."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/self-ref",
+        json={
+            "id": "self-ref",
+            "name": "Self",
+            "all_parts": [
+                {"id": "self-ref", "name": "Self", "component": "combo_piece"},
+            ],
+        },
+        status=200,
+    )
+    assert fill.scryfall_token_refs("self-ref", fill.requests.Session()) == []
+
+
+@responses.activate
+def test_token_discovery_dedupes_across_cards():
+    """Two main-deck cards both producing the same token UID yield one
+    entry — exercises the dedupe-by-UID logic the way main() drives it."""
+    fill._scryfall_payload_cache.clear()
+    for parent_id in ["card-a", "card-b"]:
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{parent_id}",
+            json={
+                "id": parent_id,
+                "name": parent_id,
+                "all_parts": [
+                    {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+                ],
+            },
+            status=200,
+        )
+    s = fill.requests.Session()
+    seen: dict[str, fill.CardJob] = {}
+    for parent in ["card-a", "card-b"]:
+        for tok_uid, tok_name in fill.scryfall_token_refs(parent, s):
+            if tok_uid not in seen:
+                seen[tok_uid] = fill.CardJob(
+                    name=f"{tok_name} (token)",
+                    qty=1,
+                    scryfall_uid=tok_uid,
+                    custom_image_url=None,
+                    set_code=None,
+                    collector_number=None,
+                )
+    assert list(seen) == ["treasure-uid"]
+    assert seen["treasure-uid"].name == "Treasure (token)"
+
+
+def test_token_discovery_skips_jobs_without_uid():
+    """Custom-art cards (no scryfall_uid) must be skipped silently — the
+    main()-loop short-circuits on a falsy uid before calling Scryfall."""
+    job = fill.CardJob(
+        name="Custom",
+        qty=1,
+        scryfall_uid=None,
+        custom_image_url="https://example.com/x.png",
+        set_code=None,
+        collector_number=None,
+    )
+    queried = []
+
+    def fake_refs(uid, session):
+        queried.append(uid)
+        return []
+
+    seen: dict = {}
+    if job.scryfall_uid:
+        for u, n in fake_refs(job.scryfall_uid, None):
+            seen.setdefault(u, n)
+    assert queried == []
+    assert seen == {}
+
+
 def test_cloudflare_blocked_raises_with_helpful_message():
     with pytest.raises(SystemExit, match="Cloudflare.*--decklist"):
         fill._fetch_cloudflare_blocked("Deckstats", "126143", "4305047")

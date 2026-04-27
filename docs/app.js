@@ -446,12 +446,14 @@ async function discoverTokens(jobs) {
   // return one token job per unique token. One physical token per design
   // is enough — copies don't add information.
   const seen = new Map();  // token UID → job
+  let failed = 0;
   for (const job of jobs) {
-    if (!job.uid) continue;
+    if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
     let data;
     try {
       data = await scryfallCard(job.uid);
     } catch {
+      failed += 1;
       continue;
     }
     for (const part of data.all_parts || []) {
@@ -466,7 +468,7 @@ async function discoverTokens(jobs) {
       }
     }
   }
-  return [...seen.values()];
+  return { tokens: [...seen.values()], failed };
 }
 
 async function processJob(state, job, opts, zip, gallery) {
@@ -602,6 +604,9 @@ async function run() {
   els.failures.hidden = true;
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
+  // SPA: reset the Scryfall payload cache on every fresh run so the Map
+  // doesn't grow unbounded across multiple builds in the same tab.
+  _scryfallCache.clear();
   setProgress(0, 0);
   setStatus("Loading deck...");
 
@@ -629,10 +634,14 @@ async function run() {
 
   if (opts.includeTokens) {
     setStatus("Discovering tokens / emblems...");
-    const tokens = await discoverTokens(jobs);
+    const { tokens, failed } = await discoverTokens(jobs);
     if (tokens.length) {
       jobs = [...jobs, ...tokens];
       deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+    }
+    if (failed) {
+      // Surface as a soft failure — same shape Python prints to stdout.
+      initialUnresolved = [...initialUnresolved, ...Array(failed).fill("[token discovery]")];
     }
   }
 

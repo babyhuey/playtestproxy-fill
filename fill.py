@@ -428,9 +428,9 @@ def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str |
 
 def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str]]:
     """Return [(token_uid, token_name), ...] for tokens this card creates.
-    Only `component == "token"` entries; emblems and meld results are
-    classified differently by Scryfall but rare enough that we keep this
-    narrowly scoped."""
+    Filters to `component == "token"`. Scryfall classifies emblems as tokens
+    (with `layout == "emblem"`), so this catches both. Meld result cards
+    use `component == "meld_result"` and are intentionally not included."""
     d = scryfall_card_payload(uid, session)
     return [
         (p["id"], p.get("name") or f"token-{p['id'][:8]}")
