@@ -10,13 +10,31 @@
 <body>
 <header>
   <h1>playtestproxy-fill</h1>
-  <p class="tag">Archidekt or Moxfield deck → print-ready images for <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com</a></p>
+  <p class="tag">Any deck → print-ready images for <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com</a></p>
 </header>
 
 <main>
   <section class="card">
-    <label for="deck-input">Archidekt or Moxfield deck URL or ID</label>
-    <input id="deck-input" type="text" placeholder="archidekt.com/decks/21170685  or  moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg" autocomplete="off">
+    <div class="mode-toggle" role="tablist">
+      <button id="mode-url" class="mode-btn active" role="tab" aria-selected="true">Deck URL / ID</button>
+      <button id="mode-text" class="mode-btn" role="tab" aria-selected="false">Paste decklist</button>
+    </div>
+
+    <div id="mode-url-pane">
+      <label for="deck-input">Archidekt, Moxfield, or TappedOut</label>
+      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  tappedout.net/mtg-decks/…" autocomplete="off">
+    </div>
+
+    <div id="mode-text-pane" hidden>
+      <label for="decklist-input">Decklist — one card per line</label>
+      <textarea id="decklist-input" rows="8" placeholder="1 Sol Ring
+4 Lightning Bolt (M21) 162
+1 Forest
+
+Sideboard
+2 Negate"></textarea>
+      <p class="hint small">Accepts MTG Arena exports, copy/paste from any deck builder, plain "N Card Name" lines. Set codes / collector numbers in parens are optional. Sections labelled <em>Sideboard / Maybeboard / Tokens</em> are skipped.</p>
+    </div>
 
     <details class="opts">
       <summary>Options</summary>
@@ -71,7 +89,8 @@
 </main>
 
 <footer>
-  <span>No data leaves your browser except API requests to Archidekt &amp; Scryfall.</span>
+  <span>No data leaves your browser except deck-builder &amp; Scryfall API requests.</span>
+  <span class="version" id="version-info">loading…</span>
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>

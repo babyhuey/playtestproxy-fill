@@ -30,6 +30,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Stamp version.json
+        # Written into the artifact so the footer can show "deployed at X · sha".
+        run: |
+          cat > docs/version.json <<EOF
+          {
+            "commit": "${{ github.sha }}",
+            "deployed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "ref": "${{ github.ref_name }}"
+          }
+          EOF
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3

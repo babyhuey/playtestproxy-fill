@@ -35,6 +35,14 @@ Recognised inputs:
 - An Archidekt URL (`https://archidekt.com/decks/21170685/...`) or numeric id.
 - A Moxfield URL (`https://www.moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg`)
   or alphanumeric public id.
+- A TappedOut URL (`https://tappedout.net/mtg-decks/<slug>/`).
+- A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
+  Accepts MTG Arena exports, "1 Card Name" lines, optional `(SET) NUM`
+  trailers, and Sideboard/Maybeboard sections (skipped).
+
+Deckstats and MTGGoldfish URLs are recognised but blocked behind
+Cloudflare JS challenges. The tool prints a clear message asking you to
+copy the deck text and use `--decklist` instead.
 
 What this does:
 1. Fetches the deck from Archidekt or Moxfield's API. Card inclusion follows Archidekt or Moxfield's
