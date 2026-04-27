@@ -42,6 +42,13 @@ class TestSlug:
     def test_empty(self):
         assert fill.slug("") == "card"
 
+    def test_strips_leading_dots(self):
+        # Defense in depth — a card "named" .. or ./foo would otherwise
+        # produce "..png" / "._foo.png" filenames that lean on dot semantics.
+        assert fill.slug("..") == "card"
+        assert fill.slug(".hidden") == "hidden"
+        assert fill.slug("../traversal") == "traversal"
+
 
 class TestDetectSource:
     def test_archidekt_url(self):
@@ -745,6 +752,46 @@ def test_resolve_urls_pair_back_uses_other_card_front():
     front, back = fill.resolve_urls(job, Path("/tmp/no-overrides"), fill.requests.Session())
     assert front == "https://x/front.png"
     assert back == "https://x/back.png"
+
+
+class TestFetchImageSchemeAllowlist:
+    def test_https_allowed(self):
+        # Smoke test that the scheme check passes — actual fetch is mocked
+        # via `responses` in other tests.
+        # We just want to confirm the rejection branch isn't accidentally
+        # blocking https://.
+        # Easiest: assert the regex check is what we expect.
+        for ok in ("https://api.scryfall.com/x", "file:///tmp/x.png"):
+            assert ok.startswith(fill._ALLOWED_IMAGE_SCHEMES)
+
+    def test_rejects_http(self):
+        with pytest.raises(RuntimeError, match="disallowed scheme"):
+            fill.fetch_image("http://example.com/img.png", fill.requests.Session())
+
+    def test_rejects_data_url(self):
+        with pytest.raises(RuntimeError, match="disallowed scheme"):
+            fill.fetch_image("data:image/png;base64,iVBORw0KGg=", fill.requests.Session())
+
+    def test_rejects_ftp(self):
+        with pytest.raises(RuntimeError, match="disallowed scheme"):
+            fill.fetch_image("ftp://internal/img.png", fill.requests.Session())
+
+
+class TestScrubSource:
+    def test_keeps_https_url(self):
+        assert (
+            fill._scrub_source("https://cards.scryfall.io/png/x.png")
+            == "https://cards.scryfall.io/png/x.png"
+        )
+
+    def test_strips_absolute_path(self):
+        # Local override paths leak the user's home; manifest gets only the basename.
+        out = fill._scrub_source("file:///home/jlyons/secret/overrides/Sol_Ring.png")
+        assert out == "file://overrides/Sol_Ring.png"
+        assert "/home/" not in out
+
+    def test_passes_none(self):
+        assert fill._scrub_source(None) is None
 
 
 def test_cloudflare_blocked_raises_with_helpful_message():

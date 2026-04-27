@@ -70,9 +70,14 @@ function detectSource(input) {
 }
 
 function slug(name) {
+  // Strip any leading combination of `.` and `_` so traversal-flavoured
+  // input (`..`, `./foo`, `../foo`) can't produce filenames that lean on
+  // dot semantics. The slot prefix on the writer side already neutralises
+  // real traversal, but rejecting up front is defense in depth.
   return name
     .replace(/[^A-Za-z0-9._-]+/g, "_")
     .replace(/^_+|_+$/g, "")
+    .replace(/^[._]+/, "")
     .slice(0, 80) || "card";
 }
 
