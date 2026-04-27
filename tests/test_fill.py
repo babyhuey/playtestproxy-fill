@@ -208,48 +208,12 @@ class TestScryfallWait:
 # --- Image pipeline ------------------------------------------------------
 
 
-class TestPadBleed:
-    def _solid_image(self, w=745, h=1040, color=(50, 100, 200)):
-        return Image.new("RGB", (w, h), color)
-
-    def test_output_dimensions(self):
-        img = self._solid_image()
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=2.0)
-        # 2.48" + 2*(2/25.4)" at 300 dpi
-        expected_w = int(round(2.48 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        expected_h = int(round(3.46 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        assert out.size == (expected_w, expected_h)
-
-    def test_no_bleed_short_circuits(self):
-        img = self._solid_image()
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=0)
-        # Just the resized art, no extension.
-        assert out.size == (int(round(2.48 * 300)), int(round(3.46 * 300)))
-
-    def test_corner_color_matches_inner_border(self):
-        # A border-coloured frame around a different-coloured centre — the
-        # bleed corner should pick up the BORDER colour, not the centre,
-        # because we sample inset (past the rounded-corner area) into the border.
-        border = (10, 10, 10)
-        img = Image.new("RGB", (745, 1040), border)
-        # Paint the centre a different colour, but leave the outer 12% as border.
-        centre_color = (255, 255, 255)
-        centre = Image.new("RGB", (520, 815), centre_color)
-        img.paste(centre, (112, 112))
-        out = fill.pad_bleed(img, dpi=300, bleed_mm=2.0)
-        # Sample top-left corner pixel of the bleed canvas: should be border, not white.
-        assert out.getpixel((1, 1)) != centre_color
-        # Allow JPEG-style tolerance (resampling may shift by a few units).
-        r, g, b = out.getpixel((1, 1))
-        assert r < 60 and g < 60 and b < 60
-
-
 class TestMakeDefaultBack:
-    def test_returns_padded_image(self):
-        img = fill.make_default_back(dpi=300, bleed_mm=2.0)
-        expected_w = int(round(2.48 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        expected_h = int(round(3.46 * 300)) + 2 * int(round((2 / 25.4) * 300))
-        assert img.size == (expected_w, expected_h)
+    def test_returns_image(self):
+        img = fill.make_default_back()
+        # Bundled meme back is a normal-sized card image; just assert it loaded.
+        assert img.mode == "RGB"
+        assert img.size[0] > 0 and img.size[1] > 0
 
 
 # --- Mocked fetchers -----------------------------------------------------
@@ -488,7 +452,7 @@ def test_make_default_back_missing_file_raises(monkeypatch, tmp_path):
     """If the bundled default_back.png is missing, give a clear error."""
     monkeypatch.setattr(fill, "DEFAULT_BACK_FILE", tmp_path / "absent.png")
     with pytest.raises(FileNotFoundError, match="Bundled default back missing"):
-        fill.make_default_back(dpi=300, bleed_mm=2.0)
+        fill.make_default_back()
 
 
 @responses.activate
