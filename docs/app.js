@@ -55,9 +55,14 @@ const els = {
   failures: $("failures"),
   failuresList: $("failures-list"),
   retryBtn: $("retry-failures"),
+  addAnotherBtn: $("add-another"),
   costEstimate: $("cost-estimate"),
   deckStats: $("deck-stats"),
 };
+
+// Set when the user clicks "Add another deck": the next build call merges
+// into the existing zip / gallery / failures rather than starting over.
+let appendMode = false;
 
 let lastZipBlob = null;
 let lastZipName = "deck.zip";
@@ -576,6 +581,7 @@ function pairTokens(tokens) {
       uid: a.uid,
       customUrl: null,
       pairBackUid: b ? b.uid : null,
+      isToken: true,
     });
   }
   return paired;
@@ -612,6 +618,7 @@ async function discoverTokens(jobs) {
           qty: 1,
           uid: part.id,
           customUrl: null,
+          isToken: true,
         });
       }
     }
@@ -830,16 +837,18 @@ async function renderDeckStats(jobs) {
   el.hidden = false;
 }
 
-// --- Retry context ------------------------------------------------------
-// Holds enough state across the build → retry boundary that the retry
-// button can re-run only the failed jobs without redoing the whole deck.
+// --- Build / retry context ----------------------------------------------
+// Holds the running build's state across two boundaries: the retry button
+// (re-runs failed image fetches into the same zip) and append mode (a
+// second deck's cards land in the same zip with continuous slot numbers
+// and merged stats / cost / token-dedup).
 const retryCtx = {
   state: null,
   zip: null,
   opts: null,
-  totalCopies: 0,
   jobsLen: 0,
   deckLabel: "",
+  jobs: [],
 };
 
 async function rebuildZipBlob() {
@@ -989,35 +998,58 @@ async function loadJobs(opts) {
 
 async function run() {
   els.go.disabled = true;
-  els.result.hidden = true;
-  els.failures.hidden = true;
-  els.gallery.replaceChildren();
-  els.failuresList.replaceChildren();
-  els.retryBtn.hidden = true;
-  els.costEstimate.hidden = true;
-  els.deckStats.hidden = true;
-  liveFailures = [];
-  retryCtx.state = null;
-  retryCtx.zip = null;
-  // SPA: reset the Scryfall payload cache on every fresh run so the Map
-  // doesn't grow unbounded across multiple builds in the same tab.
-  _scryfallCache.clear();
-  setProgress(0, 0);
-  setStatus("Loading deck...");
+  const append = appendMode && retryCtx.zip != null;
+  // Don't consume `appendMode` yet — if loadJobs throws, the user should
+  // still be in append mode so a corrected URL doesn't silently wipe the
+  // first deck's progress.
 
-  const opts = {
-    skipSide: els.skipSide.checked,
-    skipBasics: els.skipBasics.checked,
-    pairBacks: $("opt-pair-backs").checked,
-    includeTokens: $("opt-tokens").checked,
-    pairTokens: $("opt-pair-tokens").checked,
-  };
+  let zip, state, opts;
+  if (append) {
+    // Continue the existing build: same zip, slot counter, gallery, opts.
+    // Caller picks up where the previous pass stopped, so a 100-card deck
+    // followed by a 60-card deck yields slots 001-100 then 101-160.
+    zip = retryCtx.zip;
+    state = retryCtx.state;
+    opts = retryCtx.opts;
+  } else {
+    els.result.hidden = true;
+    els.failures.hidden = true;
+    els.gallery.replaceChildren();
+    els.failuresList.replaceChildren();
+    els.retryBtn.hidden = true;
+    els.addAnotherBtn.hidden = true;
+    els.costEstimate.hidden = true;
+    els.deckStats.hidden = true;
+    liveFailures = [];
+    retryCtx.state = null;
+    retryCtx.zip = null;
+    retryCtx.jobs = [];
+    retryCtx.deckLabel = "";
+    // SPA: reset the Scryfall payload cache on every fresh run so the Map
+    // doesn't grow unbounded across multiple builds in the same tab.
+    _scryfallCache.clear();
+    opts = {
+      skipSide: els.skipSide.checked,
+      skipBasics: els.skipBasics.checked,
+      pairBacks: $("opt-pair-backs").checked,
+      includeTokens: $("opt-tokens").checked,
+      pairTokens: $("opt-pair-tokens").checked,
+    };
+    zip = new JSZip();
+    state = {
+      slot: 0,
+      defaultBack: opts.pairBacks ? await makeDefaultBackBlob() : null,
+    };
+  }
+  setProgress(0, 0);
+  setStatus(append ? "Loading additional deck..." : "Loading deck...");
 
   let jobs;
   let deckLabel;
   let initialUnresolved = [];
-  let tokenDiscoveryFailures = [];
-  const failures = [];
+  let newTokenFailures = [];
+  // Failures from this pass only — accumulated into liveFailures at the end.
+  const passFailures = [];
   try {
     const loaded = await loadJobs(opts);
     jobs = loaded.jobs;
@@ -1028,6 +1060,9 @@ async function run() {
     els.go.disabled = false;
     return;
   }
+  // loadJobs succeeded — now safe to consume the flag and reset the label.
+  appendMode = false;
+  els.go.textContent = "Fetch & build";
   if (opts.skipBasics) {
     const before = jobs.reduce((a, j) => a + j.qty, 0);
     jobs = jobs.filter((j) => !isBasicLand(j.name));
@@ -1037,73 +1072,94 @@ async function run() {
 
   if (opts.includeTokens) {
     setStatus("Discovering tokens / emblems...");
-    const { tokens, failures: tokenFailures } = await discoverTokens(jobs);
-    if (tokens.length) {
-      // Pairing requires pair-backs because Sequential Backs is the only
-      // mechanism we have to assign per-card backs in tcgplaytest. If the
-      // user asked for pairing without pair-backs, surface a soft warning
-      // in the failures box so they know why the cost didn't drop.
+    // Run discovery against the merged main deck so tokens already
+    // included from the first pass don't get printed again on the second.
+    const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
+    const { tokens, failures: tokenFailures } = await discoverTokens(baseJobsForDiscovery);
+    // Filter to tokens we haven't already added in a prior pass. Include
+    // both `uid` and any `pairBackUid` so a paired-token back from pass 1
+    // doesn't get re-emitted as a standalone token in pass 2.
+    const existingTokenUids = new Set();
+    for (const j of retryCtx.jobs || []) {
+      if (!j.isToken) continue;
+      if (j.uid) existingTokenUids.add(j.uid);
+      if (j.pairBackUid) existingTokenUids.add(j.pairBackUid);
+    }
+    const fresh = tokens.filter((t) => !existingTokenUids.has(t.uid));
+    if (fresh.length) {
       if (opts.pairTokens && !opts.pairBacks) {
-        failures.push({
+        passFailures.push({
           name: "Token pairing skipped",
           error: "Pair tokens needs Pair backs enabled — falling back to single-sided.",
         });
       }
-      if (opts.pairTokens && opts.pairBacks && tokens.length >= 2) {
-        const paired = pairTokens(tokens);
+      if (opts.pairTokens && opts.pairBacks && fresh.length >= 2) {
+        const paired = pairTokens(fresh);
         jobs = [...jobs, ...paired];
-        deckLabel = `${deckLabel} (+ ${tokens.length} tokens → ${paired.length} cards)`;
+        deckLabel = `${deckLabel} (+ ${fresh.length} tokens → ${paired.length} cards)`;
       } else {
-        jobs = [...jobs, ...tokens];
-        deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+        jobs = [...jobs, ...fresh];
+        deckLabel = `${deckLabel} (+ ${fresh.length} tokens)`;
       }
     }
-    tokenDiscoveryFailures = tokenFailures;
+    newTokenFailures = tokenFailures;
   }
 
-  const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
-  setStatus(`${deckLabel} — ${jobs.length} unique cards, ${totalCopies} copies. Building...`);
+  setStatus(`${deckLabel} — ${jobs.length} unique cards. Building...`);
   setProgress(0, jobs.length);
 
-  const zip = new JSZip();
   let done = 0;
-
-  // Pre-generate the default back placeholder if pairing is on.
-  const state = {
-    slot: 0,
-    defaultBack: opts.pairBacks ? await makeDefaultBackBlob() : null,
-  };
-
-  // Process sequentially to be polite to Scryfall and to keep memory low.
   for (let i = 0; i < jobs.length; i++) {
     try {
       await processJob(state, jobs[i], opts, zip, els.gallery);
     } catch (e) {
-      // Carry the job so the Retry button can re-run just this one.
-      failures.push({ name: jobs[i].name, error: e.message, job: jobs[i] });
+      passFailures.push({ name: jobs[i].name, error: e.message, job: jobs[i] });
     }
     done++;
     setProgress(done, jobs.length);
     setStatus(
-      `Building... ${done}/${jobs.length} cards${failures.length ? ` (${failures.length} failed)` : ""}`
+      `Building... ${done}/${jobs.length} cards${passFailures.length ? ` (${passFailures.length} failed)` : ""}`,
     );
   }
 
-  // Add manifest.
+  // Merge this pass into the running build.
+  const allJobs = [...retryCtx.jobs, ...jobs];
+  for (const name of initialUnresolved) {
+    passFailures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
+  }
+  for (const f of newTokenFailures) {
+    passFailures.push({ name: `Token discovery: ${f.name}`, error: f.error });
+  }
+  const mergedDeckLabel = append ? `${retryCtx.deckLabel} + ${deckLabel}` : deckLabel;
+
+  // Overwrite the manifest with the merged view (zip.file replaces).
   zip.file(
     "manifest.json",
     JSON.stringify(
       {
-        source: deckLabel,
-        unique_cards: jobs.length,
-        total_copies: totalCopies,
+        source: mergedDeckLabel,
+        unique_cards: allJobs.length,
+        total_copies: allJobs.reduce((a, j) => a + j.qty, 0),
         options: opts,
-        failures,
+        failures: [...liveFailures, ...passFailures],
       },
       null,
-      2
-    )
+      2,
+    ),
   );
+
+  // Commit retryCtx and the failure list BEFORE attempting zip gen. The
+  // per-card files are already inside `zip` from the build loop above, so
+  // retryCtx.jobs needs to reflect them; otherwise a zip-gen failure would
+  // leave retryCtx pointing at a zip whose contents the dedupe code
+  // doesn't know about.
+  liveFailures = [...liveFailures, ...passFailures];
+  retryCtx.state = state;
+  retryCtx.zip = zip;
+  retryCtx.opts = opts;
+  retryCtx.jobs = allJobs;
+  retryCtx.jobsLen = allJobs.length;
+  retryCtx.deckLabel = mergedDeckLabel;
 
   setStatus("Zipping...");
   try {
@@ -1113,35 +1169,34 @@ async function run() {
     els.go.disabled = false;
     return;
   }
-  lastZipName = `${slug(deckLabel)}_tcgplaytest.zip`;
+  lastZipName = `${slug(mergedDeckLabel)}_tcgplaytest.zip`;
 
-  const goodCount = jobs.length - failures.length;
-  els.resultSummary.textContent = `Built ${goodCount}/${jobs.length} cards (${
-    Object.keys(zip.files).length - 1
-  } files in ZIP)`;
+  // Surface non-retryable failures (unresolved-by-name, token discovery)
+  // in the headline too — otherwise "Built 100/100" hides the 3 unresolved
+  // entries the user can see in the failures box below.
+  const builtJobs = allJobs.length - liveFailures.filter((f) => f.job).length;
+  const failTail = liveFailures.length
+    ? ` — ${liveFailures.length} failure${liveFailures.length === 1 ? "" : "s"} below`
+    : "";
+  els.resultSummary.textContent =
+    `Built ${builtJobs}/${allJobs.length} cards (${Object.keys(zip.files).length - 1} files in ZIP)${failTail}`;
   els.result.hidden = false;
+  els.addAnotherBtn.hidden = false;
 
   // state.slot is the number of physical cards we wrote — fronts only.
   // tcgplaytest charges per card, not per face, so a card with a custom
   // back still counts once. Non-US shipping varies and isn't surfaced.
   renderCostEstimate(state.slot);
-
-  for (const name of initialUnresolved) {
-    failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
-  }
-  for (const f of tokenDiscoveryFailures) {
-    failures.push({ name: `Token discovery: ${f.name}`, error: f.error });
-  }
-  liveFailures = failures;
-  retryCtx.state = state;
-  retryCtx.zip = zip;
-  retryCtx.opts = opts;
-  retryCtx.jobsLen = jobs.length;
-  retryCtx.deckLabel = deckLabel;
   renderFailures(liveFailures);
-  await renderDeckStats(jobs);
+  await renderDeckStats(allJobs);
 
-  setStatus("Done. Click Download ZIP, then drag-drop into TCGPlaytest.", "ok");
+  // Don't paint the success-green "ok" colour when the failures box has
+  // entries — that contradicts the failure list right below.
+  const hadFailures = liveFailures.length > 0;
+  const message = append
+    ? "Added. Click Download ZIP, or add another deck."
+    : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.";
+  setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
   els.go.disabled = false;
 }
 
@@ -1154,6 +1209,18 @@ els.go.addEventListener("click", () => {
 
 els.retryBtn.addEventListener("click", () => {
   retryFailures().catch((e) => setStatus(`Retry failed: ${e.message}`, "error"));
+});
+
+els.addAnotherBtn.addEventListener("click", () => {
+  // Arm append mode and bring the user back to the input. Build options
+  // (pair-backs / tokens / skip-basics) are locked from the first pass —
+  // the original `opts` lives on retryCtx and is reused on the next click.
+  appendMode = true;
+  els.go.textContent = "Add to order";
+  els.input.value = "";
+  $("decklist-input").value = "";
+  els.input.focus();
+  setStatus("Paste another deck URL or decklist, then click Add to order.");
 });
 
 els.input.addEventListener("keydown", (e) => {

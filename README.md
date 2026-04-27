@@ -27,6 +27,12 @@ The frontend covers the same options as the CLI:
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
 of the same deck are near-instant after the first run.
 
+After a deck builds, an **Add another deck** button appears next to
+Download ZIP — click it to paste a second deck URL and append its cards
+to the same order (continuous slot numbers, merged stats / cost
+estimate, deduped tokens). Useful for batching multiple decks into one
+tcgplaytest order.
+
 ## CLI setup
 
 ```bash
