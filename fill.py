@@ -391,13 +391,28 @@ def _scryfall_wait() -> None:
         _scryfall_last_call = time.monotonic()
 
 
-def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str | None]:
-    """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
-    this carries both faces so the caller can pair them per-slot."""
+_scryfall_payload_cache: dict[str, dict] = {}
+
+
+def scryfall_card_payload(uid: str, session: requests.Session) -> dict:
+    """Fetch + cache the full Scryfall card payload for `uid`. Multiple
+    callers (image lookup + token discovery) share the same response so we
+    don't double-spend the rate-limit budget."""
+    cached = _scryfall_payload_cache.get(uid)
+    if cached is not None:
+        return cached
     _scryfall_wait()
     r = session.get(SCRYFALL_CARD.format(uid), timeout=30)
     r.raise_for_status()
     d = r.json()
+    _scryfall_payload_cache[uid] = d
+    return d
+
+
+def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str | None]:
+    """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
+    this carries both faces so the caller can pair them per-slot."""
+    d = scryfall_card_payload(uid, session)
     layout = d.get("layout", "")
     if "image_uris" in d:
         return d["image_uris"]["png"], None
@@ -409,6 +424,49 @@ def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str |
     if faces and "image_uris" in faces[0]:
         return faces[0]["image_uris"]["png"], None
     raise RuntimeError(f"No image_uris for {uid} ({d.get('name')})")
+
+
+def _discover_tokens(
+    jobs: list[CardJob], session: requests.Session
+) -> tuple[list[CardJob], list[str]]:
+    """Walk every main-deck card's all_parts, dedupe tokens by Scryfall UID,
+    and return (new_token_jobs, failure_messages). Cards without a
+    scryfall_uid (Archidekt customs) are skipped silently. Network/runtime
+    failures on any one card are recorded but don't abort discovery."""
+    token_jobs: dict[str, CardJob] = {}
+    failures: list[str] = []
+    for job in jobs:
+        if not job.scryfall_uid:
+            continue
+        try:
+            refs = scryfall_token_refs(job.scryfall_uid, session)
+        except (requests.RequestException, RuntimeError) as e:
+            failures.append(f"{job.name}: {e}")
+            continue
+        for token_uid, token_name in refs:
+            if token_uid not in token_jobs:
+                token_jobs[token_uid] = CardJob(
+                    name=f"{token_name} (token)",
+                    qty=1,
+                    scryfall_uid=token_uid,
+                    custom_image_url=None,
+                    set_code=None,
+                    collector_number=None,
+                )
+    return list(token_jobs.values()), failures
+
+
+def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str]]:
+    """Return [(token_uid, token_name), ...] for tokens this card creates.
+    Filters to `component == "token"`. Scryfall classifies emblems as tokens
+    (with `layout == "emblem"`), so this catches both. Meld result cards
+    use `component == "meld_result"` and are intentionally not included."""
+    d = scryfall_card_payload(uid, session)
+    return [
+        (p["id"], p.get("name") or f"token-{p['id'][:8]}")
+        for p in (d.get("all_parts") or [])
+        if p.get("component") == "token" and p.get("id")
+    ]
 
 
 def resolve_urls(
@@ -551,6 +609,12 @@ def main() -> int:
         "Defaults to assets/default_back.png (a meme back) "
         "shipped with the repo.",
     )
+    ap.add_argument(
+        "--include-tokens",
+        action="store_true",
+        help="Append every token / emblem the main deck creates (one of each "
+        "unique token, looked up from Scryfall's all_parts) after the deck.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -593,6 +657,14 @@ def main() -> int:
 
     session = requests.Session()
     session.headers.update(UA)
+
+    if args.include_tokens:
+        token_jobs, token_failures = _discover_tokens(jobs, session)
+        if token_jobs:
+            print(f"  + {len(token_jobs)} unique tokens / emblems")
+            jobs = list(jobs) + token_jobs
+        if token_failures:
+            print(f"  (skipped token discovery on {len(token_failures)} cards)")
 
     manifest: list[dict] = []
     failures: list[tuple[str, str]] = []
