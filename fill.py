@@ -102,6 +102,9 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
     m = _TAPPEDOUT_RE.search(s)
     if m:
         return "tappedout", (m.group(1),)
+    m = _EDHREC_RE.search(s)
+    if m:
+        return "edhrec", (m.group(1),)
     m = _MTGGOLDFISH_RE.search(s)
     if m:
         return "mtggoldfish", (m.group(1),)
@@ -122,6 +125,7 @@ def fetch_deck(input_str: str) -> list[CardJob]:
         "archidekt": _fetch_archidekt,
         "moxfield": _fetch_moxfield,
         "tappedout": _fetch_tappedout,
+        "edhrec": _fetch_edhrec,
         "deckstats": lambda *a: _fetch_cloudflare_blocked("Deckstats", *a),
         "mtggoldfish": lambda *a: _fetch_cloudflare_blocked("MTGGoldfish", *a),
     }
@@ -354,6 +358,7 @@ def _jobs_from_decklist(text: str) -> list[CardJob]:
 
 
 _TAPPEDOUT_RE = re.compile(r"tappedout\.net/mtg-decks/([A-Za-z0-9_-]+)", re.I)
+_EDHREC_RE = re.compile(r"edhrec\.com/deckpreview/([A-Za-z0-9_-]+)", re.I)
 # Deckstats and MTGGoldfish use Cloudflare JS challenges that block plain
 # python requests; the URL patterns are detected only so we can give the
 # user a clear "paste the decklist instead" message.
@@ -371,6 +376,44 @@ def _fetch_tappedout(slug: str) -> list[CardJob]:
         )
     r.raise_for_status()
     return _jobs_from_decklist(r.text)
+
+
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
+    re.S,
+)
+
+
+def _fetch_edhrec(deck_hash: str) -> list[CardJob]:
+    """EDHREC's `/deckpreview/<hash>` page is a Next.js SSR app — the deck
+    is embedded in the page's `__NEXT_DATA__` JSON blob as a list of plain
+    `"N Card Name"` strings, which we hand straight to the decklist parser.
+
+    The buildId-keyed `_next/data/.../*.json` endpoint serves the same
+    payload but rotates on every EDHREC deploy. Reading the inline blob is
+    stable and one network round-trip."""
+    url = f"https://edhrec.com/deckpreview/{deck_hash}"
+    r = requests.get(url, headers=UA, timeout=30)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"EDHREC returned {r.status_code} for deck '{deck_hash}'. "
+            "Check the URL — the hash is the segment after /deckpreview/."
+        )
+    r.raise_for_status()
+    m = _NEXT_DATA_RE.search(r.text)
+    if not m:
+        raise SystemExit(
+            "EDHREC page didn't include the expected __NEXT_DATA__ blob — "
+            "their site may have changed shape. Open an issue."
+        )
+    try:
+        payload = json.loads(m.group(1))
+        deck = payload["props"]["pageProps"]["data"]["deck"]
+    except (KeyError, ValueError) as e:
+        raise SystemExit(f"Could not extract decklist from EDHREC: {e}") from e
+    if not isinstance(deck, list) or not deck:
+        raise SystemExit("EDHREC payload had no `deck` list — page shape changed.")
+    return _jobs_from_decklist("\n".join(str(line) for line in deck))
 
 
 def _fetch_cloudflare_blocked(site: str, *_: str) -> list[CardJob]:
