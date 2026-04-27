@@ -253,9 +253,41 @@ _SECTION_HEADERS = re.compile(
 )
 
 
+def _parse_mtgo_dek(text: str) -> list[tuple[int, str, str | None, str | None]]:
+    """Parse Magic Online .dek XML. Each `<Cards>` element carries
+    Quantity, Name, and Sideboard attributes; we keep main-deck rows.
+    Returns the same tuple shape as `_parse_decklist`."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        # MTGO .dek files are trusted user input from the local filesystem,
+        # but parse defensively anyway — defusedxml isn't a dependency.
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise SystemExit(f"Could not parse MTGO .dek XML: {e}") from e
+    out: list[tuple[int, str, str | None, str | None]] = []
+    for el in root.iter():
+        if not el.tag.endswith("Cards"):
+            continue
+        if (el.attrib.get("Sideboard") or "").lower() == "true":
+            continue
+        try:
+            qty = int(el.attrib.get("Quantity", "0"))
+        except ValueError:
+            continue
+        name = (el.attrib.get("Name") or "").strip()
+        if qty <= 0 or not name:
+            continue
+        out.append((qty, name, None, None))
+    return out
+
+
 def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
     """Return [(qty, name, set_code|None, collector|None), ...] for the
-    main deck only. Sideboard / maybeboard / token sections are skipped."""
+    main deck only. Sideboard / maybeboard / token sections are skipped.
+    Auto-detects MTGO `.dek` XML."""
+    if text.lstrip().startswith("<?xml") or "<Deck" in text[:200]:
+        return _parse_mtgo_dek(text)
     out: list[tuple[int, str, str | None, str | None]] = []
     in_excluded = False
     for raw in text.splitlines():
