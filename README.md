@@ -1,6 +1,6 @@
 # playtestproxy-fill
 
-Pull a deck from Archidekt and produce print-ready images for tcgplaytest.com.
+Pull a deck from Archidekt or Moxfield and produce print-ready images for tcgplaytest.com.
 Includes a Python CLI, a Playwright auto-uploader, and a no-install web
 frontend at <https://babyhuey.github.io/playtestproxy-fill/>.
 
@@ -11,7 +11,7 @@ DFC face-2 backs + 97 default backs), Sequential Backs upload aligned.
 ## Web frontend (no install)
 
 Just visit <https://babyhuey.github.io/playtestproxy-fill/>, paste your
-Archidekt deck URL, click Fetch & build, download the ZIP, drag the
+Archidekt or Moxfield deck URL, click Fetch & build, download the ZIP, drag the
 `fronts/` and `backs/` folders into tcgplaytest.
 
 The frontend has the same options as the CLI, including a custom-back
@@ -28,20 +28,31 @@ python3 -m venv .venv
 ## Step 1 — Generate images
 
 ```bash
-.venv/bin/python fill.py <archidekt_deck_id> -o out --pair-backs
+.venv/bin/python fill.py <deck_url_or_id> -o out --pair-backs
 ```
 
-The deck id is the number in `https://archidekt.com/decks/<id>/...`.
+Recognised inputs:
+- An Archidekt URL (`https://archidekt.com/decks/21170685/...`) or numeric id.
+- A Moxfield URL (`https://www.moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg`)
+  or alphanumeric public id.
+- A TappedOut URL (`https://tappedout.net/mtg-decks/<slug>/`).
+- A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
+  Accepts MTG Arena exports, "1 Card Name" lines, optional `(SET) NUM`
+  trailers, and Sideboard/Maybeboard sections (skipped).
+
+Deckstats and MTGGoldfish URLs are recognised but blocked behind
+Cloudflare JS challenges. The tool prints a clear message asking you to
+copy the deck text and use `--decklist` instead.
 
 What this does:
-1. Fetches the deck from Archidekt's API. Card inclusion follows Archidekt's
+1. Fetches the deck from Archidekt or Moxfield's API. Card inclusion follows Archidekt or Moxfield's
    per-deck `categories[].includedInDeck` against each card's *primary*
    (first) category — so a Land tagged "Maybeboard" only counts if its
    primary category is excluded.
 2. For each card, picks an image source in this order:
    1. `overrides/<card_slug>.png` if present (drop your own art here).
       `overrides/<card_slug>.back.png` overrides a DFC's back face.
-   2. Archidekt-hosted custom image if the card is a custom.
+   2. Archidekt or Moxfield-hosted custom image if the card is a custom.
    3. Scryfall PNG for the **specific printing recorded in the deck**
       (Secret Lair / alt-art selections come through faithfully).
 3. Transform/MDFC cards yield two faces — front for the front uploader,
@@ -147,9 +158,9 @@ upload.py <images_dir>
 
 ## Notes
 
-- The Archidekt API (`https://archidekt.com/api/decks/<id>/`) is undocumented
+- The Archidekt or Moxfield API (`https://archidekt.com/api/decks/<id>/`) is undocumented
   but stable. CORS is locked to localhost:3000, so the web frontend routes
-  Archidekt through corsproxy.io. Scryfall has open CORS.
+  Archidekt or Moxfield through corsproxy.io. Scryfall has open CORS.
 - Scryfall calls are globally rate-limited to ~10/s (their published cap)
   via a thread-shared lock.
 - tcgplaytest's design page is fully client-side (Canvas2D + IndexedDB);

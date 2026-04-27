@@ -32,6 +32,7 @@ import requests
 from PIL import Image, ImageOps  # noqa: F401  (ImageOps reserved for future use)
 
 ARCHIDEKT_DECK = "https://archidekt.com/api/decks/{}/"
+MOXFIELD_DECK = "https://api2.moxfield.com/v3/decks/all/{}"
 SCRYFALL_CARD = "https://api.scryfall.com/cards/{}"
 
 CARD_W_IN, CARD_H_IN = 2.48, 3.46  # MTG card art area target before bleed
@@ -56,7 +57,70 @@ def slug(name: str) -> str:
     return s[:80] or "card"
 
 
-def fetch_deck(deck_id: str) -> list[CardJob]:
+# Source detection ---------------------------------------------------------
+# Each source: regex(es) that match its deck URL, plus a fetcher that takes
+# the bare id and returns CardJob list. The dispatcher picks the first match;
+# a pure-numeric id falls through to Archidekt for backwards compat.
+
+_ARCHIDEKT_RE = re.compile(r"archidekt\.com/decks/(\d+)", re.I)
+_MOXFIELD_RE = re.compile(r"moxfield\.com/decks/([A-Za-z0-9_-]{12,})", re.I)
+
+
+def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
+    """Return (source_name, args_for_fetcher) for a deck URL or bare id.
+
+    Recognised:
+      - Archidekt URL  -> ("archidekt",  (numeric_id,))
+      - Moxfield URL   -> ("moxfield",   (public_id,))
+      - TappedOut URL  -> ("tappedout",  (slug,))
+      - Deckstats URL  -> ("deckstats",  (owner_id, deck_id))
+      - MTGGoldfish URL-> ("mtggoldfish",(deck_id,))
+      - Numeric id     -> ("archidekt",  (id,))   (legacy CLI usage)
+      - Alphanumeric id-> ("moxfield",   (id,))
+    """
+    s = input_str.strip()
+    m = _ARCHIDEKT_RE.search(s)
+    if m:
+        return "archidekt", (m.group(1),)
+    m = _MOXFIELD_RE.search(s)
+    if m:
+        return "moxfield", (m.group(1),)
+    m = _DECKSTATS_RE.search(s)
+    if m:
+        return "deckstats", (m.group(1), m.group(2))
+    m = _TAPPEDOUT_RE.search(s)
+    if m:
+        return "tappedout", (m.group(1),)
+    m = _MTGGOLDFISH_RE.search(s)
+    if m:
+        return "mtggoldfish", (m.group(1),)
+    if s.isdigit():
+        return "archidekt", (s,)
+    if re.fullmatch(r"[A-Za-z0-9_-]{12,}", s):
+        return "moxfield", (s,)
+    raise SystemExit(
+        f"Could not recognise '{input_str}' as a supported deck. "
+        "Paste an Archidekt, Moxfield, TappedOut, Deckstats, or MTGGoldfish URL, "
+        "or use --decklist with a path / '-' to pipe a plain decklist."
+    )
+
+
+def fetch_deck(input_str: str) -> list[CardJob]:
+    source, args = detect_source(input_str)
+    fetchers = {
+        "archidekt": _fetch_archidekt,
+        "moxfield": _fetch_moxfield,
+        "tappedout": _fetch_tappedout,
+        "deckstats": lambda *a: _fetch_cloudflare_blocked("Deckstats", *a),
+        "mtggoldfish": lambda *a: _fetch_cloudflare_blocked("MTGGoldfish", *a),
+    }
+    fn = fetchers.get(source)
+    if fn is None:
+        raise SystemExit(f"Unknown source: {source}")
+    return fn(*args)
+
+
+def _fetch_archidekt(deck_id: str) -> list[CardJob]:
     r = requests.get(ARCHIDEKT_DECK.format(deck_id), headers=UA, timeout=30)
     if 400 <= r.status_code < 500:
         # Authoritative — deck doesn't exist or is private.
@@ -104,6 +168,207 @@ def fetch_deck(deck_id: str) -> list[CardJob]:
             )
         )
     return jobs
+
+
+# Moxfield boards that count toward the playtest deck. Tokens / planes /
+# schemes / attractions / stickers / contraptions are gameplay accessories
+# that aren't part of the deck proper; sideboard and maybeboard are
+# explicit user-selected exclusions.
+_MOXFIELD_DECK_BOARDS = ("commanders", "mainboard", "companions", "signatureSpells")
+
+# Browser-style headers needed because the Moxfield API rejects plain-Python
+# user-agents at the edge (Cloudflare).
+_MOXFIELD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Origin": "https://www.moxfield.com",
+    "Referer": "https://www.moxfield.com/",
+}
+
+
+def _fetch_moxfield(public_id: str) -> list[CardJob]:
+    r = requests.get(MOXFIELD_DECK.format(public_id), headers=_MOXFIELD_HEADERS, timeout=30)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"Moxfield returned {r.status_code} for deck {public_id}. "
+            "Check that the deck exists and is public."
+        )
+    r.raise_for_status()
+    data = r.json()
+    boards = data.get("boards") or {}
+    jobs: list[CardJob] = []
+    for board_name in _MOXFIELD_DECK_BOARDS:
+        cards = (boards.get(board_name) or {}).get("cards", {})
+        # Moxfield's `cards` is a dict keyed by an internal id; iteration
+        # order is not stable across API responses. Sort by card name for
+        # deterministic slot numbering across runs.
+        for entry in sorted(cards.values(), key=lambda e: (e.get("card") or {}).get("name") or ""):
+            card = entry.get("card") or {}
+            uid = card.get("scryfall_id")
+            jobs.append(
+                CardJob(
+                    name=card.get("name") or f"moxfield-{card.get('id')}",
+                    qty=int(entry.get("quantity") or 1),
+                    scryfall_uid=uid,
+                    custom_image_url=None,  # Moxfield's custom-art workflow uses Scryfall
+                    set_code=card.get("set"),
+                    collector_number=card.get("cn"),
+                )
+            )
+    return jobs
+
+
+# Plain-text decklist support ---------------------------------------------
+# Used for: direct user paste, TappedOut, MTGGoldfish, Deckstats text export,
+# MTG Arena export, anything that comes out as "1 Card Name" lines.
+
+_DECKLIST_LINE = re.compile(
+    r"""^\s*
+        (?:SB:\s*)?                              # Sideboard prefix (some exporters)
+        (\d+)                                    # quantity
+        \s*[xX]?\s+                              # 'x' separator optional
+        ([^()\n]+?)                              # card name (lazy)
+        (?:\s+\(([A-Za-z0-9]{2,6})\)             # optional (SET) — anchors collector
+           (?:\s+([\w*★]+))?                     # collector number, only if SET present
+        )?
+        \s*$""",
+    re.VERBOSE,
+)
+_SECTION_HEADERS = re.compile(
+    r"^\s*(?://|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard)\s*:?\s*$",
+    re.I,
+)
+
+
+def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
+    """Return [(qty, name, set_code|None, collector|None), ...] for the
+    main deck only. Sideboard / maybeboard / token sections are skipped."""
+    out: list[tuple[int, str, str | None, str | None]] = []
+    in_excluded = False
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        sec = _SECTION_HEADERS.match(line)
+        if sec:
+            in_excluded = sec.group(1).lower() not in {"deck", "main", "mainboard"}
+            continue
+        if line.lstrip().startswith(("//", "#")):
+            continue
+        if in_excluded or line.lstrip().startswith("SB:"):
+            continue
+        m = _DECKLIST_LINE.match(line)
+        if not m:
+            continue
+        qty = int(m.group(1))
+        name = m.group(2).strip().rstrip(",")
+        set_code = (m.group(3) or "").lower() or None
+        collector = m.group(4) or None
+        out.append((qty, name, set_code, collector))
+    return out
+
+
+def _scryfall_lookup_named(
+    name: str, set_code: str | None, collector: str | None, session: requests.Session
+) -> str | None:
+    """Resolve a card name to a Scryfall UID. Set+collector first (most
+    specific), then exact-name lookup as fallback."""
+    if set_code and collector:
+        _scryfall_wait()
+        r = session.get(
+            f"https://api.scryfall.com/cards/{set_code}/{collector}",
+            headers=UA,
+            timeout=20,
+        )
+        if r.ok:
+            return r.json().get("id")
+    _scryfall_wait()
+    params = {"exact": name}
+    if set_code:
+        params["set"] = set_code
+    r = session.get(
+        "https://api.scryfall.com/cards/named",
+        headers=UA,
+        params=params,
+        timeout=20,
+    )
+    if r.ok:
+        return r.json().get("id")
+    if r.status_code == 404 and set_code:
+        # The deck pinned a set we don't have; retry by name only.
+        _scryfall_wait()
+        r = session.get(
+            "https://api.scryfall.com/cards/named",
+            headers=UA,
+            params={"exact": name},
+            timeout=20,
+        )
+        if r.ok:
+            return r.json().get("id")
+    return None
+
+
+def _jobs_from_decklist(text: str) -> list[CardJob]:
+    """Parse decklist text and resolve each line via Scryfall name lookup."""
+    parsed = _parse_decklist(text)
+    if not parsed:
+        raise SystemExit("Could not parse any cards from the decklist.")
+    session = requests.Session()
+    session.headers.update(UA)
+    jobs: list[CardJob] = []
+    unresolved: list[str] = []
+    for qty, name, set_code, collector in parsed:
+        uid = _scryfall_lookup_named(name, set_code, collector, session)
+        if not uid:
+            unresolved.append(name)
+            continue
+        jobs.append(
+            CardJob(
+                name=name,
+                qty=qty,
+                scryfall_uid=uid,
+                custom_image_url=None,
+                set_code=set_code,
+                collector_number=collector,
+            )
+        )
+    if unresolved:
+        print(f"WARNING: {len(unresolved)} cards could not be resolved on Scryfall:")
+        for n in unresolved:
+            print(f"  - {n}")
+    return jobs
+
+
+_TAPPEDOUT_RE = re.compile(r"tappedout\.net/mtg-decks/([A-Za-z0-9_-]+)", re.I)
+# Deckstats and MTGGoldfish use Cloudflare JS challenges that block plain
+# python requests; the URL patterns are detected only so we can give the
+# user a clear "paste the decklist instead" message.
+_DECKSTATS_RE = re.compile(r"deckstats\.net/decks/(\d+)/(\d+)", re.I)
+_MTGGOLDFISH_RE = re.compile(r"mtggoldfish\.com/(?:deck|archetype)/(\d+)", re.I)
+
+
+def _fetch_tappedout(slug: str) -> list[CardJob]:
+    url = f"https://tappedout.net/mtg-decks/{slug}/?fmt=txt"
+    r = requests.get(url, headers=UA, timeout=30)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"TappedOut returned {r.status_code} for deck '{slug}'. "
+            "Check the slug and that the deck is public."
+        )
+    r.raise_for_status()
+    return _jobs_from_decklist(r.text)
+
+
+def _fetch_cloudflare_blocked(site: str, *_: str) -> list[CardJob]:
+    raise SystemExit(
+        f"{site} sits behind a Cloudflare JS challenge that blocks programmatic "
+        "fetches. Open the deck in your browser, copy the decklist, and run with "
+        "--decklist - (or save to a file). The text parser handles the standard "
+        "MTGA / 'N Card Name' format."
+    )
 
 
 SINGLE_PIECE_LAYOUTS = {"split", "flip", "adventure", "aftermath", "fuse"}
@@ -249,7 +514,19 @@ def make_default_back(dpi: int, bleed_mm: float) -> Image.Image:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("deck_id", help="Archidekt deck id (the number in the URL)")
+    ap.add_argument(
+        "deck",
+        nargs="?",
+        help="Deck URL or id. Recognised: Archidekt, Moxfield, TappedOut, "
+        "Deckstats, or MTGGoldfish URL — or a bare Archidekt numeric id / "
+        "Moxfield public id. Omit when using --decklist.",
+    )
+    ap.add_argument(
+        "--decklist",
+        help="Path to a plain-text decklist (or '-' to read from stdin). "
+        "Lines like '1 Sol Ring' or '4 Lightning Bolt (M21) 162'. "
+        "Sections labelled Sideboard / Maybeboard / Tokens are skipped.",
+    )
     ap.add_argument("-o", "--out", default="out", help="Output directory")
     ap.add_argument("--overrides", default="overrides", help="Override images dir")
     ap.add_argument("--dpi", type=int, default=300)
@@ -296,8 +573,18 @@ def main() -> int:
         else:
             default_back_img = make_default_back(args.dpi, 0 if args.no_bleed else args.bleed_mm)
 
-    print(f"Fetching deck {args.deck_id}...")
-    jobs = fetch_deck(args.deck_id)
+    if args.decklist:
+        if args.decklist == "-":
+            text = sys.stdin.read()
+        else:
+            text = Path(args.decklist).read_text(encoding="utf-8")
+        print(f"Parsing decklist ({len(text.splitlines())} lines)...")
+        jobs = _jobs_from_decklist(text)
+    elif args.deck:
+        print(f"Fetching deck {args.deck}...")
+        jobs = fetch_deck(args.deck)
+    else:
+        ap.error("supply a deck URL/id or --decklist")
     total_cards = sum(j.qty for j in jobs)
     print(
         f"  {len(jobs)} unique cards, {total_cards} total copies"
@@ -382,7 +669,7 @@ def main() -> int:
     (out_dir / "manifest.json").write_text(
         json.dumps(
             {
-                "deck_id": args.deck_id,
+                "deck_id": args.deck or f"decklist:{args.decklist}",
                 "paired_backs": args.pair_backs,
                 "cards": manifest,
                 "failures": failures,
