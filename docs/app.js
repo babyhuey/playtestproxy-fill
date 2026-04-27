@@ -410,17 +410,80 @@ function buildJobsMoxfield(deck) {
   return jobs;
 }
 
-// Module-level cache of full Scryfall card payloads, shared across
-// resolveUrls and token discovery so we don't double-spend the rate limit.
+// Two-tier Scryfall payload cache: in-memory Map for the current build,
+// persistent IndexedDB for cross-session reuse. Card metadata on Scryfall
+// almost never changes, so a 7-day TTL is safe and saves ~100ms × 100 cards
+// on a re-build of the same deck.
 const _scryfallCache = new Map();
+const SCRYFALL_DB_NAME = "playtestproxy-fill";
+const SCRYFALL_STORE = "scryfall-cards";
+const SCRYFALL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let _idbPromise = null;
 
-async function scryfallCard(uid) {
-  const hit = _scryfallCache.get(uid);
-  if (hit) return hit;
-  await new Promise((r) => setTimeout(r, 80));
-  const data = await fetchJson(SCRYFALL(uid));
-  _scryfallCache.set(uid, data);
-  return data;
+function openIdb() {
+  // Schema is implicit at version 1. Any schema change requires either a
+  // version bump with a real onupgradeneeded migration, or a new DB name.
+  if (_idbPromise) return _idbPromise;
+  _idbPromise = new Promise((resolve) => {
+    if (!("indexedDB" in self)) return resolve(null);  // Safari private mode etc.
+    const req = indexedDB.open(SCRYFALL_DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(SCRYFALL_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => resolve(null);  // fall through to network on any DB failure
+    req.onblocked = () => resolve(null);
+  });
+  return _idbPromise;
+}
+
+async function idbGet(key) {
+  const db = await openIdb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    const tx = db.transaction(SCRYFALL_STORE, "readonly");
+    const req = tx.objectStore(SCRYFALL_STORE).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => resolve(null);
+  });
+}
+
+async function idbSet(key, value) {
+  const db = await openIdb();
+  if (!db) return;
+  return new Promise((resolve) => {
+    const tx = db.transaction(SCRYFALL_STORE, "readwrite");
+    tx.objectStore(SCRYFALL_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => resolve();  // best-effort, never block the build
+    tx.onabort = () => resolve();
+  });
+}
+
+function scryfallCard(uid) {
+  // Store the *Promise* in the in-memory cache, not the resolved data. Two
+  // concurrent callers asking for the same UID land on the same in-flight
+  // request, so we never double-fetch even under rapid double-clicks.
+  // Resolved Promises are cheap to await — same micro-task overhead as a
+  // direct value return.
+  const inflight = _scryfallCache.get(uid);
+  if (inflight) return inflight;
+
+  const promise = (async () => {
+    const stored = await idbGet(uid);
+    if (stored && Date.now() - stored.fetchedAt < SCRYFALL_TTL_MS) {
+      return stored.data;
+    }
+    await new Promise((r) => setTimeout(r, 80));  // Scryfall rate-limit politeness
+    const data = await fetchJson(SCRYFALL(uid));
+    // Best-effort persist; awaiting is cheap because IDB writes are async-batched.
+    idbSet(uid, { data, fetchedAt: Date.now() });
+    return data;
+  })();
+
+  _scryfallCache.set(uid, promise);
+  // If the fetch fails, drop the rejected promise so a retry can try again
+  // instead of seeing the cached failure forever.
+  promise.catch(() => _scryfallCache.delete(uid));
+  return promise;
 }
 
 async function resolveUrls(job) {

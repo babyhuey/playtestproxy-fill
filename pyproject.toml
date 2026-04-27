@@ -14,6 +14,9 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "frontend: integration tests that drive the static frontend with a live browser",
+]
 
 [tool.coverage.run]
 source = ["fill"]
