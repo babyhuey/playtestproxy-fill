@@ -224,14 +224,22 @@ function parseMtgoDek(text) {
   // DOMParser.parseFromString as an XSS sink even when we only read
   // attributes. The schema is trivial enough to extract with regex.
   const xmlEntities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  // Decode the five XML named entities + numeric refs (decimal AND hex —
+  // some third-party .dek exporters emit `&#xC6;` for non-ASCII names like
+  // "Æther Vial"; missing this loses the character and breaks Scryfall lookup).
   const decode = (s) =>
-    s.replace(/&(amp|lt|gt|quot|apos|#(\d+));/g, (_, name, dec) =>
-      dec ? String.fromCharCode(Number(dec)) : xmlEntities[name],
-    );
+    s.replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-fA-F]+));/g, (_, name, dec, hex) => {
+      if (name) return xmlEntities[name];
+      if (dec) return String.fromCodePoint(Number(dec));
+      return String.fromCodePoint(parseInt(hex, 16));
+    });
   const attr = (chunk, key) => {
     const m = chunk.match(new RegExp(`\\b${key}="([^"]*)"`));
     return m ? decode(m[1]) : "";
   };
+  if (!/<Cards\b/.test(text)) {
+    throw new Error("MTGO .dek had no <Cards> elements — unexpected schema.");
+  }
   const out = [];
   for (const m of text.matchAll(/<Cards\b([^>]*?)\/?>/g)) {
     const chunk = m[1];
@@ -345,9 +353,15 @@ async function fetchEdhrecDecklist(deckHash) {
   }
   const deck = payload?.props?.pageProps?.data?.deck;
   if (!Array.isArray(deck) || !deck.length) {
-    throw new Error("EDHREC payload had no `deck` list.");
+    throw new Error("EDHREC payload had no `deck` list — page may be private or deleted.");
   }
-  return deck.map(String).join("\n");
+  // Schema drift guard: EDHREC ships strings of the form "1 Sol Ring".
+  // If they ever switch to objects, `String(x)` silently produces
+  // "[object Object]" and the user sees "0 cards" with no clue why.
+  if (typeof deck[0] !== "string" || !/^\s*\d+\s+\S/.test(deck[0])) {
+    throw new Error("EDHREC deck shape changed — please open an issue.");
+  }
+  return deck.join("\n");
 }
 
 async function fetchTappedOutText(slug) {
@@ -559,23 +573,29 @@ async function discoverTokens(jobs) {
   // token. Dedupes by lowercased name so different Scryfall printings of
   // the same token (e.g. "Treasure", "Faerie Rogue") collapse — otherwise
   // pair-tokens could land visually identical art on both sides.
-  const seen = new Map();  // lowercased name → job
-  let failed = 0;
+  // Dedupe key: (lowercased name, type_line) — name alone collapses
+  // legitimately distinct tokens that happen to share a name (e.g. the
+  // 1/1 W flying "Spirit" vs the Kamigawa colorless "Spirit").
+  const seen = new Map();
+  const failures = [];
   for (const job of jobs) {
     if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
     let data;
     try {
       data = await scryfallCard(job.uid);
-    } catch {
-      failed += 1;
+    } catch (e) {
+      failures.push({ name: job.name, error: e.message });
       continue;
     }
     for (const part of data.all_parts || []) {
       if (part.component !== "token" || !part.id) continue;
-      const key = (part.name || part.id).trim().toLowerCase();
+      const name = (part.name || "").trim();
+      if (!name) continue;  // skip nameless parts rather than collapse them
+      const tline = (part.type_line || "").trim().toLowerCase();
+      const key = `${name.toLowerCase()}|${tline}`;
       if (!seen.has(key)) {
         seen.set(key, {
-          name: `${part.name || "Token"} (token)`,
+          name: `${name} (token)`,
           qty: 1,
           uid: part.id,
           customUrl: null,
@@ -583,7 +603,7 @@ async function discoverTokens(jobs) {
       }
     }
   }
-  return { tokens: [...seen.values()], failed };
+  return { tokens: [...seen.values()], failures };
 }
 
 async function processJob(state, job, opts, zip, gallery) {
@@ -712,12 +732,19 @@ async function renderDeckStats(jobs) {
   let cmcCount = 0;
   const types = { Creature: 0, Instant: 0, Sorcery: 0, Artifact: 0, Enchantment: 0, Planeswalker: 0, Land: 0 };
   let identified = 0;
+  // Only count jobs that have a Scryfall UID we can look up — Archidekt
+  // customs (no UID) aren't deckbuilding signals worth aggregating.
+  const eligible = jobs.filter((j) => j.uid).length;
   for (const job of jobs) {
     if (!job.uid) continue;
     const inflight = _scryfallCache.get(job.uid);
     if (!inflight) continue;
     let card;
-    try { card = await inflight; } catch { continue; }
+    try {
+      card = await inflight;
+    } catch {
+      continue;
+    }
     if (!card) continue;
     identified += 1;
     for (const c of card.color_identity || []) colors.add(c);
@@ -730,11 +757,16 @@ async function renderDeckStats(jobs) {
     for (const k of Object.keys(types)) {
       if (new RegExp(`\\b${k}\\b`).test(tline)) {
         types[k] += job.qty;
-        break;  // pick the first matching primary type
+        break;
       }
     }
   }
-  if (!identified) { el.hidden = true; return; }
+  // Hide the badge if coverage is too thin to be meaningful — anything
+  // below 80% of eligible jobs would mislead more than it informs.
+  if (eligible === 0 || identified < eligible * 0.8) {
+    el.hidden = true;
+    return;
+  }
   el.replaceChildren();
 
   const colorWrap = document.createElement("span");
@@ -776,6 +808,12 @@ async function renderDeckStats(jobs) {
     span.append(lbl, String(n));
     el.append(span);
   }
+  if (identified < eligible) {
+    const note = document.createElement("span");
+    note.className = "stat-label";
+    note.textContent = `(based on ${identified}/${eligible} cards)`;
+    el.append(note);
+  }
   el.hidden = false;
 }
 
@@ -792,12 +830,11 @@ const retryCtx = {
 };
 
 async function rebuildZipBlob() {
+  // Re-throw on failure: the caller writes a "Built N/M cards" success
+  // summary right after this, and a stale `lastZipBlob` would mean the
+  // user clicks Download and gets the pre-retry ZIP without warning.
   setStatus("Re-zipping...");
-  try {
-    lastZipBlob = await retryCtx.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-  } catch (e) {
-    setStatus(`ZIP generation failed: ${e.message}`, "error");
-  }
+  lastZipBlob = await retryCtx.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }
 
 function renderFailures(failures) {
@@ -840,7 +877,13 @@ async function retryFailures() {
   }
   liveFailures = [...passthrough, ...remaining];
   renderFailures(liveFailures);
-  await rebuildZipBlob();
+  try {
+    await rebuildZipBlob();
+  } catch (e) {
+    setStatus(`ZIP generation failed: ${e.message}`, "error");
+    els.retryBtn.disabled = false;
+    return;
+  }
   const goodCount = retryCtx.jobsLen - liveFailures.filter((f) => f.job).length;
   els.resultSummary.textContent = `Built ${goodCount}/${retryCtx.jobsLen} cards (${
     Object.keys(retryCtx.zip.files).length - 1
@@ -849,7 +892,7 @@ async function retryFailures() {
     remaining.length
       ? `Retried — ${remaining.length} still failing.`
       : "Retried — all recovered. Re-download the ZIP.",
-    remaining.length ? "error" : "ok"
+    remaining.length ? "error" : "ok",
   );
   els.retryBtn.disabled = false;
 }
@@ -959,7 +1002,7 @@ async function run() {
   let jobs;
   let deckLabel;
   let initialUnresolved = [];
-  let tokenDiscoveryFailed = 0;
+  let tokenDiscoveryFailures = [];
   const failures = [];
   try {
     const loaded = await loadJobs(opts);
@@ -974,7 +1017,7 @@ async function run() {
 
   if (opts.includeTokens) {
     setStatus("Discovering tokens / emblems...");
-    const { tokens, failed } = await discoverTokens(jobs);
+    const { tokens, failures: tokenFailures } = await discoverTokens(jobs);
     if (tokens.length) {
       // Pairing requires pair-backs because Sequential Backs is the only
       // mechanism we have to assign per-card backs in tcgplaytest. If the
@@ -995,10 +1038,7 @@ async function run() {
         deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
       }
     }
-    if (failed) {
-      // One aggregated row instead of N opaque "[token discovery]" entries.
-      tokenDiscoveryFailed = failed;
-    }
+    tokenDiscoveryFailures = tokenFailures;
   }
 
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
@@ -1069,11 +1109,8 @@ async function run() {
   for (const name of initialUnresolved) {
     failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
   }
-  if (tokenDiscoveryFailed) {
-    failures.push({
-      name: `Token discovery skipped on ${tokenDiscoveryFailed} card${tokenDiscoveryFailed === 1 ? "" : "s"}`,
-      error: "Scryfall lookup failed; non-fatal — main deck still built.",
-    });
+  for (const f of tokenDiscoveryFailures) {
+    failures.push({ name: `Token discovery: ${f.name}`, error: f.error });
   }
   liveFailures = failures;
   retryCtx.state = state;

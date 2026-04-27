@@ -254,21 +254,22 @@ _SECTION_HEADERS = re.compile(
 
 
 def _parse_mtgo_dek(text: str) -> list[tuple[int, str, str | None, str | None]]:
-    """Parse Magic Online .dek XML. Each `<Cards>` element carries
-    Quantity, Name, and Sideboard attributes; we keep main-deck rows.
-    Returns the same tuple shape as `_parse_decklist`."""
+    """Parse Magic Online .dek XML. Returns the same tuple shape as
+    `_parse_decklist`. stdlib `ET.fromstring` is safe here for our use:
+    Python 3.7.1+ disables external entity resolution by default, and the
+    only data we read is element attributes."""
     import xml.etree.ElementTree as ET
 
     try:
-        # MTGO .dek files are trusted user input from the local filesystem,
-        # but parse defensively anyway — defusedxml isn't a dependency.
         root = ET.fromstring(text)
     except ET.ParseError as e:
         raise SystemExit(f"Could not parse MTGO .dek XML: {e}") from e
     out: list[tuple[int, str, str | None, str | None]] = []
+    saw_cards_element = False
     for el in root.iter():
         if not el.tag.endswith("Cards"):
             continue
+        saw_cards_element = True
         if (el.attrib.get("Sideboard") or "").lower() == "true":
             continue
         try:
@@ -279,6 +280,8 @@ def _parse_mtgo_dek(text: str) -> list[tuple[int, str, str | None, str | None]]:
         if qty <= 0 or not name:
             continue
         out.append((qty, name, None, None))
+    if not saw_cards_element:
+        raise SystemExit("MTGO .dek had no <Cards> elements — unexpected schema variant.")
     return out
 
 
@@ -433,14 +436,21 @@ def _fetch_edhrec(deck_hash: str) -> list[CardJob]:
             "EDHREC page didn't include the expected __NEXT_DATA__ blob — "
             "their site may have changed shape. Open an issue."
         )
+    # TypeError covers EDHREC's "deleted/private" response where
+    # `pageProps.data` is `null` and the next subscript fails on None.
     try:
         payload = json.loads(m.group(1))
         deck = payload["props"]["pageProps"]["data"]["deck"]
-    except (KeyError, ValueError) as e:
+    except (KeyError, TypeError, ValueError) as e:
         raise SystemExit(f"Could not extract decklist from EDHREC: {e}") from e
     if not isinstance(deck, list) or not deck:
-        raise SystemExit("EDHREC payload had no `deck` list — page shape changed.")
-    return _jobs_from_decklist("\n".join(str(line) for line in deck))
+        raise SystemExit("EDHREC payload had no `deck` list — page may be private or deleted.")
+    # Schema drift guard: EDHREC ships strings like "1 Sol Ring". If they
+    # ever switch to objects, str() silently produces "[object Object]"-
+    # equivalents and the decklist parser would emit a deck of 0 cards.
+    if not isinstance(deck[0], str) or not re.match(r"^\s*\d+\s+\S", deck[0]):
+        raise SystemExit("EDHREC deck shape changed — please open an issue.")
+    return _jobs_from_decklist("\n".join(deck))
 
 
 def _fetch_cloudflare_blocked(site: str, *_: str) -> list[CardJob]:
@@ -554,13 +564,14 @@ def _discover_tokens(
     jobs: list[CardJob], session: requests.Session
 ) -> tuple[list[CardJob], list[str]]:
     """Walk every main-deck card's all_parts and return (new_token_jobs,
-    failure_messages). Dedupes by lowercased token name so different
-    Scryfall printings of "Treasure" or "Faerie Rogue" collapse to one
-    job — otherwise --pair-tokens can put visually identical art on both
-    sides of a card. Cards without a scryfall_uid (Archidekt customs) are
-    skipped silently. Network/runtime failures on any one card are
-    recorded but don't abort discovery."""
-    token_jobs: dict[str, CardJob] = {}
+    failure_messages). Dedupes by (lowercased name, type_line) so
+    different printings of "Treasure" / "Faerie Rogue" collapse — but
+    legitimately distinct same-named tokens (e.g. the 1/1 W flying Spirit
+    vs. the Kamigawa colorless Spirit) stay separate. Cards without a
+    scryfall_uid (Archidekt customs) are skipped silently. Network /
+    runtime failures on any one card are recorded but don't abort
+    discovery."""
+    token_jobs: dict[tuple[str, str], CardJob] = {}
     failures: list[str] = []
     for job in jobs:
         if not job.scryfall_uid:
@@ -570,8 +581,8 @@ def _discover_tokens(
         except (requests.RequestException, RuntimeError) as e:
             failures.append(f"{job.name}: {e}")
             continue
-        for token_uid, token_name in refs:
-            key = token_name.strip().lower()
+        for token_uid, token_name, token_type in refs:
+            key = (token_name.strip().lower(), token_type.strip().lower())
             if key not in token_jobs:
                 token_jobs[key] = CardJob(
                     name=f"{token_name} (token)",
@@ -584,14 +595,19 @@ def _discover_tokens(
     return list(token_jobs.values()), failures
 
 
-def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str]]:
-    """Return [(token_uid, token_name), ...] for tokens this card creates.
-    Filters to `component == "token"`. Scryfall classifies emblems as tokens
-    (with `layout == "emblem"`), so this catches both. Meld result cards
-    use `component == "meld_result"` and are intentionally not included."""
+def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str, str]]:
+    """Return [(token_uid, token_name, token_type_line), ...] for tokens
+    this card creates. Filters to `component == "token"`. Scryfall
+    classifies emblems as tokens (with `layout == "emblem"`), so this
+    catches both. Meld result cards use `component == "meld_result"` and
+    are intentionally not included.
+
+    `type_line` is included so the caller can dedupe by (name, type_line);
+    name alone collides on legitimately distinct tokens like the 1/1 W
+    flying Spirit vs. the Kamigawa colorless Spirit."""
     d = scryfall_card_payload(uid, session)
     return [
-        (p["id"], p.get("name") or f"token-{p['id'][:8]}")
+        (p["id"], p.get("name") or f"token-{p['id'][:8]}", p.get("type_line") or "")
         for p in (d.get("all_parts") or [])
         if p.get("component") == "token" and p.get("id")
     ]
