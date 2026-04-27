@@ -30,7 +30,7 @@ jobs:
         # ~300MB of Chromium binaries; pip's cache doesn't cover them.
         # Key on dev-requirements.txt so a Playwright bump invalidates.
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('dev-requirements.txt') }}
