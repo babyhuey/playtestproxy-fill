@@ -450,6 +450,164 @@ def test_jobs_from_decklist_warns_on_unresolved(capsys):
     assert "Bogus Made Up Card" in out
 
 
+@responses.activate
+def test_scryfall_card_payload_caches():
+    """A second call for the same UID hits the cache, not the network."""
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-cache",
+        json={"id": "uid-cache", "name": "Cached"},
+        status=200,
+    )
+    fill._scryfall_payload_cache.clear()
+    s = fill.requests.Session()
+    a = fill.scryfall_card_payload("uid-cache", s)
+    b = fill.scryfall_card_payload("uid-cache", s)
+    assert a is b
+    assert len(responses.calls) == 1  # only one HTTP request
+
+
+@responses.activate
+def test_scryfall_token_refs_extracts_tokens_only():
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/bitter",
+        json={
+            "id": "bitter",
+            "name": "Bitterblossom",
+            "all_parts": [
+                {"id": "tok-1", "name": "Faerie Rogue", "component": "token"},
+                {"id": "self", "name": "Bitterblossom", "component": "combo_piece"},
+                {"id": "tok-2", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+    refs = fill.scryfall_token_refs("bitter", fill.requests.Session())
+    assert refs == [("tok-1", "Faerie Rogue"), ("tok-2", "Treasure")]
+
+
+@responses.activate
+def test_scryfall_token_refs_no_tokens():
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/bolt",
+        json={"id": "bolt", "name": "Lightning Bolt"},
+        status=200,
+    )
+    assert fill.scryfall_token_refs("bolt", fill.requests.Session()) == []
+
+
+@responses.activate
+def test_scryfall_token_refs_skips_self_reference():
+    """A combo_piece self-reference must not be returned as a token."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/self-ref",
+        json={
+            "id": "self-ref",
+            "name": "Self",
+            "all_parts": [
+                {"id": "self-ref", "name": "Self", "component": "combo_piece"},
+            ],
+        },
+        status=200,
+    )
+    assert fill.scryfall_token_refs("self-ref", fill.requests.Session()) == []
+
+
+@responses.activate
+def test_token_discovery_dedupes_across_cards():
+    """Two main-deck cards both producing the same token UID yield one
+    entry — exercises the dedupe-by-UID logic the way main() drives it."""
+    fill._scryfall_payload_cache.clear()
+    for parent_id in ["card-a", "card-b"]:
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{parent_id}",
+            json={
+                "id": parent_id,
+                "name": parent_id,
+                "all_parts": [
+                    {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+                ],
+            },
+            status=200,
+        )
+    s = fill.requests.Session()
+    seen: dict[str, fill.CardJob] = {}
+    for parent in ["card-a", "card-b"]:
+        for tok_uid, tok_name in fill.scryfall_token_refs(parent, s):
+            if tok_uid not in seen:
+                seen[tok_uid] = fill.CardJob(
+                    name=f"{tok_name} (token)",
+                    qty=1,
+                    scryfall_uid=tok_uid,
+                    custom_image_url=None,
+                    set_code=None,
+                    collector_number=None,
+                )
+    assert list(seen) == ["treasure-uid"]
+    assert seen["treasure-uid"].name == "Treasure (token)"
+
+
+@responses.activate
+def test_discover_tokens_end_to_end():
+    """`_discover_tokens` walks every job, skips no-UID jobs without an HTTP
+    call, dedupes tokens across cards, and reports network failures rather
+    than aborting the run. Exercises the production code path the way
+    main() drives it."""
+    fill._scryfall_payload_cache.clear()
+    # card-a and card-b both emit the same Treasure UID — must dedupe.
+    for cid in ("card-a", "card-b"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [
+                    {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+                ],
+            },
+            status=200,
+        )
+    # card-c: 500 error → recorded as failure but doesn't abort discovery.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-c",
+        json={"err": "boom"},
+        status=500,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    jobs = [
+        J("CardA", "card-a"),
+        J("Custom", None),  # no UID — skipped without HTTP
+        J("CardB", "card-b"),
+        J("CardC", "card-c"),
+    ]
+    new_jobs, failures = fill._discover_tokens(jobs, fill.requests.Session())
+
+    assert [j.name for j in new_jobs] == ["Treasure (token)"]
+    assert new_jobs[0].scryfall_uid == "treasure-uid"
+    assert len(failures) == 1
+    assert "CardC" in failures[0]
+    # No HTTP call for the Custom job: only card-a, card-b, card-c got hit.
+    assert len(responses.calls) == 3
+
+
 def test_cloudflare_blocked_raises_with_helpful_message():
     with pytest.raises(SystemExit, match="Cloudflare.*--decklist"):
         fill._fetch_cloudflare_blocked("Deckstats", "126143", "4305047")

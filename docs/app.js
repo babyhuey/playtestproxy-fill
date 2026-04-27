@@ -410,12 +410,24 @@ function buildJobsMoxfield(deck) {
   return jobs;
 }
 
+// Module-level cache of full Scryfall card payloads, shared across
+// resolveUrls and token discovery so we don't double-spend the rate limit.
+const _scryfallCache = new Map();
+
+async function scryfallCard(uid) {
+  const hit = _scryfallCache.get(uid);
+  if (hit) return hit;
+  await new Promise((r) => setTimeout(r, 80));
+  const data = await fetchJson(SCRYFALL(uid));
+  _scryfallCache.set(uid, data);
+  return data;
+}
+
 async function resolveUrls(job) {
   // Returns { front, back }. `back` is null unless this is a DFC.
   if (job.customUrl) return { front: job.customUrl, back: null };
   if (!job.uid) throw new Error("no Scryfall UID and no custom image");
-  await new Promise((r) => setTimeout(r, 80));
-  const data = await fetchJson(SCRYFALL(job.uid));
+  const data = await scryfallCard(job.uid);
   if (data.image_uris) return { front: data.image_uris.png, back: null };
   const faces = data.card_faces || [];
   if (faces.length && faces.every((f) => f.image_uris)) {
@@ -428,6 +440,36 @@ async function resolveUrls(job) {
     return { front: faces[0].image_uris.png, back: null };
   }
   throw new Error(`no image_uris for ${data.name || job.uid}`);
+}
+
+async function discoverTokens(jobs) {
+  // Walk all_parts on every main-deck card, dedupe by Scryfall UID, and
+  // return one token job per unique token. One physical token per design
+  // is enough — copies don't add information.
+  const seen = new Map();  // token UID → job
+  let failed = 0;
+  for (const job of jobs) {
+    if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
+    let data;
+    try {
+      data = await scryfallCard(job.uid);
+    } catch {
+      failed += 1;
+      continue;
+    }
+    for (const part of data.all_parts || []) {
+      if (part.component !== "token" || !part.id) continue;
+      if (!seen.has(part.id)) {
+        seen.set(part.id, {
+          name: `${part.name || "Token"} (token)`,
+          qty: 1,
+          uid: part.id,
+          customUrl: null,
+        });
+      }
+    }
+  }
+  return { tokens: [...seen.values()], failed };
 }
 
 async function processJob(state, job, opts, zip, gallery) {
@@ -611,6 +653,9 @@ async function run() {
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
   els.costEstimate.hidden = true;
+  // SPA: reset the Scryfall payload cache on every fresh run so the Map
+  // doesn't grow unbounded across multiple builds in the same tab.
+  _scryfallCache.clear();
   setProgress(0, 0);
   setStatus("Loading deck...");
 
@@ -619,11 +664,13 @@ async function run() {
     dpi: parseInt(els.dpi.value, 10) || 300,
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
+    includeTokens: $("opt-tokens").checked,
   };
 
   let jobs;
   let deckLabel;
   let initialUnresolved = [];
+  let tokenDiscoveryFailed = 0;
   try {
     const loaded = await loadJobs(opts);
     jobs = loaded.jobs;
@@ -633,6 +680,19 @@ async function run() {
     setStatus(e.message, "error");
     els.go.disabled = false;
     return;
+  }
+
+  if (opts.includeTokens) {
+    setStatus("Discovering tokens / emblems...");
+    const { tokens, failed } = await discoverTokens(jobs);
+    if (tokens.length) {
+      jobs = [...jobs, ...tokens];
+      deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+    }
+    if (failed) {
+      // One aggregated row instead of N opaque "[token discovery]" entries.
+      tokenDiscoveryFailed = failed;
+    }
   }
 
   const totalCopies = jobs.reduce((a, j) => a + j.qty, 0);
@@ -702,6 +762,12 @@ async function run() {
 
   for (const name of initialUnresolved) {
     failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
+  }
+  if (tokenDiscoveryFailed) {
+    failures.push({
+      name: `Token discovery skipped on ${tokenDiscoveryFailed} card${tokenDiscoveryFailed === 1 ? "" : "s"}`,
+      error: "Scryfall lookup failed; non-fatal — main deck still built.",
+    });
   }
   if (failures.length) {
     els.failures.hidden = false;
