@@ -57,7 +57,9 @@ const els = {
   gallery: $("gallery"),
   failures: $("failures"),
   failuresList: $("failures-list"),
+  retryBtn: $("retry-failures"),
   costEstimate: $("cost-estimate"),
+  deckStats: $("deck-stats"),
 };
 
 let lastZipBlob = null;
@@ -715,6 +717,162 @@ function renderCostEstimate(numCards) {
   el.hidden = false;
 }
 
+// --- Deck stats badge ---------------------------------------------------
+// Aggregated post-build from the Scryfall payloads we already fetched
+// during processJob. Pure read of `_scryfallCache` — no extra network.
+
+const COLOR_ORDER = ["W", "U", "B", "R", "G"];
+
+async function renderDeckStats(jobs) {
+  const el = els.deckStats;
+  if (!el) return;
+  const colors = new Set();
+  let cmcSum = 0;
+  let cmcCount = 0;
+  const types = { Creature: 0, Instant: 0, Sorcery: 0, Artifact: 0, Enchantment: 0, Planeswalker: 0, Land: 0 };
+  let identified = 0;
+  for (const job of jobs) {
+    if (!job.uid) continue;
+    const inflight = _scryfallCache.get(job.uid);
+    if (!inflight) continue;
+    let card;
+    try { card = await inflight; } catch { continue; }
+    if (!card) continue;
+    identified += 1;
+    for (const c of card.color_identity || []) colors.add(c);
+    const tline = (card.type_line || "").split("//")[0];
+    const isLand = /\bLand\b/.test(tline);
+    if (!isLand && typeof card.cmc === "number") {
+      cmcSum += card.cmc * job.qty;
+      cmcCount += job.qty;
+    }
+    for (const k of Object.keys(types)) {
+      if (new RegExp(`\\b${k}\\b`).test(tline)) {
+        types[k] += job.qty;
+        break;  // pick the first matching primary type
+      }
+    }
+  }
+  if (!identified) { el.hidden = true; return; }
+  el.replaceChildren();
+
+  const colorWrap = document.createElement("span");
+  const colorLabel = document.createElement("span");
+  colorLabel.className = "stat-label";
+  colorLabel.textContent = "Identity:";
+  colorWrap.append(colorLabel);
+  const present = COLOR_ORDER.filter((c) => colors.has(c));
+  if (!present.length) {
+    const pip = document.createElement("span");
+    pip.className = "pip C";
+    pip.title = "Colorless";
+    colorWrap.append(pip);
+  } else {
+    for (const c of present) {
+      const pip = document.createElement("span");
+      pip.className = `pip ${c}`;
+      pip.title = c;
+      colorWrap.append(pip);
+    }
+  }
+  el.append(colorWrap);
+
+  if (cmcCount) {
+    const avg = document.createElement("span");
+    const lbl = document.createElement("span");
+    lbl.className = "stat-label";
+    lbl.textContent = "Avg MV:";
+    avg.append(lbl, (cmcSum / cmcCount).toFixed(2));
+    el.append(avg);
+  }
+
+  const parts = Object.entries(types).filter(([, n]) => n > 0);
+  for (const [name, n] of parts) {
+    const span = document.createElement("span");
+    const lbl = document.createElement("span");
+    lbl.className = "stat-label";
+    lbl.textContent = `${name}:`;
+    span.append(lbl, String(n));
+    el.append(span);
+  }
+  el.hidden = false;
+}
+
+// --- Retry context ------------------------------------------------------
+// Holds enough state across the build → retry boundary that the retry
+// button can re-run only the failed jobs without redoing the whole deck.
+const retryCtx = {
+  state: null,
+  zip: null,
+  opts: null,
+  totalCopies: 0,
+  jobsLen: 0,
+  deckLabel: "",
+};
+
+async function rebuildZipBlob() {
+  setStatus("Re-zipping...");
+  try {
+    lastZipBlob = await retryCtx.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+  } catch (e) {
+    setStatus(`ZIP generation failed: ${e.message}`, "error");
+  }
+}
+
+function renderFailures(failures) {
+  els.failuresList.replaceChildren();
+  if (!failures.length) {
+    els.failures.hidden = true;
+    els.retryBtn.hidden = true;
+    return;
+  }
+  els.failures.hidden = false;
+  for (const f of failures) {
+    const li = document.createElement("li");
+    li.textContent = `${f.name} — ${f.error}`;
+    els.failuresList.appendChild(li);
+  }
+  // Only show retry if at least one failure carries a retryable job (image
+  // fetch failures during processJob). Pre-resolution failures and token
+  // discovery failures don't.
+  const retryable = failures.filter((f) => f.job).length;
+  els.retryBtn.hidden = retryable === 0;
+  els.retryBtn.textContent = `Retry ${retryable} failed card${retryable === 1 ? "" : "s"}`;
+}
+
+let liveFailures = [];
+
+async function retryFailures() {
+  if (!retryCtx.state || !retryCtx.zip) return;
+  els.retryBtn.disabled = true;
+  const remaining = [];
+  const retryable = liveFailures.filter((f) => f.job);
+  const passthrough = liveFailures.filter((f) => !f.job);
+  for (let i = 0; i < retryable.length; i++) {
+    const f = retryable[i];
+    setStatus(`Retrying ${i + 1}/${retryable.length}: ${f.job.name}...`);
+    try {
+      await processJob(retryCtx.state, f.job, retryCtx.opts, retryCtx.zip, els.gallery);
+    } catch (e) {
+      remaining.push({ name: f.job.name, error: e.message, job: f.job });
+    }
+  }
+  liveFailures = [...passthrough, ...remaining];
+  renderFailures(liveFailures);
+  await rebuildZipBlob();
+  const goodCount = retryCtx.jobsLen - liveFailures.filter((f) => f.job).length;
+  els.resultSummary.textContent = `Built ${goodCount}/${retryCtx.jobsLen} cards (${
+    Object.keys(retryCtx.zip.files).length - 1
+  } files in ZIP)`;
+  setStatus(
+    remaining.length
+      ? `Retried — ${remaining.length} still failing.`
+      : "Retried — all recovered. Re-download the ZIP.",
+    remaining.length ? "error" : "ok"
+  );
+  els.retryBtn.disabled = false;
+}
+
 async function loadJobs(opts) {
   // Returns { jobs, deckLabel, unresolved? }. Throws on fatal user input.
   const mode = $("mode-text-pane").hidden ? "url" : "text";
@@ -794,7 +952,12 @@ async function run() {
   els.failures.hidden = true;
   els.gallery.replaceChildren();
   els.failuresList.replaceChildren();
+  els.retryBtn.hidden = true;
   els.costEstimate.hidden = true;
+  els.deckStats.hidden = true;
+  liveFailures = [];
+  retryCtx.state = null;
+  retryCtx.zip = null;
   // SPA: reset the Scryfall payload cache on every fresh run so the Map
   // doesn't grow unbounded across multiple builds in the same tab.
   _scryfallCache.clear();
@@ -873,7 +1036,8 @@ async function run() {
     try {
       await processJob(state, jobs[i], opts, zip, els.gallery);
     } catch (e) {
-      failures.push({ name: jobs[i].name, error: e.message });
+      // Carry the job so the Retry button can re-run just this one.
+      failures.push({ name: jobs[i].name, error: e.message, job: jobs[i] });
     }
     done++;
     setProgress(done, jobs.length);
@@ -928,14 +1092,14 @@ async function run() {
       error: "Scryfall lookup failed; non-fatal — main deck still built.",
     });
   }
-  if (failures.length) {
-    els.failures.hidden = false;
-    for (const f of failures) {
-      const li = document.createElement("li");
-      li.textContent = `${f.name} — ${f.error}`;
-      els.failuresList.appendChild(li);
-    }
-  }
+  liveFailures = failures;
+  retryCtx.state = state;
+  retryCtx.zip = zip;
+  retryCtx.opts = opts;
+  retryCtx.jobsLen = jobs.length;
+  retryCtx.deckLabel = deckLabel;
+  renderFailures(liveFailures);
+  await renderDeckStats(jobs);
 
   setStatus("Done. Click Download ZIP, then drag-drop into TCGPlaytest.", "ok");
   els.go.disabled = false;
@@ -946,6 +1110,10 @@ els.go.addEventListener("click", () => {
     setStatus(`Unexpected error: ${e.message}`, "error");
     els.go.disabled = false;
   });
+});
+
+els.retryBtn.addEventListener("click", () => {
+  retryFailures().catch((e) => setStatus(`Retry failed: ${e.message}`, "error"));
 });
 
 els.input.addEventListener("keydown", (e) => {
