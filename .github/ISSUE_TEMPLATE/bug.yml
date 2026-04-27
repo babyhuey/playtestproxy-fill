@@ -1,0 +1,51 @@
+name: Bug report
+description: Something is wrong with the CLI, the web frontend, or the auto-uploader.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A short description of what you saw vs. what you expected.
+      placeholder: I pasted my Moxfield URL and the build stalled at 60% with no error.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it happen?
+      options:
+        - Web frontend (babyhuey.github.io/playtestproxy-fill)
+        - CLI (fill.py)
+        - Auto-uploader (upload.py)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: deck
+    attributes:
+      label: Deck URL or input (if applicable)
+      description: Paste the deck URL, the bare id, or the first few lines of the decklist that triggered the bug.
+      placeholder: https://archidekt.com/decks/21170685
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error message / console output
+      description: Copy-paste any error text, the failing card name(s), or the browser console output if it's a frontend bug.
+      render: shell
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: e.g. Chrome 142 on macOS, or Python 3.12 on Linux
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: For the web frontend, the footer shows "merged at X · sha". For the CLI, paste the output of `git rev-parse --short HEAD`.
+      placeholder: e.g. 5e9f126 or "merged 4/27/2026"
