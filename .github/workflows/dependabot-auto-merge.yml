@@ -1,0 +1,50 @@
+name: Dependabot auto-merge
+
+# Auto-merges Dependabot PRs once required checks pass.
+# Strategy:
+#   - Always auto-merge: github-actions updates (any semver bump) and pip
+#     patch + minor updates.
+#   - Major version bumps for pip get a comment and stay open for manual
+#     review (breaking-change risk).
+# Branch protection on main must require CI to pass; otherwise auto-merge
+# fires immediately. This workflow only enables auto-merge — actual merging
+# waits on the required checks finishing.
+
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge for safe updates
+        if: |
+          steps.meta.outputs.package-ecosystem == 'github_actions' ||
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Comment on major bumps
+        if: |
+          steps.meta.outputs.package-ecosystem != 'github_actions' &&
+          steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: |
+          gh pr comment "$PR_URL" --body "Major version bump for **${{ steps.meta.outputs.dependency-names }}** (${{ steps.meta.outputs.previous-version }} → ${{ steps.meta.outputs.new-version }}). Leaving this for human review — auto-merge is opt-in for major bumps."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
