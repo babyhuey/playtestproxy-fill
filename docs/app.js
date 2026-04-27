@@ -43,6 +43,7 @@ const $ = (id) => document.getElementById(id);
 const els = {
   input: $("deck-input"),
   skipSide: $("opt-skip-side"),
+  skipBasics: $("opt-skip-basics"),
   dfc: $("opt-dfc"),
   go: $("go"),
   status: $("status"),
@@ -79,6 +80,18 @@ function detectSource(input) {
   if (/^\d+$/.test(s)) return { source: "archidekt", args: [s] };
   if (/^[A-Za-z0-9_-]{12,}$/.test(s)) return { source: "moxfield", args: [s] };
   return null;
+}
+
+// Match against the canonical basic-land names + snow-covered variants.
+// Mirrors fill.py:is_basic_land — kept verbatim so the two sides can't drift.
+const BASIC_LAND_NAMES = new Set([
+  "plains", "island", "swamp", "mountain", "forest", "wastes",
+  "snow-covered plains", "snow-covered island", "snow-covered swamp",
+  "snow-covered mountain", "snow-covered forest", "snow-covered wastes",
+]);
+
+function isBasicLand(name) {
+  return BASIC_LAND_NAMES.has((name || "").trim().toLowerCase());
 }
 
 function slug(name) {
@@ -994,6 +1007,7 @@ async function run() {
 
   const opts = {
     skipSide: els.skipSide.checked,
+    skipBasics: els.skipBasics.checked,
     pairBacks: $("opt-pair-backs").checked,
     includeTokens: $("opt-tokens").checked,
     pairTokens: $("opt-pair-tokens").checked,
@@ -1013,6 +1027,12 @@ async function run() {
     setStatus(e.message, "error");
     els.go.disabled = false;
     return;
+  }
+  if (opts.skipBasics) {
+    const before = jobs.reduce((a, j) => a + j.qty, 0);
+    jobs = jobs.filter((j) => !isBasicLand(j.name));
+    const skipped = before - jobs.reduce((a, j) => a + j.qty, 0);
+    if (skipped) deckLabel = `${deckLabel} (− ${skipped} basics)`;
   }
 
   if (opts.includeTokens) {

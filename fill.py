@@ -52,6 +52,33 @@ class CardJob:
     pair_back_uid: str | None = None
 
 
+# The five basic-land names plus colorless Wastes, in both regular and
+# snow-covered variants. Matching on name is sufficient because Scryfall's
+# basic-land prints all carry these exact names regardless of set / frame /
+# alt art (Secret Lair etc.). Detecting via Scryfall `type_line` would
+# require fetching every card's payload up front, which we'd rather avoid.
+_BASIC_LAND_NAMES = frozenset(
+    {
+        "plains",
+        "island",
+        "swamp",
+        "mountain",
+        "forest",
+        "wastes",
+        "snow-covered plains",
+        "snow-covered island",
+        "snow-covered swamp",
+        "snow-covered mountain",
+        "snow-covered forest",
+        "snow-covered wastes",
+    }
+)
+
+
+def is_basic_land(name: str) -> bool:
+    return name.strip().lower() in _BASIC_LAND_NAMES
+
+
 def slug(name: str) -> str:
     """Filename-safe normalisation. Strips any leading combination of
     `.` and `_` so path-traversal-flavoured input (`..`, `./foo`,
@@ -710,6 +737,14 @@ def main() -> int:
     ap.add_argument("--overrides", default="overrides", help="Override images dir")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument(
+        "--skip-basic-lands",
+        action="store_true",
+        help="Drop basic lands (Plains/Island/Swamp/Mountain/Forest/Wastes "
+        "and their snow-covered variants) from the output. Use when you "
+        "already have basics in your collection and don't want to print "
+        "more of them.",
+    )
+    ap.add_argument(
         "--pair-backs",
         action="store_true",
         help="Emit out/backs/ with paired back images for each slot "
@@ -767,7 +802,15 @@ def main() -> int:
         print(f"Fetching deck {args.deck}...")
         jobs = fetch_deck(args.deck)
     else:
-        ap.error("supply a deck URL/id or --decklist")
+        # ap.error sys.exits but CodeQL doesn't model that, so raise
+        # explicitly to keep `jobs` flow-sensitive.
+        raise SystemExit("supply a deck URL/id or --decklist")
+    if args.skip_basic_lands:
+        before = sum(j.qty for j in jobs)
+        jobs = [j for j in jobs if not is_basic_land(j.name)]
+        skipped = before - sum(j.qty for j in jobs)
+        if skipped:
+            print(f"  skipping {skipped} basic land copies (--skip-basic-lands)")
     total_cards = sum(j.qty for j in jobs)
     print(
         f"  {len(jobs)} unique cards, {total_cards} total copies"
