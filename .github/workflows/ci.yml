@@ -26,6 +26,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r dev-requirements.txt
 
+      - name: Install Chromium for Playwright tests
+        # The frontend integration test needs a headless browser. The
+        # download is cached by setup-python's pip cache between runs.
+        run: playwright install --with-deps chromium
+
       - name: Lint
         run: ruff check fill.py upload.py tests
 
