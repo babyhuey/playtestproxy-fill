@@ -21,3 +21,14 @@ updates:
       - ci
     commit-message:
       prefix: "deps(ci)"
+
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "deps(precommit)"

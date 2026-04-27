@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest something new — a deck source, an upload-flow tweak, a frontend option, anything.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case, not the implementation. "I'd like to print decks I keep on Foo.com" is more useful than "add Foo.com support".
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: Rough idea (optional)
+      description: If you have an opinion on how it should work, describe it. Otherwise leave blank.

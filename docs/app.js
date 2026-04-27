@@ -45,6 +45,7 @@ const els = {
   gallery: $("gallery"),
   failures: $("failures"),
   failuresList: $("failures-list"),
+  costEstimate: $("cost-estimate"),
 };
 
 let lastZipBlob = null;
@@ -534,6 +535,53 @@ function addThumb(gallery, blob, label) {
   gallery.appendChild(wrap);
 }
 
+// --- Cost estimator -----------------------------------------------------
+// Pricing tiers transcribed from https://www.tcgplaytest.com/?view=pricing
+// (volume-based per-card cost + flat US-shipping bands). Frozen at the
+// time of writing — if tcgplaytest changes their rates this needs an update.
+
+const CARD_PRICE_TIERS = [
+  { upTo: 144, perCard: 0.35, label: "Starter" },       // 1–144
+  { upTo: 499, perCard: 0.30, label: "Playtest Set" },  // 145–499
+  { upTo: Infinity, perCard: 0.26, label: "Bulk" },     // 500+ (inclusive per pricing page)
+];
+
+const SHIPPING_US = [
+  { upTo: 100, cost: 6.95 },
+  { upTo: 250, cost: 8.95 },
+  { upTo: 500, cost: 12.95 },
+  { upTo: 1000, cost: 18.95 },
+  { upTo: 2000, cost: 29.95 },
+  { upTo: Infinity, cost: 49.95 },
+];
+
+function pickTier(tiers, n) {
+  return tiers.find((t) => n <= t.upTo);
+}
+
+function estimateCost(numCards) {
+  const tier = pickTier(CARD_PRICE_TIERS, numCards);
+  const cards = numCards * tier.perCard;
+  const shipping = pickTier(SHIPPING_US, numCards).cost;
+  return { numCards, cards, shipping, total: cards + shipping, tier: tier.label, perCard: tier.perCard };
+}
+
+function fmt(n) {
+  return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
+}
+
+function renderCostEstimate(numCards) {
+  const el = els.costEstimate;
+  if (!el) return;
+  if (!numCards) { el.hidden = true; return; }
+  const e = estimateCost(numCards);
+  el.innerHTML =
+    `Estimated TCGPlaytest cost: <strong>${fmt(e.total)}</strong> ` +
+    `<span class="small">${e.numCards} cards · ${fmt(e.perCard)}/card (${e.tier} tier) · ${fmt(e.cards)} cards + ${fmt(e.shipping)} US shipping. ` +
+    `Tax + non-US shipping not included.</span>`;
+  el.hidden = false;
+}
+
 async function loadJobs(opts) {
   // Returns { jobs, deckLabel, unresolved? }. Throws on fatal user input.
   const mode = $("mode-text-pane").hidden ? "url" : "text";
@@ -604,6 +652,7 @@ async function run() {
   els.failures.hidden = true;
   els.gallery.innerHTML = "";
   els.failuresList.innerHTML = "";
+  els.costEstimate.hidden = true;
   // SPA: reset the Scryfall payload cache on every fresh run so the Map
   // doesn't grow unbounded across multiple builds in the same tab.
   _scryfallCache.clear();
@@ -705,6 +754,11 @@ async function run() {
     Object.keys(zip.files).length - 1
   } files in ZIP)`;
   els.result.hidden = false;
+
+  // state.slot is the number of physical cards we wrote — fronts only.
+  // tcgplaytest charges per card, not per face, so a card with a custom
+  // back still counts once. Non-US shipping varies and isn't surfaced.
+  renderCostEstimate(state.slot);
 
   for (const name of initialUnresolved) {
     failures.push({ name, error: "could not resolve via Scryfall (check spelling / set code)" });
