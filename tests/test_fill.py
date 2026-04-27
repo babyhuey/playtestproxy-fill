@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 import responses
@@ -606,6 +607,144 @@ def test_discover_tokens_end_to_end():
     assert "CardC" in failures[0]
     # No HTTP call for the Custom job: only card-a, card-b, card-c got hit.
     assert len(responses.calls) == 3
+
+
+# --- Token pairing -------------------------------------------------------
+
+
+def _tok(name, uid):
+    return fill.CardJob(
+        name=name,
+        qty=1,
+        scryfall_uid=uid,
+        custom_image_url=None,
+        set_code=None,
+        collector_number=None,
+    )
+
+
+class TestPairTokens:
+    def test_empty(self):
+        assert fill._pair_tokens([]) == []
+
+    def test_single(self):
+        # 1 token → 1 card, unpaired (pair_back_uid stays None so the
+        # default playtest back wins for the second face).
+        out = fill._pair_tokens([_tok("Treasure", "uid-t")])
+        assert len(out) == 1
+        assert out[0].name == "Treasure"
+        assert out[0].scryfall_uid == "uid-t"
+        assert out[0].pair_back_uid is None
+
+    def test_pair(self):
+        out = fill._pair_tokens([_tok("Treasure", "uid-t"), _tok("Goblin", "uid-g")])
+        assert len(out) == 1
+        assert out[0].name == "Treasure / Goblin"
+        assert out[0].scryfall_uid == "uid-t"
+        assert out[0].pair_back_uid == "uid-g"
+
+    def test_odd_three(self):
+        out = fill._pair_tokens([_tok("A", "uid-a"), _tok("B", "uid-b"), _tok("C", "uid-c")])
+        # Cards 0: A/B, 1: C with no pair → default back applies.
+        assert [c.name for c in out] == ["A / B", "C"]
+        assert out[0].pair_back_uid == "uid-b"
+        assert out[1].pair_back_uid is None
+
+    def test_even_four(self):
+        out = fill._pair_tokens([_tok("A", "1"), _tok("B", "2"), _tok("C", "3"), _tok("D", "4")])
+        assert [(c.name, c.pair_back_uid) for c in out] == [
+            ("A / B", "2"),
+            ("C / D", "4"),
+        ]
+
+
+class TestApplyTokenJobs:
+    """Gating rules for --pair-tokens / --pair-backs combinations."""
+
+    def test_no_tokens_returns_empty(self):
+        assert fill._apply_token_jobs([], pair_tokens=True, pair_backs=True) == ([], None)
+
+    def test_pair_tokens_without_pair_backs_warns_and_falls_back(self):
+        toks = [_tok("A", "1"), _tok("B", "2"), _tok("C", "3")]
+        out, warn = fill._apply_token_jobs(toks, pair_tokens=True, pair_backs=False)
+        assert out == toks  # single-sided fallback, no pairing
+        assert warn and "pair-backs" in warn
+
+    def test_pair_tokens_with_one_token_skips_pairing(self):
+        # Pairing needs ≥2 to be meaningful; with 1 we just emit the
+        # single-sided card and let the default-back path fill the second face.
+        toks = [_tok("Solo", "uid")]
+        out, warn = fill._apply_token_jobs(toks, pair_tokens=True, pair_backs=True)
+        assert out == toks
+        assert warn is None
+
+    def test_pair_tokens_full_path_pairs(self):
+        toks = [_tok("A", "1"), _tok("B", "2"), _tok("C", "3"), _tok("D", "4")]
+        out, warn = fill._apply_token_jobs(toks, pair_tokens=True, pair_backs=True)
+        assert [c.name for c in out] == ["A / B", "C / D"]
+        assert warn is None
+
+    def test_pair_tokens_off_returns_singles(self):
+        toks = [_tok("A", "1"), _tok("B", "2")]
+        out, warn = fill._apply_token_jobs(toks, pair_tokens=False, pair_backs=True)
+        assert out == toks
+        assert warn is None
+
+
+@responses.activate
+def test_resolve_urls_back_override_wins_over_pair_back_uid(tmp_path):
+    """An explicit `<slug>.back.png` is more intentional than an inferred
+    pair_back_uid; the user file must win."""
+    fill._scryfall_payload_cache.clear()
+    front_file = tmp_path / "Test_Card.png"
+    back_file = tmp_path / "Test_Card.back.png"
+    front_file.write_bytes(b"front")
+    back_file.write_bytes(b"back")
+    job = fill.CardJob(
+        name="Test Card",
+        qty=1,
+        scryfall_uid=None,
+        custom_image_url=None,
+        set_code=None,
+        collector_number=None,
+        pair_back_uid="some-other-uid",  # would normally fetch; should be ignored
+    )
+    front, back = fill.resolve_urls(job, tmp_path, fill.requests.Session())
+    assert front.endswith("Test_Card.png")
+    assert back is not None and back.endswith("Test_Card.back.png")
+    # Crucially, no Scryfall request was made.
+    assert len(responses.calls) == 0
+
+
+@responses.activate
+def test_resolve_urls_pair_back_uses_other_card_front():
+    """When pair_back_uid is set, the back URL becomes that other card's
+    front face (tokens are single-faced, so no DFC subtleties)."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/front-token",
+        json={"id": "front-token", "image_uris": {"png": "https://x/front.png"}},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/back-token",
+        json={"id": "back-token", "image_uris": {"png": "https://x/back.png"}},
+        status=200,
+    )
+    job = fill.CardJob(
+        name="Front / Back",
+        qty=1,
+        scryfall_uid="front-token",
+        custom_image_url=None,
+        set_code=None,
+        collector_number=None,
+        pair_back_uid="back-token",
+    )
+    front, back = fill.resolve_urls(job, Path("/tmp/no-overrides"), fill.requests.Session())
+    assert front == "https://x/front.png"
+    assert back == "https://x/back.png"
 
 
 def test_cloudflare_blocked_raises_with_helpful_message():
