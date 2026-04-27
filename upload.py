@@ -17,6 +17,7 @@ Sequence (learned by inspecting the live site):
      set files, wait for processing.
   5. Save Draft. Leave browser open with --user-data so it persists.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,8 @@ import asyncio
 import re
 import sys
 from pathlib import Path
-from playwright.async_api import async_playwright, Page
+
+from playwright.async_api import Page, async_playwright
 
 DESIGN_URL = "https://www.tcgplaytest.com/?view=design"
 EXTS = {".png", ".jpg", ".jpeg"}
@@ -59,9 +61,7 @@ async def get_card_count(page: Page) -> int | None:
 
 
 async def _processing_visible(page: Page) -> bool:
-    js = (
-        "(texts) => texts.some(t => document.body.innerText.includes(t))"
-    )
+    js = "(texts) => texts.some(t => document.body.innerText.includes(t))"
     return await page.evaluate(js, list(PROCESSING_TEXTS))
 
 
@@ -70,7 +70,7 @@ async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 1
     `expected` (or stops climbing for several seconds)."""
     last = -1
     stable_for = 0
-    for i in range(timeout_s):
+    for _ in range(timeout_s):
         processing = await _processing_visible(page)
         count = await get_card_count(page)
         if count == expected and not processing:
@@ -151,8 +151,9 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
     return True
 
 
-async def run(images_dir: Path, headed: bool, user_data: Path | None,
-              save_draft: bool, batch_size: int) -> int:
+async def run(
+    images_dir: Path, headed: bool, user_data: Path | None, save_draft: bool, batch_size: int
+) -> int:
     # Detect fronts/backs layout from `fill.py --pair-backs`. If absent,
     # treat the dir itself as fronts.
     fronts_dir = images_dir / "fronts" if (images_dir / "fronts").is_dir() else images_dir
@@ -167,14 +168,17 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
             f"front count ({len(files)}) != back count ({len(back_files)}) — "
             f"Sequential Backs needs matching counts. Re-run fill.py --pair-backs."
         )
-    print(f"Found {len(files)} fronts in {fronts_dir}"
-          + (f" + {len(back_files)} backs in {backs_dir}" if backs_dir else ""))
+    print(
+        f"Found {len(files)} fronts in {fronts_dir}"
+        + (f" + {len(back_files)} backs in {backs_dir}" if backs_dir else "")
+    )
 
     async with async_playwright() as p:
         if user_data:
             user_data.mkdir(parents=True, exist_ok=True)
             ctx = await p.chromium.launch_persistent_context(
-                str(user_data), headless=not headed,
+                str(user_data),
+                headless=not headed,
                 viewport={"width": 1500, "height": 1000},
             )
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
@@ -232,7 +236,9 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
                     visible = False
                 if visible:
                     try:
-                        await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(timeout=3000)
+                        await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(
+                            timeout=3000
+                        )
                         clicked_modal["done"] = True
                         print(f"  selected: {BLEED_OPTION_PRE_BLED} (images already have bleed)")
                         return
@@ -281,9 +287,11 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
         if final != len(files):
             # Failing loud here is better than uploading misaligned backs
             # against a partially-loaded front deck.
-            print(f"WARNING: only {final}/{len(files)} cards registered. "
-                  "Sequential Backs and Save Draft skipped — investigate the "
-                  "upload before continuing.")
+            print(
+                f"WARNING: only {final}/{len(files)} cards registered. "
+                "Sequential Backs and Save Draft skipped — investigate the "
+                "upload before continuing."
+            )
         elif backs_dir and back_files:
             await upload_sequential_backs(page, back_files)
 
@@ -316,14 +324,16 @@ async def run(images_dir: Path, headed: bool, user_data: Path | None,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("images_dir")
-    ap.add_argument("--headless", action="store_true",
-                    help="Run without a visible browser window")
-    ap.add_argument("--user-data", default=None,
-                    help="Persistent browser profile dir (lets draft survive)")
-    ap.add_argument("--no-save-draft", action="store_true",
-                    help="Do not click Save Draft after upload")
-    ap.add_argument("--batch-size", type=int, default=0,
-                    help="Upload in chunks of N (0 = all at once)")
+    ap.add_argument("--headless", action="store_true", help="Run without a visible browser window")
+    ap.add_argument(
+        "--user-data", default=None, help="Persistent browser profile dir (lets draft survive)"
+    )
+    ap.add_argument(
+        "--no-save-draft", action="store_true", help="Do not click Save Draft after upload"
+    )
+    ap.add_argument(
+        "--batch-size", type=int, default=0, help="Upload in chunks of N (0 = all at once)"
+    )
     args = ap.parse_args()
 
     images = Path(args.images_dir)
@@ -331,13 +341,15 @@ def main() -> int:
         print(f"Not a directory: {images}", file=sys.stderr)
         return 1
 
-    return asyncio.run(run(
-        images,
-        headed=not args.headless,
-        user_data=Path(args.user_data) if args.user_data else None,
-        save_draft=not args.no_save_draft,
-        batch_size=args.batch_size,
-    ))
+    return asyncio.run(
+        run(
+            images,
+            headed=not args.headless,
+            user_data=Path(args.user_data) if args.user_data else None,
+            save_draft=not args.no_save_draft,
+            batch_size=args.batch_size,
+        )
+    )
 
 
 if __name__ == "__main__":
