@@ -179,6 +179,21 @@ progress::-webkit-progress-value { background: var(--accent); }
 progress::-moz-progress-bar { background: var(--accent); }
 
 .result { margin-top: 16px; }
+.cost-estimate {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: #0e1530;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.88rem;
+}
+.cost-estimate strong { color: var(--ok); }
+.cost-estimate .small {
+  color: var(--muted);
+  font-size: 0.78rem;
+  display: block;
+  margin-top: 2px;
+}
 .result-row {
   display: flex;
   align-items: center;
