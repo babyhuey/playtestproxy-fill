@@ -3,6 +3,32 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!--
+  GitHub Pages won't serve real Content-Security-Policy / Referrer-Policy
+  / X-Content-Type-Options headers, so we set what we can via meta. Note:
+  `frame-ancestors` is ignored when delivered via meta — clickjacking
+  protection is enforced by the JS frame-buster at the top of app.js.
+
+  Threat model:
+  - script-src: own origin + cdnjs (JSZip with SRI)
+  - connect-src: deck-source APIs + Scryfall + the public CORS proxy +
+    arbitrary https hosts (the "Custom default back URL" feature lets
+    users paste any image URL)
+  - img-src: own origin + Scryfall CDN + arbitrary https hosts (custom
+    backs again) + blob:/data: for canvas-generated images
+  - everything else locked down to 'none' / 'self'
+-->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' https://cdnjs.cloudflare.com;
+  style-src 'self';
+  img-src 'self' data: blob: https:;
+  connect-src 'self' https:;
+  font-src 'self';
+  base-uri 'none';
+  form-action 'none';
+">
+<meta name="referrer" content="strict-origin-when-cross-origin">
 <title>playtestproxy-fill — Archidekt → TCGPlaytest</title>
 <link rel="stylesheet" href="style.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🃏</text></svg>">
@@ -92,7 +118,7 @@ Sideboard
 </main>
 
 <footer>
-  <span>No data leaves your browser except deck-builder &amp; Scryfall API requests.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, TappedOut) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall and the bundled image are fetched directly.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 

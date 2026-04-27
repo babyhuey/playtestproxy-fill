@@ -5,6 +5,18 @@
 // - Pads with bleed via Canvas.
 // - Bundles everything into a ZIP for the user to drop into TCGPlaytest.
 
+// Clickjacking defence. GitHub Pages can't set X-Frame-Options and meta-CSP
+// frame-ancestors is ignored by browsers; this is the only real fix for a
+// static site we don't control headers on.
+if (window.top !== window.self) {
+  try { window.top.location = window.self.location; } catch { /* cross-origin block — already safe */ }
+}
+
+// Hard cap on parsed decklist entries. The build is sequential at ~100ms
+// per card (Scryfall rate limit), so a 100k-line paste would burn hours
+// and OOM the tab. Self-DoS only, but worth a cheap upfront bound.
+const MAX_DECKLIST_ENTRIES = 2000;
+
 const ARCHIDEKT = (id) => `https://archidekt.com/api/decks/${id}/`;
 const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
@@ -244,6 +256,9 @@ async function loadCustomBackBlob() {
   const urlEl = $("opt-back-url");
   const url = (urlEl.value || "").trim();
   if (url) {
+    if (!/^https:\/\//i.test(url)) {
+      throw new Error("Custom back URL must start with https://");
+    }
     try {
       const r = await fetch(url);
       if (r.ok) return r.blob();
@@ -318,6 +333,12 @@ async function scryfallLookupNamed(name, setCode, cn) {
 async function buildJobsFromDecklist(text, onProgress) {
   const parsed = parseDecklist(text);
   if (!parsed.length) throw new Error("Couldn't parse any cards from the decklist.");
+  if (parsed.length > MAX_DECKLIST_ENTRIES) {
+    throw new Error(
+      `Decklist has ${parsed.length} entries — capped at ${MAX_DECKLIST_ENTRIES} ` +
+      "to avoid running for hours and OOM-ing the tab. Split into smaller decks."
+    );
+  }
   const jobs = [];
   const unresolved = [];
   for (let i = 0; i < parsed.length; i++) {
@@ -672,10 +693,20 @@ function renderCostEstimate(numCards) {
   if (!el) return;
   if (!numCards) { el.hidden = true; return; }
   const e = estimateCost(numCards);
-  el.innerHTML =
-    `Estimated TCGPlaytest cost: <strong>${fmt(e.total)}</strong> ` +
-    `<span class="small">${e.numCards} cards · ${fmt(e.perCard)}/card (${e.tier} tier) · ${fmt(e.cards)} cards + ${fmt(e.shipping)} US shipping. ` +
-    `Tax + non-US shipping not included.</span>`;
+  // Build via DOM APIs so card-count / pricing data can never become an
+  // injection vector even if a future change feeds untrusted input here.
+  el.replaceChildren();
+  el.append("Estimated TCGPlaytest cost: ");
+  const total = document.createElement("strong");
+  total.textContent = fmt(e.total);
+  el.append(total, " ");
+  const detail = document.createElement("span");
+  detail.className = "small";
+  detail.textContent =
+    `${e.numCards} cards · ${fmt(e.perCard)}/card (${e.tier} tier) · ` +
+    `${fmt(e.cards)} cards + ${fmt(e.shipping)} US shipping. ` +
+    `Tax + non-US shipping not included.`;
+  el.append(detail);
   el.hidden = false;
 }
 
@@ -737,6 +768,15 @@ async function loadJobs(opts) {
     }
     throw new Error(`Failed to fetch deck: ${e.message}`);
   }
+  // Cheap shape check before we trust the response. corsproxy.io can MITM
+  // these endpoints; an injected payload that doesn't match expectations
+  // should fail loudly here instead of feeding garbage downstream.
+  if (source === "archidekt" && !Array.isArray(deck.cards)) {
+    throw new Error("Archidekt response missing `cards` array — proxy or upstream tampering?");
+  }
+  if (source === "moxfield" && (!deck.boards || typeof deck.boards !== "object")) {
+    throw new Error("Moxfield response missing `boards` object — proxy or upstream tampering?");
+  }
   const jobs = source === "archidekt"
     ? buildJobsArchidekt(deck, opts)
     : buildJobsMoxfield(deck);
@@ -747,8 +787,8 @@ async function run() {
   els.go.disabled = true;
   els.result.hidden = true;
   els.failures.hidden = true;
-  els.gallery.innerHTML = "";
-  els.failuresList.innerHTML = "";
+  els.gallery.replaceChildren();
+  els.failuresList.replaceChildren();
   els.costEstimate.hidden = true;
   // SPA: reset the Scryfall payload cache on every fresh run so the Map
   // doesn't grow unbounded across multiple builds in the same tab.
@@ -956,9 +996,20 @@ $("mode-text").addEventListener("click", () => setMode("text"));
     const ts = v.committed_at || v.deployed_at;
     const t = new Date(ts).toLocaleString();
     const sha = (v.commit || "").slice(0, 7);
-    el.innerHTML = sha
-      ? `merged ${t} · <a href="https://github.com/babyhuey/playtestproxy-fill/commit/${v.commit}" target="_blank" rel="noopener">${sha}</a>`
-      : `merged ${t}`;
+    // Build via DOM APIs so the commit field — written by the Pages
+    // workflow but ultimately user-controllable in a malicious-PR scenario
+    // — can never inject markup or a javascript: URL into the page.
+    el.replaceChildren();
+    el.append(`merged ${t}`);
+    if (sha && /^[0-9a-f]{7,40}$/.test(v.commit)) {
+      el.append(" · ");
+      const a = document.createElement("a");
+      a.href = `https://github.com/babyhuey/playtestproxy-fill/commit/${encodeURIComponent(v.commit)}`;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = sha;
+      el.append(a);
+    }
   } catch {
     el.textContent = "dev build";
   }
