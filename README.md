@@ -22,7 +22,6 @@ The frontend covers the same options as the CLI:
 - Include tokens / emblems (off by default)
 - Pair tokens back-to-back (cuts the token portion of the bill in half)
 - Custom default back (file upload or URL paste)
-- Bleed-mm and DPI controls
 
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
 of the same deck are near-instant after the first run.
@@ -78,9 +77,9 @@ What this does:
    end. With `--pair-tokens` (and `--pair-backs`), prints two unrelated
    tokens back-to-back on a single card — you only ever need one face
    up at a time, so this halves the token portion of the order.
-5. Pads each image with **2mm bleed** (edge-replicated, sampled inset
-   from rounded corners so transparent corners don't bleed white).
-6. Writes one PNG per card slot, plus `manifest.json`.
+5. Writes one PNG per card slot (the unmodified Scryfall image), plus
+   `manifest.json`. tcgplaytest applies the print-bleed expansion on
+   their end after upload — pick **"No Bleed"** in their modal.
 
 ### Output layout
 
@@ -139,10 +138,9 @@ Open <https://www.tcgplaytest.com/?view=design> and:
 1. Drag everything in `out/fronts/` (or `out/` if no pairing) into the
    Fronts uploader.
 2. When the "Do Your Images Have Print Bleed?" modal appears, choose
-   **"3mm Bleed added"** — the closest option to our 2mm output. The
-   site silently trims the 1mm excess.
-3. Click "Got It" on "Bleed Trimmed Successfully".
-4. Click Next → Customize Back. If you used `--pair-backs`, drag
+   **"No Bleed"** — tcgplaytest applies the print-bleed expansion
+   server-side.
+3. Click Next → Customize Back. If you used `--pair-backs`, drag
    everything in `out/backs/` into the **Sequential Backs** uploader
    (image N → slot N).
 5. Finish Preview → Add to Cart.
@@ -168,9 +166,6 @@ fill.py [<deck_url_or_id>]
   -o, --out DIR           Output directory (default: out)
   --decklist PATH         Plain-text decklist (or '-' for stdin) instead of a URL
   --overrides DIR         Override-images dir (default: overrides)
-  --dpi N                 Output DPI (default: 300)
-  --bleed-mm FLOAT        Bleed in mm (default: 2.0)
-  --no-bleed              Skip bleed padding entirely
   --workers N             Parallel image downloads (default: 6)
   --pair-backs            Emit out/fronts/ + out/backs/ for Sequential Backs
   --default-back PATH     Custom default back for non-DFC cards (with --pair-backs)
