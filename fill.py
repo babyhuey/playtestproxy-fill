@@ -561,9 +561,12 @@ _ALLOWED_IMAGE_SCHEMES = ("https://", "file://")
 
 def _scrub_source(url: str | None) -> str | None:
     """Strip the absolute-path portion of a file:// URL down to its basename
-    so manifest.json doesn't leak `/home/<user>/...` if shared."""
+    so manifest.json doesn't leak `/home/<user>/...` if shared. We drop the
+    folder entirely rather than implying `overrides/` — the actual override
+    dir is configurable via --overrides and could itself be sensitive
+    (e.g. /home/alice/private-cards/)."""
     if url and url.startswith("file://"):
-        return f"file://overrides/{Path(url[7:]).name}"
+        return f"file://{Path(url[7:]).name}"
     return url
 
 

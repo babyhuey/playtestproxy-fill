@@ -755,26 +755,44 @@ def test_resolve_urls_pair_back_uses_other_card_front():
 
 
 class TestFetchImageSchemeAllowlist:
-    def test_https_allowed(self):
-        # Smoke test that the scheme check passes — actual fetch is mocked
-        # via `responses` in other tests.
-        # We just want to confirm the rejection branch isn't accidentally
-        # blocking https://.
-        # Easiest: assert the regex check is what we expect.
-        for ok in ("https://api.scryfall.com/x", "file:///tmp/x.png"):
-            assert ok.startswith(fill._ALLOWED_IMAGE_SCHEMES)
+    @responses.activate
+    def test_https_passes_through(self):
+        # End-to-end: an https URL is not rejected by the allowlist and
+        # actually proceeds to the HTTP layer (mocked here).
+        buf = BytesIO()
+        Image.new("RGB", (4, 6)).save(buf, "PNG")
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/img.png",
+            body=buf.getvalue(),
+            status=200,
+            content_type="image/png",
+        )
+        out = fill.fetch_image("https://api.scryfall.com/img.png", fill.requests.Session())
+        assert out.size == (4, 6)
 
-    def test_rejects_http(self):
-        with pytest.raises(RuntimeError, match="disallowed scheme"):
-            fill.fetch_image("http://example.com/img.png", fill.requests.Session())
+    def test_file_passes_through(self, tmp_path):
+        p = tmp_path / "x.png"
+        Image.new("RGB", (3, 5)).save(p)
+        out = fill.fetch_image(f"file://{p}", fill.requests.Session())
+        assert out.size == (3, 5)
 
-    def test_rejects_data_url(self):
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://example.com/img.png",
+            "data:image/png;base64,iVBORw0KGg=",
+            "ftp://internal/img.png",
+            "javascript:alert(1)",
+            "HTTPS://api.scryfall.com/img.png",  # case-sensitive on purpose
+            "https",  # bare scheme, no separator
+            "",
+            "  https://leading-space.example/img.png",
+        ],
+    )
+    def test_rejects(self, url):
         with pytest.raises(RuntimeError, match="disallowed scheme"):
-            fill.fetch_image("data:image/png;base64,iVBORw0KGg=", fill.requests.Session())
-
-    def test_rejects_ftp(self):
-        with pytest.raises(RuntimeError, match="disallowed scheme"):
-            fill.fetch_image("ftp://internal/img.png", fill.requests.Session())
+            fill.fetch_image(url, fill.requests.Session())
 
 
 class TestScrubSource:
@@ -787,8 +805,20 @@ class TestScrubSource:
     def test_strips_absolute_path(self):
         # Local override paths leak the user's home; manifest gets only the basename.
         out = fill._scrub_source("file:///home/jlyons/secret/overrides/Sol_Ring.png")
-        assert out == "file://overrides/Sol_Ring.png"
+        assert out == "file://Sol_Ring.png"
         assert "/home/" not in out
+
+    def test_strips_alternate_override_dir(self):
+        # The fix doesn't lie: arbitrary --overrides paths still scrub down
+        # to just the basename, no implied `overrides/` prefix.
+        out = fill._scrub_source("file:///home/alice/private-cards/Sol_Ring.png")
+        assert out == "file://Sol_Ring.png"
+        assert "alice" not in out and "private" not in out
+
+    def test_relative_file_url(self):
+        # Edge case: relative path inside file:// (no leading slash). Path.name
+        # still extracts the basename.
+        assert fill._scrub_source("file://relative/Sol_Ring.png") == "file://Sol_Ring.png"
 
     def test_passes_none(self):
         assert fill._scrub_source(None) is None
