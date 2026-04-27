@@ -769,6 +769,7 @@ async function run() {
   let deckLabel;
   let initialUnresolved = [];
   let tokenDiscoveryFailed = 0;
+  const failures = [];
   try {
     const loaded = await loadJobs(opts);
     jobs = loaded.jobs;
@@ -784,8 +785,16 @@ async function run() {
     setStatus("Discovering tokens / emblems...");
     const { tokens, failed } = await discoverTokens(jobs);
     if (tokens.length) {
-      // Pairing requires --pair-backs because Sequential Backs is the
-      // only mechanism we have to assign per-card backs in tcgplaytest.
+      // Pairing requires pair-backs because Sequential Backs is the only
+      // mechanism we have to assign per-card backs in tcgplaytest. If the
+      // user asked for pairing without pair-backs, surface a soft warning
+      // in the failures box so they know why the cost didn't drop.
+      if (opts.pairTokens && !opts.pairBacks) {
+        failures.push({
+          name: "Token pairing skipped",
+          error: "Pair tokens needs Pair backs enabled — falling back to single-sided.",
+        });
+      }
       if (opts.pairTokens && opts.pairBacks && tokens.length >= 2) {
         const paired = pairTokens(tokens);
         jobs = [...jobs, ...paired];
@@ -806,7 +815,6 @@ async function run() {
   setProgress(0, jobs.length);
 
   const zip = new JSZip();
-  const failures = [];
   let done = 0;
 
   // Pre-generate the default back placeholder if pairing is on.

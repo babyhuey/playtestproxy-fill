@@ -431,6 +431,23 @@ def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str |
     raise RuntimeError(f"No image_uris for {uid} ({d.get('name')})")
 
 
+def _apply_token_jobs(
+    token_jobs: list[CardJob], pair_tokens: bool, pair_backs: bool
+) -> tuple[list[CardJob], str | None]:
+    """Decide how to fold discovered token jobs into the deck.
+
+    Returns (jobs_to_append, warning_msg). Pure function, no I/O — exists
+    so the gating rules (--pair-tokens needs --pair-backs; need ≥2 tokens
+    to pair) are independently testable."""
+    if not token_jobs:
+        return [], None
+    if pair_tokens and not pair_backs:
+        return token_jobs, "--pair-tokens needs --pair-backs; falling back to single-sided"
+    if pair_tokens and pair_backs and len(token_jobs) >= 2:
+        return _pair_tokens(token_jobs), None
+    return token_jobs, None
+
+
 def _pair_tokens(tokens: list[CardJob]) -> list[CardJob]:
     """Pair N unique tokens into ceil(N/2) cards: token A front, token B back.
     Last card if N is odd: token N front, default playtest back (unset
@@ -508,13 +525,17 @@ def resolve_urls(
     back face (DFC). If the override-back doesn't exist but a Scryfall back
     does, the Scryfall back is used.
 
-    If `pair_back_uid` is set the back becomes the front-face of that other
-    Scryfall card — used by --pair-tokens to print two tokens back-to-back."""
+    If `pair_back_uid` is set (from --pair-tokens) the back becomes the
+    front face of that other Scryfall card. An explicit `<slug>.back.png`
+    override file still wins, since the user dropping a file in is more
+    intentional than an inferred token-pairing."""
     front_override = override_dir / f"{slug(job.name)}.png"
     back_override = override_dir / f"{slug(job.name)}.back.png"
     if front_override.exists():
         front = f"file://{front_override.resolve()}"
         back = f"file://{back_override.resolve()}" if back_override.exists() else None
+        if back:
+            return front, back
     elif job.custom_image_url:
         front, back = job.custom_image_url, None
     elif job.scryfall_uid:
@@ -523,8 +544,8 @@ def resolve_urls(
         raise RuntimeError(f"No image source for {job.name}")
 
     if job.pair_back_uid:
-        # Use the paired token's *front* face as our back. Tokens are
-        # always single-faced, so the second tuple element is irrelevant.
+        # Tokens are always single-faced, so the second tuple element from
+        # scryfall_image_urls is irrelevant.
         back, _ = scryfall_image_urls(job.pair_back_uid, session)
     return front, back
 
@@ -707,23 +728,20 @@ def main() -> int:
 
     if args.include_tokens:
         token_jobs, token_failures = _discover_tokens(jobs, session)
-        if token_jobs:
-            # Pairing requires --pair-backs because Sequential Backs is the
-            # whole mechanism we use to tell tcgplaytest which back goes on
-            # which card. Without pair-backs, we have no way to assign a
-            # token-back-to-token-front.
-            if args.pair_tokens and args.pair_backs and len(token_jobs) >= 2:
-                paired = _pair_tokens(token_jobs)
+        appended, warning = _apply_token_jobs(token_jobs, args.pair_tokens, args.pair_backs)
+        if warning:
+            print(f"  ({warning})")
+        if appended:
+            n_unique = len(token_jobs)
+            n_appended = len(appended)
+            if n_appended < n_unique:
                 print(
-                    f"  + {len(token_jobs)} unique tokens / emblems "
-                    f"→ paired into {len(paired)} double-sided cards"
+                    f"  + {n_unique} unique tokens / emblems "
+                    f"→ paired into {n_appended} double-sided cards"
                 )
-                jobs = list(jobs) + paired
             else:
-                if args.pair_tokens and not args.pair_backs:
-                    print("  (--pair-tokens needs --pair-backs; falling back to single-sided)")
-                print(f"  + {len(token_jobs)} unique tokens / emblems")
-                jobs = list(jobs) + token_jobs
+                print(f"  + {n_unique} unique tokens / emblems")
+            jobs = list(jobs) + appended
         if token_failures:
             print(f"  (skipped token discovery on {len(token_failures)} cards)")
 
