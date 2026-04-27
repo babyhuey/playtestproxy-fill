@@ -498,9 +498,9 @@ function addThumb(gallery, blob, label) {
 // time of writing — if tcgplaytest changes their rates this needs an update.
 
 const CARD_PRICE_TIERS = [
-  { upTo: 144, perCard: 0.35, label: "Starter" },     // 1–144
-  { upTo: 500, perCard: 0.30, label: "Playtest Set" }, // 145–500
-  { upTo: Infinity, perCard: 0.26, label: "Bulk" },    // 500+
+  { upTo: 144, perCard: 0.35, label: "Starter" },       // 1–144
+  { upTo: 499, perCard: 0.30, label: "Playtest Set" },  // 145–499
+  { upTo: Infinity, perCard: 0.26, label: "Bulk" },     // 500+ (inclusive per pricing page)
 ];
 
 const SHIPPING_US = [
