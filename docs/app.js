@@ -581,6 +581,7 @@ function pairTokens(tokens) {
       uid: a.uid,
       customUrl: null,
       pairBackUid: b ? b.uid : null,
+      isToken: true,
     });
   }
   return paired;
@@ -617,6 +618,7 @@ async function discoverTokens(jobs) {
           qty: 1,
           uid: part.id,
           customUrl: null,
+          isToken: true,
         });
       }
     }
@@ -835,12 +837,11 @@ async function renderDeckStats(jobs) {
   el.hidden = false;
 }
 
-// --- Retry context ------------------------------------------------------
-// Holds enough state across the build → retry boundary that the retry
-// button can re-run only the failed jobs without redoing the whole deck.
-// Holds the running build's state across passes. A fresh `run()` resets
-// this; an append-mode `run()` extends it so the second deck's cards land
-// in the same zip with continuous slot numbers and a merged stats badge.
+// --- Build / retry context ----------------------------------------------
+// Holds the running build's state across two boundaries: the retry button
+// (re-runs failed image fetches into the same zip) and append mode (a
+// second deck's cards land in the same zip with continuous slot numbers
+// and merged stats / cost / token-dedup).
 const retryCtx = {
   state: null,
   zip: null,
@@ -998,8 +999,9 @@ async function loadJobs(opts) {
 async function run() {
   els.go.disabled = true;
   const append = appendMode && retryCtx.zip != null;
-  appendMode = false;  // consumed; the next click defaults back to fresh
-  els.go.textContent = "Fetch & build";
+  // Don't consume `appendMode` yet — if loadJobs throws, the user should
+  // still be in append mode so a corrected URL doesn't silently wipe the
+  // first deck's progress.
 
   let zip, state, opts;
   if (append) {
@@ -1058,6 +1060,9 @@ async function run() {
     els.go.disabled = false;
     return;
   }
+  // loadJobs succeeded — now safe to consume the flag and reset the label.
+  appendMode = false;
+  els.go.textContent = "Fetch & build";
   if (opts.skipBasics) {
     const before = jobs.reduce((a, j) => a + j.qty, 0);
     jobs = jobs.filter((j) => !isBasicLand(j.name));
@@ -1071,10 +1076,15 @@ async function run() {
     // included from the first pass don't get printed again on the second.
     const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
     const { tokens, failures: tokenFailures } = await discoverTokens(baseJobsForDiscovery);
-    // Filter to tokens we haven't already added in a prior pass.
-    const existingTokenUids = new Set(
-      (retryCtx.jobs || []).filter((j) => /\(token\)$/.test(j.name)).map((j) => j.uid),
-    );
+    // Filter to tokens we haven't already added in a prior pass. Include
+    // both `uid` and any `pairBackUid` so a paired-token back from pass 1
+    // doesn't get re-emitted as a standalone token in pass 2.
+    const existingTokenUids = new Set();
+    for (const j of retryCtx.jobs || []) {
+      if (!j.isToken) continue;
+      if (j.uid) existingTokenUids.add(j.uid);
+      if (j.pairBackUid) existingTokenUids.add(j.pairBackUid);
+    }
     const fresh = tokens.filter((t) => !existingTokenUids.has(t.uid));
     if (fresh.length) {
       if (opts.pairTokens && !opts.pairBacks) {
@@ -1138,6 +1148,19 @@ async function run() {
     ),
   );
 
+  // Commit retryCtx and the failure list BEFORE attempting zip gen. The
+  // per-card files are already inside `zip` from the build loop above, so
+  // retryCtx.jobs needs to reflect them; otherwise a zip-gen failure would
+  // leave retryCtx pointing at a zip whose contents the dedupe code
+  // doesn't know about.
+  liveFailures = [...liveFailures, ...passFailures];
+  retryCtx.state = state;
+  retryCtx.zip = zip;
+  retryCtx.opts = opts;
+  retryCtx.jobs = allJobs;
+  retryCtx.jobsLen = allJobs.length;
+  retryCtx.deckLabel = mergedDeckLabel;
+
   setStatus("Zipping...");
   try {
     lastZipBlob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
@@ -1148,32 +1171,32 @@ async function run() {
   }
   lastZipName = `${slug(mergedDeckLabel)}_tcgplaytest.zip`;
 
-  liveFailures = [...liveFailures, ...passFailures];
-  retryCtx.state = state;
-  retryCtx.zip = zip;
-  retryCtx.opts = opts;
-  retryCtx.jobs = allJobs;
-  retryCtx.jobsLen = allJobs.length;
-  retryCtx.deckLabel = mergedDeckLabel;
-
-  const goodCount = allJobs.length - liveFailures.filter((f) => f.job).length;
-  els.resultSummary.textContent = `Built ${goodCount}/${allJobs.length} cards (${
-    Object.keys(zip.files).length - 1
-  } files in ZIP)`;
+  // Surface non-retryable failures (unresolved-by-name, token discovery)
+  // in the headline too — otherwise "Built 100/100" hides the 3 unresolved
+  // entries the user can see in the failures box below.
+  const builtJobs = allJobs.length - liveFailures.filter((f) => f.job).length;
+  const failTail = liveFailures.length
+    ? ` — ${liveFailures.length} failure${liveFailures.length === 1 ? "" : "s"} below`
+    : "";
+  els.resultSummary.textContent =
+    `Built ${builtJobs}/${allJobs.length} cards (${Object.keys(zip.files).length - 1} files in ZIP)${failTail}`;
   els.result.hidden = false;
   els.addAnotherBtn.hidden = false;
 
   // state.slot is the number of physical cards we wrote — fronts only.
+  // tcgplaytest charges per card, not per face, so a card with a custom
+  // back still counts once. Non-US shipping varies and isn't surfaced.
   renderCostEstimate(state.slot);
   renderFailures(liveFailures);
   await renderDeckStats(allJobs);
 
-  setStatus(
-    append
-      ? "Added. Click Download ZIP, or add another deck."
-      : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.",
-    "ok",
-  );
+  // Don't paint the success-green "ok" colour when the failures box has
+  // entries — that contradicts the failure list right below.
+  const hadFailures = liveFailures.length > 0;
+  const message = append
+    ? "Added. Click Download ZIP, or add another deck."
+    : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.";
+  setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
   els.go.disabled = false;
 }
 
