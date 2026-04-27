@@ -218,7 +218,36 @@ async function makeDefaultBackBlob() {
 
 // --- Plain-text decklist support ----------------------------------------
 
+function parseMtgoDek(text) {
+  // MTGO `.dek` XML: <Cards CatID="..." Quantity="N" Sideboard="false" Name="..." />
+  // We could route this through DOMParser, but CodeQL flags
+  // DOMParser.parseFromString as an XSS sink even when we only read
+  // attributes. The schema is trivial enough to extract with regex.
+  const xmlEntities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  const decode = (s) =>
+    s.replace(/&(amp|lt|gt|quot|apos|#(\d+));/g, (_, name, dec) =>
+      dec ? String.fromCharCode(Number(dec)) : xmlEntities[name],
+    );
+  const attr = (chunk, key) => {
+    const m = chunk.match(new RegExp(`\\b${key}="([^"]*)"`));
+    return m ? decode(m[1]) : "";
+  };
+  const out = [];
+  for (const m of text.matchAll(/<Cards\b([^>]*?)\/?>/g)) {
+    const chunk = m[1];
+    if (attr(chunk, "Sideboard").toLowerCase() === "true") continue;
+    const qty = Number(attr(chunk, "Quantity") || "0");
+    const name = attr(chunk, "Name").trim();
+    if (qty > 0 && name) out.push({ qty, name, set: null, cn: null });
+  }
+  return out;
+}
+
 function parseDecklist(text) {
+  const head = text.trimStart();
+  if (head.startsWith("<?xml") || head.startsWith("<Deck")) {
+    return parseMtgoDek(text);
+  }
   const out = [];
   let inExcluded = false;
   for (const raw of text.split(/\r?\n/)) {

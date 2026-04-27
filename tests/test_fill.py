@@ -183,6 +183,31 @@ class TestParseDecklist:
     def test_empty(self):
         assert fill._parse_decklist("") == []
 
+    def test_mtgo_dek_xml_routed_to_xml_parser(self):
+        text = """<?xml version="1.0" encoding="utf-8"?>
+<Deck>
+  <Cards Quantity="4" Sideboard="false" Name="Lightning Bolt" />
+  <Cards Quantity="1" Sideboard="false" Name="Sol Ring" />
+  <Cards Quantity="2" Sideboard="true" Name="Negate" />
+</Deck>"""
+        assert fill._parse_decklist(text) == [
+            (4, "Lightning Bolt", None, None),
+            (1, "Sol Ring", None, None),
+        ]
+
+    def test_mtgo_dek_with_namespace(self):
+        # Real MTGO exports include xsi/xsd namespaces on the root.
+        text = """<Deck xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Cards Quantity="1" Sideboard="false" Name="Sol Ring" />
+</Deck>"""
+        assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
+
+    def test_mtgo_dek_malformed_raises(self):
+        import pytest
+
+        with pytest.raises(SystemExit, match="Could not parse MTGO"):
+            fill._parse_decklist("<?xml version='1.0'?><Deck><Cards")
+
 
 class TestScryfallWait:
     def test_first_call_no_sleep(self):
