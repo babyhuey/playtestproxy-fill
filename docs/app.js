@@ -709,6 +709,8 @@ $("mode-text").addEventListener("click", () => setMode("text"));
 
 // --- Version footer ----------------------------------------------------
 // version.json is written by the Pages workflow at deploy time.
+// committed_at is preferred — it's when the change was merged to main.
+// deployed_at is the workflow run time (close but not identical).
 
 (async () => {
   const el = $("version-info");
@@ -717,11 +719,12 @@ $("mode-text").addEventListener("click", () => setMode("text"));
     const r = await fetch("version.json", { cache: "no-store" });
     if (!r.ok) throw new Error();
     const v = await r.json();
-    const t = new Date(v.deployed_at).toLocaleString();
+    const ts = v.committed_at || v.deployed_at;
+    const t = new Date(ts).toLocaleString();
     const sha = (v.commit || "").slice(0, 7);
     el.innerHTML = sha
-      ? `deployed ${t} · <a href="https://github.com/babyhuey/playtestproxy-fill/commit/${v.commit}" target="_blank" rel="noopener">${sha}</a>`
-      : `deployed ${t}`;
+      ? `merged ${t} · <a href="https://github.com/babyhuey/playtestproxy-fill/commit/${v.commit}" target="_blank" rel="noopener">${sha}</a>`
+      : `merged ${t}`;
   } catch {
     el.textContent = "dev build";
   }
