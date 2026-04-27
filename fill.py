@@ -802,7 +802,9 @@ def main() -> int:
         print(f"Fetching deck {args.deck}...")
         jobs = fetch_deck(args.deck)
     else:
-        ap.error("supply a deck URL/id or --decklist")
+        # ap.error sys.exits but CodeQL doesn't model that, so raise
+        # explicitly to keep `jobs` flow-sensitive.
+        raise SystemExit("supply a deck URL/id or --decklist")
     if args.skip_basic_lands:
         before = sum(j.qty for j in jobs)
         jobs = [j for j in jobs if not is_basic_land(j.name)]
