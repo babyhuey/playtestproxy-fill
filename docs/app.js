@@ -566,10 +566,11 @@ function pairTokens(tokens) {
 }
 
 async function discoverTokens(jobs) {
-  // Walk all_parts on every main-deck card, dedupe by Scryfall UID, and
-  // return one token job per unique token. One physical token per design
-  // is enough — copies don't add information.
-  const seen = new Map();  // token UID → job
+  // Walk all_parts on every main-deck card and return one job per unique
+  // token. Dedupes by lowercased name so different Scryfall printings of
+  // the same token (e.g. "Treasure", "Faerie Rogue") collapse — otherwise
+  // pair-tokens could land visually identical art on both sides.
+  const seen = new Map();  // lowercased name → job
   let failed = 0;
   for (const job of jobs) {
     if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
@@ -582,8 +583,9 @@ async function discoverTokens(jobs) {
     }
     for (const part of data.all_parts || []) {
       if (part.component !== "token" || !part.id) continue;
-      if (!seen.has(part.id)) {
-        seen.set(part.id, {
+      const key = (part.name || part.id).trim().toLowerCase();
+      if (!seen.has(key)) {
+        seen.set(key, {
           name: `${part.name || "Token"} (token)`,
           qty: 1,
           uid: part.id,
