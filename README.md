@@ -50,8 +50,9 @@ Recognised inputs:
   or alphanumeric public id.
 - A **TappedOut** URL (`https://tappedout.net/mtg-decks/<slug>/`).
 - A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
-  Accepts MTG Arena exports, "1 Card Name" lines, optional `(SET) NUM`
-  trailers, and Sideboard / Maybeboard sections (skipped).
+  Accepts MTG Arena exports, MTGO `.dek` XML, "1 Card Name" lines,
+  optional `(SET) NUM` trailers, and Sideboard / Maybeboard sections
+  (skipped).
 
 Deckstats and MTGGoldfish URLs are recognised but blocked behind
 Cloudflare JS challenges. The tool prints a clear message asking you to

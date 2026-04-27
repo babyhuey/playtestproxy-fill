@@ -292,7 +292,27 @@ async function makeDefaultBackBlob(dpi, bleedMm) {
 
 // --- Plain-text decklist support ----------------------------------------
 
+function parseMtgoDek(text) {
+  // MTGO `.dek` XML: <Cards Quantity="N" Sideboard="false" Name="..." />
+  const doc = new DOMParser().parseFromString(text, "application/xml");
+  if (doc.querySelector("parsererror")) {
+    throw new Error("Could not parse MTGO .dek XML");
+  }
+  const out = [];
+  for (const el of doc.getElementsByTagName("Cards")) {
+    if ((el.getAttribute("Sideboard") || "").toLowerCase() === "true") continue;
+    const qty = Number(el.getAttribute("Quantity") || "0");
+    const name = (el.getAttribute("Name") || "").trim();
+    if (qty > 0 && name) out.push({ qty, name, set: null, cn: null });
+  }
+  return out;
+}
+
 function parseDecklist(text) {
+  const head = text.trimStart();
+  if (head.startsWith("<?xml") || head.startsWith("<Deck")) {
+    return parseMtgoDek(text);
+  }
   const out = [];
   let inExcluded = false;
   for (const raw of text.split(/\r?\n/)) {
