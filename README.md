@@ -1,6 +1,6 @@
 # playtestproxy-fill
 
-Pull a deck from Archidekt, Moxfield, TappedOut, or any pasted decklist
+Pull a deck from Archidekt, Moxfield, TappedOut, EDHREC, or any pasted decklist
 and produce print-ready images for [tcgplaytest.com](https://www.tcgplaytest.com/).
 Includes a Python CLI, a Playwright auto-uploader, and a no-install web
 frontend at <https://babyhuey.github.io/playtestproxy-fill/>.
@@ -49,6 +49,9 @@ Recognised inputs:
 - A **Moxfield** URL (`https://www.moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg`)
   or alphanumeric public id.
 - A **TappedOut** URL (`https://tappedout.net/mtg-decks/<slug>/`).
+- An **EDHREC** sample-deck URL
+  (`https://edhrec.com/deckpreview/<hash>`). Reads the embedded
+  `__NEXT_DATA__` blob — no rotating buildId chase.
 - A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
   Accepts MTG Arena exports, "1 Card Name" lines, optional `(SET) NUM`
   trailers, and Sideboard / Maybeboard sections (skipped).

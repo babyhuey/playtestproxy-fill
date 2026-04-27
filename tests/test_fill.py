@@ -77,6 +77,11 @@ class TestDetectSource:
             ("budget-mono-blue-control-1",),
         )
 
+    def test_edhrec_url(self):
+        assert fill.detect_source(
+            "https://edhrec.com/deckpreview/k39SkKNDKaQEan_AX8CJ8A"
+        ) == ("edhrec", ("k39SkKNDKaQEan_AX8CJ8A",))
+
     def test_deckstats_url(self):
         assert fill.detect_source("https://deckstats.net/decks/126143/4305047-some-name") == (
             "deckstats",
@@ -386,6 +391,57 @@ def test_fetch_tappedout_returns_jobs():
         )
     jobs = fill._fetch_tappedout("test-slug")
     assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
+
+
+@responses.activate
+def test_fetch_edhrec_extracts_next_data():
+    """EDHREC's deckpreview page embeds the deck as a list of plain
+    `"N Card Name"` strings inside __NEXT_DATA__. We extract and route
+    through the existing decklist parser."""
+    next_data = {
+        "props": {
+            "pageProps": {
+                "data": {
+                    "deck": ["3 Lightning Bolt", "1 Sol Ring"],
+                }
+            }
+        }
+    }
+    html = (
+        "<html><body>"
+        '<script id="__NEXT_DATA__" type="application/json">'
+        + __import__("json").dumps(next_data)
+        + "</script></body></html>"
+    )
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/abc123",
+        body=html,
+        status=200,
+        content_type="text/html",
+    )
+    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/cards/named",
+            json={"id": uid, "name": name},
+            status=200,
+        )
+    jobs = fill._fetch_edhrec("abc123")
+    assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
+
+
+@responses.activate
+def test_fetch_edhrec_missing_blob_errors():
+    responses.add(
+        responses.GET,
+        "https://edhrec.com/deckpreview/abc123",
+        body="<html>no next data here</html>",
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="__NEXT_DATA__"):
+        fill._fetch_edhrec("abc123")
 
 
 @responses.activate

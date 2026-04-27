@@ -28,6 +28,7 @@ const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
 const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
 const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
+const EDHREC_RE = /edhrec\.com\/deckpreview\/([A-Za-z0-9_-]+)/i;
 const DECKSTATS_RE = /deckstats\.net\/decks\/(\d+)\/(\d+)/i;
 const MTGGOLDFISH_RE = /mtggoldfish\.com\/(?:deck|archetype)\/(\d+)/i;
 const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
@@ -72,6 +73,8 @@ function detectSource(input) {
   if (m) return { source: "moxfield", args: [m[1]] };
   m = s.match(TAPPEDOUT_RE);
   if (m) return { source: "tappedout", args: [m[1]] };
+  m = s.match(EDHREC_RE);
+  if (m) return { source: "edhrec", args: [m[1]] };
   m = s.match(DECKSTATS_RE);
   if (m) return { source: "deckstats", args: [m[1], m[2]] };
   m = s.match(MTGGOLDFISH_RE);
@@ -359,6 +362,40 @@ async function buildJobsFromDecklist(text, onProgress) {
     jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
   }
   return { jobs, unresolved };
+}
+
+async function fetchEdhrecDecklist(deckHash) {
+  // EDHREC's /deckpreview/<hash> embeds the decklist in __NEXT_DATA__ as a
+  // list of plain "N Card Name" strings. Pulling the inline blob avoids the
+  // rotating-buildId Next.js data endpoint.
+  const url = `https://edhrec.com/deckpreview/${deckHash}`;
+  let r;
+  try { r = await fetch(url); } catch { r = null; }
+  if (!r || !r.ok) {
+    r = await fetch(CORS_PROXY(url));
+    if (!r.ok) {
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`EDHREC fetch failed: ${r.status}`);
+    }
+  }
+  const html = await r.text();
+  const m = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]+?)<\/script>/);
+  if (!m) {
+    throw new Error("EDHREC page didn't include __NEXT_DATA__ — site may have changed shape.");
+  }
+  let payload;
+  try {
+    payload = JSON.parse(m[1]);
+  } catch (e) {
+    throw new Error(`EDHREC __NEXT_DATA__ wasn't valid JSON: ${e.message}`);
+  }
+  const deck = payload?.props?.pageProps?.data?.deck;
+  if (!Array.isArray(deck) || !deck.length) {
+    throw new Error("EDHREC payload had no `deck` list.");
+  }
+  return deck.map(String).join("\n");
 }
 
 async function fetchTappedOutText(slug) {
@@ -734,7 +771,7 @@ async function loadJobs(opts) {
 
   const detected = detectSource(els.input.value);
   if (!detected) {
-    throw new Error("Paste an Archidekt, Moxfield, or TappedOut URL/id.");
+    throw new Error("Paste an Archidekt, Moxfield, TappedOut, or EDHREC URL/id.");
   }
   const { source, args } = detected;
 
@@ -746,9 +783,13 @@ async function loadJobs(opts) {
     );
   }
 
-  if (source === "tappedout") {
-    setStatus("Fetching decklist from TappedOut...");
-    const text = await fetchTappedOutText(args[0]);
+  if (source === "tappedout" || source === "edhrec") {
+    const labelMap = { tappedout: "TappedOut", edhrec: "EDHREC" };
+    const human = labelMap[source];
+    setStatus(`Fetching decklist from ${human}...`);
+    const text = source === "tappedout"
+      ? await fetchTappedOutText(args[0])
+      : await fetchEdhrecDecklist(args[0]);
     setStatus("Resolving cards via Scryfall...");
     const total = (text.match(/^\s*\d+\s/gm) || []).length;
     setProgress(0, total || 1);
@@ -756,7 +797,7 @@ async function loadJobs(opts) {
       setProgress(i, n);
       setStatus(`Resolving ${i}/${n}: ${name}`);
     });
-    return { jobs, deckLabel: `TappedOut · ${args[0]}`, unresolved };
+    return { jobs, deckLabel: `${human} · ${args[0]}`, unresolved };
   }
 
   const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
