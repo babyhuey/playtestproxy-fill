@@ -616,6 +616,55 @@ def test_discover_tokens_end_to_end():
     assert len(responses.calls) == 3
 
 
+@responses.activate
+def test_discover_tokens_dedupes_by_name_across_uids():
+    """Different Scryfall printings of the same token (e.g. "Treasure" from
+    different sets) carry distinct UIDs but identical art. Dedupe by name
+    so --pair-tokens can't land copy/copy on a single card."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-a",
+        json={
+            "id": "card-a",
+            "all_parts": [
+                {"id": "treasure-uid-1", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/card-b",
+        json={
+            "id": "card-b",
+            "all_parts": [
+                {"id": "treasure-uid-2", "name": "Treasure", "component": "token"},
+            ],
+        },
+        status=200,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("CardA", "card-a"), J("CardB", "card-b")],
+        fill.requests.Session(),
+    )
+
+    assert failures == []
+    assert [j.name for j in new_jobs] == ["Treasure (token)"]
+    assert new_jobs[0].scryfall_uid == "treasure-uid-1"
+
+
 # --- Token pairing -------------------------------------------------------
 
 

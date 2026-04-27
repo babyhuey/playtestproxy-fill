@@ -483,10 +483,13 @@ def _pair_tokens(tokens: list[CardJob]) -> list[CardJob]:
 def _discover_tokens(
     jobs: list[CardJob], session: requests.Session
 ) -> tuple[list[CardJob], list[str]]:
-    """Walk every main-deck card's all_parts, dedupe tokens by Scryfall UID,
-    and return (new_token_jobs, failure_messages). Cards without a
-    scryfall_uid (Archidekt customs) are skipped silently. Network/runtime
-    failures on any one card are recorded but don't abort discovery."""
+    """Walk every main-deck card's all_parts and return (new_token_jobs,
+    failure_messages). Dedupes by lowercased token name so different
+    Scryfall printings of "Treasure" or "Faerie Rogue" collapse to one
+    job — otherwise --pair-tokens can put visually identical art on both
+    sides of a card. Cards without a scryfall_uid (Archidekt customs) are
+    skipped silently. Network/runtime failures on any one card are
+    recorded but don't abort discovery."""
     token_jobs: dict[str, CardJob] = {}
     failures: list[str] = []
     for job in jobs:
@@ -498,8 +501,9 @@ def _discover_tokens(
             failures.append(f"{job.name}: {e}")
             continue
         for token_uid, token_name in refs:
-            if token_uid not in token_jobs:
-                token_jobs[token_uid] = CardJob(
+            key = token_name.strip().lower()
+            if key not in token_jobs:
+                token_jobs[key] = CardJob(
                     name=f"{token_name} (token)",
                     qty=1,
                     scryfall_uid=token_uid,
