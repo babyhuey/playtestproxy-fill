@@ -486,8 +486,8 @@ function scryfallCard(uid) {
   return promise;
 }
 
-async function resolveUrls(job) {
-  // Returns { front, back }. `back` is null unless this is a DFC.
+async function _resolveSingle(job) {
+  // Returns { front, back } using only this job's own card data — DFC-aware.
   if (job.customUrl) return { front: job.customUrl, back: null };
   if (!job.uid) throw new Error("no Scryfall UID and no custom image");
   const data = await scryfallCard(job.uid);
@@ -503,6 +503,40 @@ async function resolveUrls(job) {
     return { front: faces[0].image_uris.png, back: null };
   }
   throw new Error(`no image_uris for ${data.name || job.uid}`);
+}
+
+async function resolveUrls(job) {
+  // Returns { front, back }. `back` is null unless this is a DFC OR the
+  // job carries a `pairBackUid` (set by pairTokens() to print two tokens
+  // back-to-back). Tokens are always single-faced, so the paired back is
+  // just that other card's front face.
+  const own = await _resolveSingle(job);
+  if (job.pairBackUid) {
+    const other = await scryfallCard(job.pairBackUid);
+    const back = other.image_uris ? other.image_uris.png : null;
+    return { front: own.front, back };
+  }
+  return own;
+}
+
+function pairTokens(tokens) {
+  // Pair N tokens into ceil(N/2) cards: token A front, token B back.
+  // The last card is unpaired if N is odd — pairBackUid stays null and
+  // resolveUrls falls through to the default playtest back. Mirrors
+  // fill.py:_pair_tokens.
+  const paired = [];
+  for (let i = 0; i < tokens.length; i += 2) {
+    const a = tokens[i];
+    const b = i + 1 < tokens.length ? tokens[i + 1] : null;
+    paired.push({
+      name: b ? `${a.name} / ${b.name}` : a.name,
+      qty: 1,
+      uid: a.uid,
+      customUrl: null,
+      pairBackUid: b ? b.uid : null,
+    });
+  }
+  return paired;
 }
 
 async function discoverTokens(jobs) {
@@ -728,6 +762,7 @@ async function run() {
     skipSide: els.skipSide.checked,
     pairBacks: $("opt-pair-backs").checked,
     includeTokens: $("opt-tokens").checked,
+    pairTokens: $("opt-pair-tokens").checked,
   };
 
   let jobs;
@@ -749,8 +784,16 @@ async function run() {
     setStatus("Discovering tokens / emblems...");
     const { tokens, failed } = await discoverTokens(jobs);
     if (tokens.length) {
-      jobs = [...jobs, ...tokens];
-      deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+      // Pairing requires --pair-backs because Sequential Backs is the
+      // only mechanism we have to assign per-card backs in tcgplaytest.
+      if (opts.pairTokens && opts.pairBacks && tokens.length >= 2) {
+        const paired = pairTokens(tokens);
+        jobs = [...jobs, ...paired];
+        deckLabel = `${deckLabel} (+ ${tokens.length} tokens → ${paired.length} cards)`;
+      } else {
+        jobs = [...jobs, ...tokens];
+        deckLabel = `${deckLabel} (+ ${tokens.length} tokens)`;
+      }
     }
     if (failed) {
       // One aggregated row instead of N opaque "[token discovery]" entries.
