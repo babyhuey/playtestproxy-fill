@@ -21,24 +21,31 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install runtime deps
+      - name: Install dev + runtime deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install ruff
-        run: pip install ruff
+          pip install -r dev-requirements.txt
 
       - name: Lint
-        run: ruff check fill.py upload.py
+        run: ruff check fill.py upload.py tests
 
       - name: Format check
-        run: ruff format --check fill.py upload.py
+        run: ruff format --check fill.py upload.py tests
 
       - name: Import smoke test
-        # Catch obvious syntax / import errors. Does not exercise network paths.
-        run: |
-          python -c "import fill, upload"
+        # Cheap pre-test guard for syntax / missing imports.
+        run: python -c "import fill, upload"
+
+      - name: Tests + coverage
+        run: pytest --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
 
   frontend:
     name: Frontend — syntax + presence checks
