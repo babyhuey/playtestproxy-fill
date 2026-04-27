@@ -680,7 +680,7 @@ def main() -> int:
     ap.add_argument(
         "--no-bleed",
         action="store_true",
-        help="Skip bleed padding (use TCGPlaytest XML path instead)",
+        help="Skip bleed padding entirely (output is just the resized art)",
     )
     ap.add_argument("--bleed-mm", type=float, default=BLEED_MM)
     ap.add_argument("--workers", type=int, default=6)
