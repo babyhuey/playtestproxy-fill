@@ -11,3 +11,4 @@ overrides/*.jpg
 # Local dev artifacts not meant for the repo
 cards.xml
 assets_default_back.png
+docs/version.json
