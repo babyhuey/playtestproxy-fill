@@ -19,15 +19,10 @@ options, or pipeline changes. -->
 
 -
 
-## Verified
-
-<!-- How did you check it works? Concrete commands/decks/inputs help. -->
-
--
-
 ## Test plan
 
-<!-- Checkboxes for the reviewer (or future-you) to walk through. -->
+<!-- How you verified it + what the reviewer should walk through.
+Concrete commands / decks / URLs are more useful than "tested locally". -->
 
 - [ ] CI green
 - [ ]

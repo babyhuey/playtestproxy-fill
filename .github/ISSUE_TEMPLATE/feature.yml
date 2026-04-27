@@ -6,7 +6,7 @@ body:
     id: problem
     attributes:
       label: What problem does this solve?
-      description: Describe the use case, not the implementation. "I want to print Cube Cobra cubes" is more useful than "add Cube Cobra integration".
+      description: Describe the use case, not the implementation. "I'd like to print decks I keep on Foo.com" is more useful than "add Foo.com support".
     validations:
       required: true
 

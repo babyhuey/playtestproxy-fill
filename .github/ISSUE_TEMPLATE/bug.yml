@@ -42,3 +42,10 @@ body:
     attributes:
       label: Environment
       placeholder: e.g. Chrome 142 on macOS, or Python 3.12 on Linux
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: For the web frontend, the footer shows "merged at X · sha". For the CLI, paste the output of `git rev-parse --short HEAD`.
+      placeholder: e.g. 5e9f126 or "merged 4/27/2026"
