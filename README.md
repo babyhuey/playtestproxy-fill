@@ -167,3 +167,18 @@ upload.py <images_dir>
   there's no upload to their server until checkout, so you can't hand a
   draft from one origin to another. The upload step has to happen in the
   same browser tab as the editor.
+
+## Legal
+
+Magic: The Gathering, all card names, and all card images are © Wizards of
+the Coast. This project is an unofficial tool for personal playtesting use
+and is not affiliated with or endorsed by Wizards of the Coast. Card images
+are fetched at runtime from the public [Scryfall](https://scryfall.com/)
+API; please respect their [terms of service](https://scryfall.com/docs/api).
+
+The bundled `assets/default_back.png` ("You Wouldn't Proxy a Magic Card")
+is fan parody — derived from a community meme, no copyright claim is made
+on it. Replace with `--default-back` if you'd rather not ship it.
+
+If you believe content in this repo infringes your rights, please open an
+issue or email the maintainer; we'll act in good faith.

@@ -58,7 +58,13 @@ class CardJob:
 
 
 def slug(name: str) -> str:
+    """Filename-safe normalisation. Strips any leading combination of
+    `.` and `_` so path-traversal-flavoured input (`..`, `./foo`,
+    `../traversal`) can't produce filenames like `..png` that look benign
+    but lean on `.` semantics. The numeric slot prefix later already
+    neutralises real traversal, but rejecting up front is defense in depth."""
     s = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
+    s = re.sub(r"^[._]+", "", s)
     return s[:80] or "card"
 
 
@@ -550,7 +556,29 @@ def resolve_urls(
     return front, back
 
 
+_ALLOWED_IMAGE_SCHEMES = ("https://", "file://")
+
+
+def _scrub_source(url: str | None) -> str | None:
+    """Strip the absolute-path portion of a file:// URL down to its basename
+    so manifest.json doesn't leak `/home/<user>/...` if shared. We drop the
+    folder entirely rather than implying `overrides/` — the actual override
+    dir is configurable via --overrides and could itself be sensitive
+    (e.g. /home/alice/private-cards/)."""
+    if url and url.startswith("file://"):
+        return f"file://{Path(url[7:]).name}"
+    return url
+
+
 def fetch_image(url: str, session: requests.Session) -> Image.Image:
+    """Fetch a card image from disk (override) or HTTPS (Scryfall / Archidekt
+    custom). Other schemes are rejected — an adversarial deck JSON could
+    otherwise send a `customImageUrl` of `http://169.254.169.254/...` or
+    `ftp://internal-host/...` and turn this CLI into an SSRF helper. The
+    user runs this on their own machine so blast radius is small, but
+    rejecting upfront is cheap and right."""
+    if not url.startswith(_ALLOWED_IMAGE_SCHEMES):
+        raise RuntimeError(f"Refusing image URL with disallowed scheme: {url!r}")
     if url.startswith("file://"):
         return Image.open(url[7:]).convert("RGB")
     r = session.get(url, headers=UA, timeout=60)
@@ -804,13 +832,16 @@ def main() -> int:
                 back_path = backs_dir / f"{base}.png"
                 this_back.save(back_path, "PNG", optimize=True)
                 files.append(str(back_path.relative_to(out_dir)))
+        # `file://` sources include the absolute local override path, which
+        # leaks the user's home directory if they share the manifest. Scrub
+        # to just the basename; HTTPS URLs stay as-is.
         manifest.append(
             {
                 "name": job.name,
                 "qty": job.qty,
                 "has_back": back_img is not None,
-                "front_source": front_url,
-                "back_source": back_url,
+                "front_source": _scrub_source(front_url),
+                "back_source": _scrub_source(back_url),
                 "files": files,
             }
         )
