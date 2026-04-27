@@ -26,9 +26,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r dev-requirements.txt
 
+      - name: Cache Playwright browsers
+        # ~300MB of Chromium binaries; pip's cache doesn't cover them.
+        # Key on dev-requirements.txt so a Playwright bump invalidates.
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('dev-requirements.txt') }}
+
       - name: Install Chromium for Playwright tests
-        # The frontend integration test needs a headless browser. The
-        # download is cached by setup-python's pip cache between runs.
+        # `--with-deps` runs apt-get for system libs; ubuntu-latest already
+        # has most of them so this is a few seconds even on a cache hit.
+        # On miss it downloads ~300MB which the cache step catches next time.
         run: playwright install --with-deps chromium
 
       - name: Lint

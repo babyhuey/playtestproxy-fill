@@ -421,6 +421,8 @@ const SCRYFALL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 let _idbPromise = null;
 
 function openIdb() {
+  // Schema is implicit at version 1. Any schema change requires either a
+  // version bump with a real onupgradeneeded migration, or a new DB name.
   if (_idbPromise) return _idbPromise;
   _idbPromise = new Promise((resolve) => {
     if (!("indexedDB" in self)) return resolve(null);  // Safari private mode etc.
@@ -456,22 +458,32 @@ async function idbSet(key, value) {
   });
 }
 
-async function scryfallCard(uid) {
-  const memHit = _scryfallCache.get(uid);
-  if (memHit) return memHit;
+function scryfallCard(uid) {
+  // Store the *Promise* in the in-memory cache, not the resolved data. Two
+  // concurrent callers asking for the same UID land on the same in-flight
+  // request, so we never double-fetch even under rapid double-clicks.
+  // Resolved Promises are cheap to await — same micro-task overhead as a
+  // direct value return.
+  const inflight = _scryfallCache.get(uid);
+  if (inflight) return inflight;
 
-  const stored = await idbGet(uid);
-  if (stored && Date.now() - stored.fetchedAt < SCRYFALL_TTL_MS) {
-    _scryfallCache.set(uid, stored.data);
-    return stored.data;
-  }
+  const promise = (async () => {
+    const stored = await idbGet(uid);
+    if (stored && Date.now() - stored.fetchedAt < SCRYFALL_TTL_MS) {
+      return stored.data;
+    }
+    await new Promise((r) => setTimeout(r, 80));  // Scryfall rate-limit politeness
+    const data = await fetchJson(SCRYFALL(uid));
+    // Best-effort persist; awaiting is cheap because IDB writes are async-batched.
+    idbSet(uid, { data, fetchedAt: Date.now() });
+    return data;
+  })();
 
-  await new Promise((r) => setTimeout(r, 80));
-  const data = await fetchJson(SCRYFALL(uid));
-  _scryfallCache.set(uid, data);
-  // Best-effort persist; awaiting is cheap because IDB writes are async-batched.
-  idbSet(uid, { data, fetchedAt: Date.now() });
-  return data;
+  _scryfallCache.set(uid, promise);
+  // If the fetch fails, drop the rejected promise so a retry can try again
+  // instead of seeing the cached failure forever.
+  promise.catch(() => _scryfallCache.delete(uid));
+  return promise;
 }
 
 async function resolveUrls(job) {
