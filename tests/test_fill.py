@@ -15,6 +15,26 @@ import fill
 # --- Pure helpers --------------------------------------------------------
 
 
+class TestIsBasicLand:
+    def test_canonical_basics(self):
+        for n in ["Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"]:
+            assert fill.is_basic_land(n)
+
+    def test_snow_covered(self):
+        assert fill.is_basic_land("Snow-Covered Forest")
+        assert fill.is_basic_land("snow-covered island")  # case-insensitive
+
+    def test_whitespace_tolerated(self):
+        assert fill.is_basic_land("  Plains  ")
+
+    def test_non_basic_lands_excluded(self):
+        # Real lands that contain a basic name as a substring must NOT match.
+        assert not fill.is_basic_land("Snow-Covered Mountain Pass")
+        assert not fill.is_basic_land("Forest of Lost Souls")
+        assert not fill.is_basic_land("Sol Ring")
+        assert not fill.is_basic_land("")
+
+
 class TestSlug:
     def test_basic(self):
         assert fill.slug("Sol Ring") == "Sol_Ring"

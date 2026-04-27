@@ -18,6 +18,7 @@ extract it, and drag the `fronts/` and `backs/` folders into tcgplaytest.
 The frontend covers the same options as the CLI:
 
 - Skip Sideboard / Maybeboard
+- Skip basic lands (use this if you already have a stack of basics)
 - Pair backs (DFC face-2 + a default back for everything else)
 - Include tokens / emblems (off by default)
 - Pair tokens back-to-back (cuts the token portion of the bill in half)
@@ -171,6 +172,7 @@ fill.py [<deck_url_or_id>]
   --decklist PATH         Plain-text decklist (or '-' for stdin) instead of a URL
   --overrides DIR         Override-images dir (default: overrides)
   --workers N             Parallel image downloads (default: 6)
+  --skip-basic-lands      Drop basic lands from the output
   --pair-backs            Emit out/fronts/ + out/backs/ for Sequential Backs
   --default-back PATH     Custom default back for non-DFC cards (with --pair-backs)
   --include-tokens        Append one of each unique token / emblem the deck creates
