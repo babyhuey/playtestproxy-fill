@@ -54,14 +54,19 @@ Recognised inputs:
 - An **Archidekt** URL (`https://archidekt.com/decks/21170685/...`) or numeric id.
 - A **Moxfield** URL (`https://www.moxfield.com/decks/3HyL6_kzbk-sFMs2fchzsg`)
   or alphanumeric public id.
+- A **Scryfall** deck URL (`https://scryfall.com/@user/decks/<uuid>`).
+  Pulls the deck via Scryfall's plain-text export endpoint.
+- A **Deckbox** set URL (`https://deckbox.org/sets/<id>`). Uses Deckbox's
+  TCG-format export. Private sets surface a clear error.
 - A **TappedOut** URL (`https://tappedout.net/mtg-decks/<slug>/`).
 - An **EDHREC** sample-deck URL
   (`https://edhrec.com/deckpreview/<hash>`). Reads the embedded
   `__NEXT_DATA__` blob — no rotating buildId chase.
 - A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
-  Accepts MTG Arena exports, MTGO `.dek` XML, "1 Card Name" lines,
-  optional `(SET) NUM` trailers, and Sideboard / Maybeboard sections
-  (skipped).
+  Accepts MTG Arena exports, MTGO `.dek` XML, **ManaBox / generic CSV**
+  with Name + Quantity columns (Section column auto-skipped for
+  Sideboard / Maybeboard), "1 Card Name" lines, optional `(SET) NUM`
+  trailers, and Sideboard / Maybeboard sections (skipped).
 
 Deckstats and MTGGoldfish URLs are recognised but blocked behind
 Cloudflare JS challenges. The tool prints a clear message asking you to
@@ -184,6 +189,10 @@ fill.py [<deck_url_or_id>]
   --include-tokens        Append one of each unique token / emblem the deck creates
   --pair-tokens           Print two tokens back-to-back (needs --include-tokens
                           and --pair-backs); cuts token cost roughly in half
+  --tokens-thorough       With --include-tokens, also regex-scan oracle text for
+                          'create … token' phrases and resolve each via Scryfall
+                          search. Catches tokens missing from Scryfall's all_parts
+                          metadata, but slower (one extra search per descriptor).
 
 upload.py <images_dir>
   --headless              Run without a visible browser window

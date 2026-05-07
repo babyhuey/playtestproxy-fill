@@ -33,6 +33,8 @@ from PIL import Image, ImageOps  # noqa: F401  (ImageOps reserved for future use
 ARCHIDEKT_DECK = "https://archidekt.com/api/decks/{}/"
 MOXFIELD_DECK = "https://api2.moxfield.com/v3/decks/all/{}"
 SCRYFALL_CARD = "https://api.scryfall.com/cards/{}"
+SCRYFALL_DECK_EXPORT = "https://api.scryfall.com/decks/{}/export/text"
+DECKBOX_EXPORT = "https://deckbox.org/sets/{}/export?format=tcg"
 
 UA = {"User-Agent": "playtestproxy-fill/0.1 (+local tool)"}
 
@@ -97,6 +99,17 @@ def slug(name: str) -> str:
 
 _ARCHIDEKT_RE = re.compile(r"archidekt\.com/decks/(\d+)", re.I)
 _MOXFIELD_RE = re.compile(r"moxfield\.com/decks/([A-Za-z0-9_-]{12,})", re.I)
+# Scryfall deck UUIDs are the standard 8-4-4-4-12 hex shape. The optional
+# `@<user>/` segment is part of the canonical URL but stripping it lets us
+# support both `scryfall.com/@user/decks/<id>` and `scryfall.com/decks/<id>`.
+_SCRYFALL_DECK_RE = re.compile(
+    r"scryfall\.com/(?:@[A-Za-z0-9_-]+/)?decks/"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.I,
+)
+# Deckbox uses numeric set ids in the URL (`/sets/<n>`); the slug after isn't
+# required for the export endpoint.
+_DECKBOX_RE = re.compile(r"deckbox\.org/sets/(\d+)", re.I)
 
 
 def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
@@ -105,6 +118,8 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
     Recognised:
       - Archidekt URL  -> ("archidekt",  (numeric_id,))
       - Moxfield URL   -> ("moxfield",   (public_id,))
+      - Scryfall URL   -> ("scryfall",   (uuid,))
+      - Deckbox URL    -> ("deckbox",    (numeric_id,))
       - TappedOut URL  -> ("tappedout",  (slug,))
       - Deckstats URL  -> ("deckstats",  (owner_id, deck_id))
       - MTGGoldfish URL-> ("mtggoldfish",(deck_id,))
@@ -118,6 +133,12 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
     m = _MOXFIELD_RE.search(s)
     if m:
         return "moxfield", (m.group(1),)
+    m = _SCRYFALL_DECK_RE.search(s)
+    if m:
+        return "scryfall", (m.group(1),)
+    m = _DECKBOX_RE.search(s)
+    if m:
+        return "deckbox", (m.group(1),)
     m = _DECKSTATS_RE.search(s)
     if m:
         return "deckstats", (m.group(1), m.group(2))
@@ -136,8 +157,9 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
         return "moxfield", (s,)
     raise SystemExit(
         f"Could not recognise '{input_str}' as a supported deck. "
-        "Paste an Archidekt, Moxfield, TappedOut, Deckstats, or MTGGoldfish URL, "
-        "or use --decklist with a path / '-' to pipe a plain decklist."
+        "Paste an Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC, "
+        "Deckstats, or MTGGoldfish URL, or use --decklist with a path / '-' "
+        "to pipe a plain decklist."
     )
 
 
@@ -146,6 +168,8 @@ def fetch_deck(input_str: str) -> list[CardJob]:
     fetchers = {
         "archidekt": _fetch_archidekt,
         "moxfield": _fetch_moxfield,
+        "scryfall": _fetch_scryfall,
+        "deckbox": _fetch_deckbox,
         "tappedout": _fetch_tappedout,
         "edhrec": _fetch_edhrec,
         "deckstats": lambda *a: _fetch_cloudflare_blocked("Deckstats", *a),
@@ -280,6 +304,75 @@ _SECTION_HEADERS = re.compile(
 )
 
 
+def _looks_like_csv(text: str) -> bool:
+    """Header-row sniff for a ManaBox / generic CSV decklist. We require
+    *both* a name and a quantity column on the first non-empty line —
+    a single comma in a card name (`Bosco, Just a Bear`) on its own line
+    must not flip the parser into CSV mode."""
+    head = text.lstrip()
+    first = head.split("\n", 1)[0].strip()
+    if "," not in first:
+        return False
+    columns = [c.strip().strip('"').lower() for c in first.split(",")]
+    has_name = any(c in {"name", "card name", "card_name"} for c in columns)
+    has_qty = any(c in {"quantity", "qty", "count"} for c in columns)
+    return has_name and has_qty
+
+
+# ManaBox 'Section' / 'Board' values that the deck shouldn't include.
+# ManaBox uses title-cased values; we lowercase before comparing.
+_CSV_EXCLUDED_SECTIONS = frozenset({"sideboard", "maybeboard", "considering"})
+
+
+def _parse_csv_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
+    """Parse a CSV decklist (e.g. ManaBox export). Column header names are
+    matched case-insensitively against the known aliases. Rows whose
+    Section/Board column flags Sideboard / Maybeboard are skipped, mirroring
+    the plain-text parser. Returns the same tuple shape as `_parse_decklist`.
+    """
+    import csv
+    from io import StringIO
+
+    reader = csv.DictReader(StringIO(text))
+    if not reader.fieldnames:
+        return []
+    # Header lookup is case- and whitespace-insensitive — different ManaBox
+    # versions ship "Set code" vs "Set Code" vs "set_code".
+    headers = {(f or "").strip().lower(): f for f in reader.fieldnames}
+
+    def pick(*aliases: str) -> str | None:
+        for a in aliases:
+            if a in headers:
+                return headers[a]
+        return None
+
+    name_key = pick("name", "card name", "card_name")
+    qty_key = pick("quantity", "qty", "count")
+    if not name_key or not qty_key:
+        return []
+    set_key = pick("set code", "set_code", "set")
+    cn_key = pick("collector number", "collector_number", "number", "collector")
+    section_key = pick("section", "board", "type")
+
+    out: list[tuple[int, str, str | None, str | None]] = []
+    for row in reader:
+        if section_key:
+            sec = (row.get(section_key) or "").strip().lower()
+            if sec in _CSV_EXCLUDED_SECTIONS:
+                continue
+        try:
+            qty = int(str(row.get(qty_key) or "0").strip())
+        except ValueError:
+            continue
+        name = (row.get(name_key) or "").strip()
+        if qty <= 0 or not name:
+            continue
+        set_code = (row.get(set_key) or "").strip().lower() or None if set_key else None
+        cn = (row.get(cn_key) or "").strip() or None if cn_key else None
+        out.append((qty, name, set_code, cn))
+    return out
+
+
 def _parse_mtgo_dek(text: str) -> list[tuple[int, str, str | None, str | None]]:
     """Parse Magic Online .dek XML. Returns the same tuple shape as
     `_parse_decklist`. stdlib `ET.fromstring` is safe here for our use:
@@ -315,9 +408,12 @@ def _parse_mtgo_dek(text: str) -> list[tuple[int, str, str | None, str | None]]:
 def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
     """Return [(qty, name, set_code|None, collector|None), ...] for the
     main deck only. Sideboard / maybeboard / token sections are skipped.
-    Auto-detects MTGO `.dek` XML."""
+    Auto-detects MTGO `.dek` XML and ManaBox-style CSV by their distinctive
+    leading bytes / header row."""
     if text.lstrip().startswith("<?xml") or "<Deck" in text[:200]:
         return _parse_mtgo_dek(text)
+    if _looks_like_csv(text):
+        return _parse_csv_decklist(text)
     out: list[tuple[int, str, str | None, str | None]] = []
     in_excluded = False
     for raw in text.splitlines():
@@ -432,6 +528,49 @@ def _fetch_tappedout(slug: str) -> list[CardJob]:
             "Check the slug and that the deck is public."
         )
     r.raise_for_status()
+    return _jobs_from_decklist(r.text)
+
+
+def _fetch_scryfall(deck_id: str) -> list[CardJob]:
+    """Scryfall public decks ship a plain-text export at /decks/<uuid>/export/text
+    with the same `N Card Name` shape the decklist parser already handles.
+    Their CDN sets `Content-Type: text/plain` and CORS-allows `*`, so the web
+    frontend hits the same endpoint without the proxy."""
+    url = SCRYFALL_DECK_EXPORT.format(deck_id)
+    r = requests.get(url, headers=UA, timeout=30)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"Scryfall returned {r.status_code} for deck '{deck_id}'. "
+            "Check the URL and that the deck is public."
+        )
+    r.raise_for_status()
+    return _jobs_from_decklist(r.text)
+
+
+def _fetch_deckbox(set_id: str) -> list[CardJob]:
+    """Deckbox 'sets' (decks and binders) expose a plain-text export at
+    /sets/<id>/export?format=tcg with `N Card Name` lines. Private sets
+    redirect to a login page; the redirect is followed so we surface that
+    as a 4xx-style 'check that the set is public' message rather than
+    silently parsing the login HTML to zero cards."""
+    url = DECKBOX_EXPORT.format(set_id)
+    # allow_redirects=True is the default but we explicitly inspect the
+    # final URL: Deckbox redirects private sets to /accounts/login/, which
+    # responds 200 with HTML that the decklist parser would yield zero
+    # entries from — surface it as a clear error instead.
+    r = requests.get(url, headers=UA, timeout=30, allow_redirects=True)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"Deckbox returned {r.status_code} for set '{set_id}'. "
+            "Check the set id and that it's public."
+        )
+    r.raise_for_status()
+    if "/login" in r.url or "<html" in r.text[:200].lower():
+        raise SystemExit(
+            f"Deckbox set '{set_id}' looks private (export redirected away from "
+            "the text endpoint). Make the set public, or copy the decklist and "
+            "use --decklist instead."
+        )
     return _jobs_from_decklist(r.text)
 
 
@@ -588,7 +727,9 @@ def _pair_tokens(tokens: list[CardJob]) -> list[CardJob]:
 
 
 def _discover_tokens(
-    jobs: list[CardJob], session: requests.Session
+    jobs: list[CardJob],
+    session: requests.Session,
+    thorough: bool = False,
 ) -> tuple[list[CardJob], list[str]]:
     """Walk every main-deck card's all_parts and return (new_token_jobs,
     failure_messages). Dedupes by (lowercased name, type_line) so
@@ -597,9 +738,17 @@ def _discover_tokens(
     vs. the Kamigawa colorless Spirit) stay separate. Cards without a
     scryfall_uid (Archidekt customs) are skipped silently. Network /
     runtime failures on any one card are recorded but don't abort
-    discovery."""
+    discovery.
+
+    `thorough=True` additionally regex-scans each card's oracle_text for
+    'create ... token' phrases and resolves each via Scryfall search. This
+    catches tokens that Scryfall's all_parts metadata omits — at the cost
+    of one search request per unique descriptor. The phrase→UID lookup is
+    cached so two cards that mint the same token (e.g. both create
+    Treasures) only burn one search request between them."""
     token_jobs: dict[tuple[str, str], CardJob] = {}
     failures: list[str] = []
+    phrase_cache: dict[str, str | None] = {}
     for job in jobs:
         if not job.scryfall_uid:
             continue
@@ -619,7 +768,189 @@ def _discover_tokens(
                     set_code=None,
                     collector_number=None,
                 )
+        if thorough:
+            try:
+                payload = scryfall_card_payload(job.scryfall_uid, session)
+            except (requests.RequestException, RuntimeError):
+                # Already recorded above by scryfall_token_refs if it failed
+                # there; payload caching means a second failure is the same
+                # underlying network/HTTP error.
+                continue
+            for phrase in _oracle_token_phrases(payload):
+                norm = phrase.lower()
+                if norm not in phrase_cache:
+                    phrase_cache[norm] = _resolve_token_phrase(phrase, session)
+                token_uid = phrase_cache[norm]
+                if not token_uid:
+                    continue
+                try:
+                    tok = scryfall_card_payload(token_uid, session)
+                except (requests.RequestException, RuntimeError):
+                    continue
+                tok_name = (tok.get("name") or "").strip()
+                tok_type = (tok.get("type_line") or "").strip()
+                if not tok_name:
+                    continue
+                key = (tok_name.lower(), tok_type.lower())
+                if key not in token_jobs:
+                    token_jobs[key] = CardJob(
+                        name=f"{tok_name} (token)",
+                        qty=1,
+                        scryfall_uid=token_uid,
+                        custom_image_url=None,
+                        set_code=None,
+                        collector_number=None,
+                    )
     return list(token_jobs.values()), failures
+
+
+# Magic oracle text uses a small fixed set of quantifiers before "token".
+# `x` is a variable but always means "≥1 token created" — fine to count.
+# Number digits ("create 4 Treasure tokens") are matched separately.
+_TOKEN_QUANTIFIERS = (
+    "a",
+    "an",
+    "x",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+)
+_TOKEN_PHRASE_RE = re.compile(
+    r"\bcreate[s]?\s+"
+    r"(?:\d+|" + "|".join(_TOKEN_QUANTIFIERS) + r")"
+    r"(?:\s+or\s+more)?"
+    # Lazy descriptor capped at 120 chars so a missing 'token' suffix can't
+    # eat the rest of the oracle text. Whitespace+token closes the match.
+    r"\s+(?P<descriptor>.{1,120}?)"
+    r"\s+token[s]?\b",
+    re.IGNORECASE,
+)
+_TOKEN_COLOR_WORDS = {
+    "white": "w",
+    "blue": "u",
+    "black": "b",
+    "red": "r",
+    "green": "g",
+    "colorless": "c",
+}
+# Words inside a creature-token descriptor that don't constrain identity
+# and would derail the Scryfall search if treated as creature subtypes.
+_TOKEN_FILLER_WORDS = frozenset(
+    {"creature", "artifact", "enchantment", "and", "or", "tapped", "legendary"}
+)
+
+
+def _extract_token_phrases(oracle_text: str) -> list[str]:
+    """Pull `create N <descriptor> token` descriptors out of oracle text.
+    The descriptor is what appears between the quantifier and the literal
+    word 'token' — e.g. '1/1 white Soldier creature' or 'Treasure'. Trailing
+    'with X', 'named X', and 'that's a copy of X' clauses come AFTER 'token',
+    so the lazy capture doesn't pick them up. Returns [] for empty/None
+    input or no matches."""
+    if not oracle_text:
+        return []
+    out: list[str] = []
+    for m in _TOKEN_PHRASE_RE.finditer(oracle_text):
+        descriptor = re.sub(r"\s+", " ", m.group("descriptor").strip())
+        if descriptor:
+            out.append(descriptor)
+    return out
+
+
+def _oracle_token_phrases(payload: dict) -> list[str]:
+    """Extract token-create phrases from a Scryfall card payload. Walks
+    both the card-level oracle_text and per-face oracle_text (DFCs put
+    their rules text on the faces, not the root)."""
+    texts: list[str] = []
+    if payload.get("oracle_text"):
+        texts.append(payload["oracle_text"])
+    for face in payload.get("card_faces") or []:
+        if face.get("oracle_text"):
+            texts.append(face["oracle_text"])
+    out: list[str] = []
+    for text in texts:
+        out.extend(_extract_token_phrases(text))
+    return out
+
+
+def _token_phrase_to_query(phrase: str) -> str:
+    """Convert a captured descriptor into a Scryfall search query.
+
+    Two shapes:
+      - P/T descriptor ('1/1 white Soldier creature') → creature token,
+        encode pt + colors + creature subtypes.
+      - Bare name ('Treasure', 'Food', 'Clue') → match by exact token name.
+    """
+    p = phrase.strip().rstrip(".,;:")
+    pt_match = re.search(r"\b(\d+)/(\d+)\b", p)
+    if pt_match:
+        rest = re.sub(r"\b\d+/\d+\b", " ", p, count=1)
+        words = re.findall(r"[A-Za-z]+", rest)
+        colors: list[str] = []
+        types: list[str] = []
+        for w in words:
+            wl = w.lower()
+            if wl in _TOKEN_COLOR_WORDS:
+                colors.append(_TOKEN_COLOR_WORDS[wl])
+            elif wl in _TOKEN_FILLER_WORDS:
+                continue
+            elif w[0].isupper():
+                types.append(wl)
+        terms = ["is:token", f"pt:{pt_match.group(1)}/{pt_match.group(2)}"]
+        if colors:
+            # `c=` is "colors are exactly" — what we want for tokens, since
+            # a 1/1 white Spirit isn't the same as a 1/1 white-and-blue
+            # Spirit even though both are "white".
+            terms.append(f"c={''.join(colors)}")
+        for t in types:
+            terms.append(f"t:{t}")
+        return " ".join(terms)
+    # Named/predefined tokens (Treasure, Food, Clue, Blood, Map, etc.).
+    return f'is:token name:"{p}"'
+
+
+def _resolve_token_phrase(phrase: str, session: requests.Session) -> str | None:
+    """Resolve a captured oracle-text descriptor to a Scryfall token UID.
+    Returns None if Scryfall finds nothing — the caller silently skips
+    unresolvable phrases rather than aborting the build."""
+    query = _token_phrase_to_query(phrase)
+    _scryfall_wait()
+    try:
+        r = session.get(
+            "https://api.scryfall.com/cards/search",
+            params={"q": query, "unique": "cards", "order": "released"},
+            headers=UA,
+            timeout=20,
+        )
+    except requests.RequestException:
+        return None
+    if r.status_code == 404 or not r.ok:
+        return None
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    cards = data.get("data") or []
+    if not cards:
+        return None
+    return cards[0].get("id")
 
 
 def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str, str]]:
@@ -723,9 +1054,10 @@ def main() -> int:
     ap.add_argument(
         "deck",
         nargs="?",
-        help="Deck URL or id. Recognised: Archidekt, Moxfield, TappedOut, "
-        "Deckstats, or MTGGoldfish URL — or a bare Archidekt numeric id / "
-        "Moxfield public id. Omit when using --decklist.",
+        help="Deck URL or id. Recognised: Archidekt, Moxfield, Scryfall, "
+        "Deckbox, TappedOut, EDHREC, Deckstats, or MTGGoldfish URL — or a "
+        "bare Archidekt numeric id / Moxfield public id. Omit when using "
+        "--decklist.",
     )
     ap.add_argument(
         "--decklist",
@@ -770,6 +1102,14 @@ def main() -> int:
         help="With --include-tokens and --pair-backs, print two tokens "
         "back-to-back on the same physical card (you only ever need one "
         "face up at a time). Cuts token cost roughly in half.",
+    )
+    ap.add_argument(
+        "--tokens-thorough",
+        action="store_true",
+        help="With --include-tokens, also regex-scan each card's oracle_text "
+        "for 'create ... token' phrases and resolve each via Scryfall search. "
+        "Catches tokens that Scryfall's all_parts metadata omits, but is "
+        "much slower (one extra search request per unique descriptor).",
     )
     args = ap.parse_args()
 
@@ -820,8 +1160,12 @@ def main() -> int:
     session = requests.Session()
     session.headers.update(UA)
 
+    if args.tokens_thorough and not args.include_tokens:
+        print("  (--tokens-thorough has no effect without --include-tokens; ignoring)")
     if args.include_tokens:
-        token_jobs, token_failures = _discover_tokens(jobs, session)
+        if args.tokens_thorough:
+            print("  (thorough token scan enabled — expect slower discovery)")
+        token_jobs, token_failures = _discover_tokens(jobs, session, thorough=args.tokens_thorough)
         appended, warning = _apply_token_jobs(token_jobs, args.pair_tokens, args.pair_backs)
         if warning:
             print(f"  ({warning})")

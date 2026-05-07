@@ -21,10 +21,13 @@ const MAX_DECKLIST_ENTRIES = 2000;
 const ARCHIDEKT = (id) => `https://archidekt.com/api/decks/${id}/`;
 const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
+const SCRYFALL_DECK_EXPORT = (id) => `https://api.scryfall.com/decks/${id}/export/text`;
+const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg`;
 const CORS_PROXY = (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`;
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
 const SCRYFALL_NAMED = "https://api.scryfall.com/cards/named";
 const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn}`;
+const SCRYFALL_SEARCH = "https://api.scryfall.com/cards/search";
 
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
 const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
@@ -32,6 +35,11 @@ const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
 const EDHREC_RE = /edhrec\.com\/deckpreview\/([A-Za-z0-9_-]+)/i;
 const DECKSTATS_RE = /deckstats\.net\/decks\/(\d+)\/(\d+)/i;
 const MTGGOLDFISH_RE = /mtggoldfish\.com\/(?:deck|archetype)\/(\d+)/i;
+// Scryfall deck UUIDs are the standard 8-4-4-4-12 hex shape; the `@<user>/`
+// segment is canonical but optional in the URL.
+const SCRYFALL_DECK_RE =
+  /scryfall\.com\/(?:@[A-Za-z0-9_-]+\/)?decks\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+const DECKBOX_RE = /deckbox\.org\/sets\/(\d+)/i;
 const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
 
 // "1 Card Name" / "4x Lightning Bolt" / "1 Sol Ring (CMM) 343" — same as fill.py.
@@ -74,6 +82,10 @@ function detectSource(input) {
   if (m) return { source: "archidekt", args: [m[1]] };
   m = s.match(MOXFIELD_RE);
   if (m) return { source: "moxfield", args: [m[1]] };
+  m = s.match(SCRYFALL_DECK_RE);
+  if (m) return { source: "scryfall", args: [m[1]] };
+  m = s.match(DECKBOX_RE);
+  if (m) return { source: "deckbox", args: [m[1]] };
   m = s.match(TAPPEDOUT_RE);
   if (m) return { source: "tappedout", args: [m[1]] };
   m = s.match(EDHREC_RE);
@@ -269,10 +281,93 @@ function parseMtgoDek(text) {
   return out;
 }
 
+// CSV detection: header row must carry both a 'name' and a 'quantity'
+// column. A single comma in `Bosco, Just a Bear` on its own line must NOT
+// flip the parser into CSV mode — that's why we require BOTH headers.
+const CSV_NAME_HEADERS = new Set(["name", "card name", "card_name"]);
+const CSV_QTY_HEADERS = new Set(["quantity", "qty", "count"]);
+const CSV_SET_HEADERS = ["set code", "set_code", "set"];
+const CSV_CN_HEADERS = ["collector number", "collector_number", "number", "collector"];
+const CSV_SECTION_HEADERS = ["section", "board", "type"];
+const CSV_EXCLUDED_SECTIONS = new Set(["sideboard", "maybeboard", "considering"]);
+
+function looksLikeCsv(text) {
+  const head = text.trimStart();
+  const first = head.split(/\r?\n/, 1)[0].trim();
+  if (!first.includes(",")) return false;
+  const cols = first.split(",").map((c) => c.trim().replace(/^"|"$/g, "").toLowerCase());
+  const hasName = cols.some((c) => CSV_NAME_HEADERS.has(c));
+  const hasQty = cols.some((c) => CSV_QTY_HEADERS.has(c));
+  return hasName && hasQty;
+}
+
+// Minimal RFC-4180-ish split. Handles quoted fields with embedded commas
+// and `""` escaping. We don't need full CSV semantics — ManaBox / Deckbox
+// exports stay within this subset.
+function splitCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (c === '"') inQuotes = false;
+      else cur += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      out.push(cur); cur = "";
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+function parseCsvDecklist(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return [];
+  const headers = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+  const idx = (cands) => {
+    for (const c of cands) {
+      const i = headers.indexOf(c);
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
+  const nameIdx = idx([...CSV_NAME_HEADERS]);
+  const qtyIdx = idx([...CSV_QTY_HEADERS]);
+  if (nameIdx === -1 || qtyIdx === -1) return [];
+  const setIdx = idx(CSV_SET_HEADERS);
+  const cnIdx = idx(CSV_CN_HEADERS);
+  const sectionIdx = idx(CSV_SECTION_HEADERS);
+
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitCsvLine(lines[i]);
+    if (sectionIdx !== -1) {
+      const sec = (cells[sectionIdx] || "").trim().toLowerCase();
+      if (CSV_EXCLUDED_SECTIONS.has(sec)) continue;
+    }
+    const qty = Number((cells[qtyIdx] || "0").trim());
+    const name = (cells[nameIdx] || "").trim();
+    if (!Number.isFinite(qty) || qty <= 0 || !name) continue;
+    const set = setIdx !== -1 ? ((cells[setIdx] || "").trim().toLowerCase() || null) : null;
+    const cn = cnIdx !== -1 ? ((cells[cnIdx] || "").trim() || null) : null;
+    out.push({ qty, name, set, cn });
+  }
+  return out;
+}
+
 function parseDecklist(text) {
   const head = text.trimStart();
   if (head.startsWith("<?xml") || head.startsWith("<Deck")) {
     return parseMtgoDek(text);
+  }
+  if (looksLikeCsv(text)) {
+    return parseCsvDecklist(text);
   }
   const out = [];
   let inExcluded = false;
@@ -380,6 +475,51 @@ async function fetchEdhrecDecklist(deckHash) {
     throw new Error("EDHREC deck shape changed — please open an issue.");
   }
   return deck.join("\n");
+}
+
+async function fetchProxiedText(url, label) {
+  // Try direct first; some sources CORS-allow, most don't. Fall through to
+  // corsproxy.io on failure. 4xx anywhere is fatal — the deck is private
+  // or the id is wrong; retrying through the proxy won't help.
+  let r;
+  try {
+    r = await fetch(url);
+  } catch {
+    r = null;
+  }
+  if (!r || !r.ok) {
+    if (r && r.status >= 400 && r.status < 500) {
+      throw new FatalFetchError(`${r.status} ${r.statusText}`);
+    }
+    r = await fetch(CORS_PROXY(url));
+    if (!r.ok) {
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`${label} fetch failed: ${r.status}`);
+    }
+  }
+  return r.text();
+}
+
+async function fetchScryfallDeckText(deckId) {
+  // Scryfall's /decks/<uuid>/export/text endpoint serves plain decklist
+  // text — the same `N Card Name` shape the parser already handles.
+  return fetchProxiedText(SCRYFALL_DECK_EXPORT(deckId), "Scryfall");
+}
+
+async function fetchDeckboxText(setId) {
+  // Deckbox's `?format=tcg` export ships `N Card Name` lines. Private sets
+  // redirect to a login page (HTML) — detect that and throw a clear error
+  // instead of feeding the HTML to the decklist parser and getting 0 cards.
+  const text = await fetchProxiedText(DECKBOX_EXPORT(setId), "Deckbox");
+  if (text.trimStart().slice(0, 200).toLowerCase().includes("<html")) {
+    throw new Error(
+      `Deckbox set '${setId}' looks private (export returned HTML). ` +
+      "Make the set public, or copy the decklist into the Paste decklist tab."
+    );
+  }
+  return text;
 }
 
 async function fetchTappedOutText(slug) {
@@ -587,16 +727,101 @@ function pairTokens(tokens) {
   return paired;
 }
 
-async function discoverTokens(jobs) {
+// Oracle-text token heuristic. Mirrors fill.py:_extract_token_phrases.
+// Magic oracle uses a small fixed quantifier vocabulary before "token";
+// `g` flag is essential — multiple `create ... token` clauses per card.
+const TOKEN_QUANTIFIERS =
+  "a|an|x|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|" +
+  "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty";
+const TOKEN_PHRASE_RE = new RegExp(
+  String.raw`\bcreate[s]?\s+(?:\d+|${TOKEN_QUANTIFIERS})(?:\s+or\s+more)?\s+(.{1,120}?)\s+token[s]?\b`,
+  "gi",
+);
+const TOKEN_COLOR_WORDS = { white: "w", blue: "u", black: "b", red: "r", green: "g", colorless: "c" };
+const TOKEN_FILLER_WORDS = new Set(["creature", "artifact", "enchantment", "and", "or", "tapped", "legendary"]);
+
+function extractTokenPhrases(oracleText) {
+  if (!oracleText) return [];
+  const out = [];
+  // matchAll on a /g regex; reset isn't needed because we don't reuse lastIndex.
+  for (const m of oracleText.matchAll(TOKEN_PHRASE_RE)) {
+    const desc = m[1].trim().replace(/\s+/g, " ");
+    if (desc) out.push(desc);
+  }
+  return out;
+}
+
+function oracleTokenPhrases(payload) {
+  // DFCs split oracle_text per face; single-faced cards keep it on the root.
+  const texts = [];
+  if (payload.oracle_text) texts.push(payload.oracle_text);
+  for (const face of payload.card_faces || []) {
+    if (face.oracle_text) texts.push(face.oracle_text);
+  }
+  const out = [];
+  for (const t of texts) out.push(...extractTokenPhrases(t));
+  return out;
+}
+
+function tokenPhraseToQuery(phrase) {
+  const p = phrase.trim().replace(/[.,;:]+$/, "");
+  const ptMatch = p.match(/\b(\d+)\/(\d+)\b/);
+  if (ptMatch) {
+    const rest = p.replace(/\b\d+\/\d+\b/, " ");
+    const words = rest.match(/[A-Za-z]+/g) || [];
+    const colors = [];
+    const types = [];
+    for (const w of words) {
+      const wl = w.toLowerCase();
+      if (TOKEN_COLOR_WORDS[wl]) colors.push(TOKEN_COLOR_WORDS[wl]);
+      else if (TOKEN_FILLER_WORDS.has(wl)) continue;
+      else if (w[0] === w[0].toUpperCase()) types.push(wl);
+    }
+    const terms = ["is:token", `pt:${ptMatch[1]}/${ptMatch[2]}`];
+    if (colors.length) terms.push(`c=${colors.join("")}`);
+    for (const t of types) terms.push(`t:${t}`);
+    return terms.join(" ");
+  }
+  return `is:token name:"${p}"`;
+}
+
+async function resolveTokenPhrase(phrase) {
+  // 80ms politeness gap — same convention as the per-card resolver.
+  // Returns null on miss / network error: the caller silently skips
+  // unresolvable phrases rather than aborting the whole build.
+  await new Promise((r) => setTimeout(r, 80));
+  const url = `${SCRYFALL_SEARCH}?${new URLSearchParams({
+    q: tokenPhraseToQuery(phrase),
+    unique: "cards",
+    order: "released",
+  })}`;
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const cards = data.data || [];
+    return cards.length ? cards[0].id : null;
+  } catch {
+    return null;
+  }
+}
+
+async function discoverTokens(jobs, opts = {}) {
   // Walk all_parts on every main-deck card and return one job per unique
-  // token. Dedupes by lowercased name so different Scryfall printings of
-  // the same token (e.g. "Treasure", "Faerie Rogue") collapse — otherwise
-  // pair-tokens could land visually identical art on both sides.
-  // Dedupe key: (lowercased name, type_line) — name alone collapses
-  // legitimately distinct tokens that happen to share a name (e.g. the
-  // 1/1 W flying "Spirit" vs the Kamigawa colorless "Spirit").
+  // token. Dedupes by (lowercased name, type_line) so different Scryfall
+  // printings of the same token (e.g. "Treasure", "Faerie Rogue") collapse —
+  // but legitimately distinct same-named tokens (e.g. 1/1 W flying Spirit
+  // vs. Kamigawa colorless Spirit) stay separate.
+  //
+  // With { thorough: true } also regex-scans each card's oracle_text for
+  // 'create ... token' phrases and resolves each via Scryfall search —
+  // catches tokens missing from all_parts at the cost of one search
+  // request per unique descriptor (cached so two cards minting the same
+  // token only burn one round-trip).
+  const { thorough = false } = opts;
   const seen = new Map();
   const failures = [];
+  const phraseCache = new Map();
   for (const job of jobs) {
     if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
     let data;
@@ -617,6 +842,34 @@ async function discoverTokens(jobs) {
           name: `${name} (token)`,
           qty: 1,
           uid: part.id,
+          customUrl: null,
+          isToken: true,
+        });
+      }
+    }
+    if (!thorough) continue;
+    for (const phrase of oracleTokenPhrases(data)) {
+      const norm = phrase.toLowerCase();
+      if (!phraseCache.has(norm)) {
+        phraseCache.set(norm, await resolveTokenPhrase(phrase));
+      }
+      const tokenUid = phraseCache.get(norm);
+      if (!tokenUid) continue;
+      let tok;
+      try {
+        tok = await scryfallCard(tokenUid);
+      } catch {
+        continue;
+      }
+      const tokName = (tok.name || "").trim();
+      const tokType = (tok.type_line || "").trim().toLowerCase();
+      if (!tokName) continue;
+      const key = `${tokName.toLowerCase()}|${tokType}`;
+      if (!seen.has(key)) {
+        seen.set(key, {
+          name: `${tokName} (token)`,
+          qty: 1,
+          uid: tokenUid,
           customUrl: null,
           isToken: true,
         });
@@ -938,25 +1191,42 @@ async function loadJobs(opts) {
 
   const detected = detectSource(els.input.value);
   if (!detected) {
-    throw new Error("Paste an Archidekt, Moxfield, TappedOut, or EDHREC URL/id.");
+    throw new Error(
+      "Paste an Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, or EDHREC URL/id."
+    );
   }
   const { source, args } = detected;
 
   if (source === "deckstats" || source === "mtggoldfish") {
+    // Auto-fallback: flip the UI over to Paste decklist and pre-pop the
+    // status with the correct breadcrumb. The user can then paste the
+    // text export directly without re-typing the URL.
+    const human = source === "deckstats" ? "Deckstats" : "MTGGoldfish";
+    setMode("text");
+    $("decklist-input").focus();
     throw new Error(
-      `${source === "deckstats" ? "Deckstats" : "MTGGoldfish"} blocks programmatic ` +
-      "fetches behind a Cloudflare challenge. Switch to “Paste decklist” and " +
-      "paste the deck text from the site's export."
+      `${human} sits behind a Cloudflare challenge — switched to Paste decklist. ` +
+      "Open the deck on their site, copy the text export (MTGA/MTGO format), " +
+      "paste it above, and click Fetch & build."
     );
   }
 
-  if (source === "tappedout" || source === "edhrec") {
-    const labelMap = { tappedout: "TappedOut", edhrec: "EDHREC" };
+  if (source === "tappedout" || source === "edhrec" || source === "scryfall" || source === "deckbox") {
+    const labelMap = {
+      tappedout: "TappedOut",
+      edhrec: "EDHREC",
+      scryfall: "Scryfall",
+      deckbox: "Deckbox",
+    };
     const human = labelMap[source];
     setStatus(`Fetching decklist from ${human}...`);
-    const text = source === "tappedout"
-      ? await fetchTappedOutText(args[0])
-      : await fetchEdhrecDecklist(args[0]);
+    const fetcherMap = {
+      tappedout: fetchTappedOutText,
+      edhrec: fetchEdhrecDecklist,
+      scryfall: fetchScryfallDeckText,
+      deckbox: fetchDeckboxText,
+    };
+    const text = await fetcherMap[source](args[0]);
     setStatus("Resolving cards via Scryfall...");
     const total = (text.match(/^\s*\d+\s/gm) || []).length;
     setProgress(0, total || 1);
@@ -1034,6 +1304,7 @@ async function run() {
       pairBacks: $("opt-pair-backs").checked,
       includeTokens: $("opt-tokens").checked,
       pairTokens: $("opt-pair-tokens").checked,
+      tokensThorough: $("opt-tokens-thorough").checked,
     };
     zip = new JSZip();
     state = {
@@ -1071,11 +1342,18 @@ async function run() {
   }
 
   if (opts.includeTokens) {
-    setStatus("Discovering tokens / emblems...");
+    setStatus(
+      opts.tokensThorough
+        ? "Discovering tokens (thorough scan, slower)..."
+        : "Discovering tokens / emblems...",
+    );
     // Run discovery against the merged main deck so tokens already
     // included from the first pass don't get printed again on the second.
     const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
-    const { tokens, failures: tokenFailures } = await discoverTokens(baseJobsForDiscovery);
+    const { tokens, failures: tokenFailures } = await discoverTokens(
+      baseJobsForDiscovery,
+      { thorough: opts.tokensThorough },
+    );
     // Filter to tokens we haven't already added in a prior pass. Include
     // both `uid` and any `pairBackUid` so a paired-token back from pass 1
     // doesn't get re-emitted as a standalone token in pass 2.

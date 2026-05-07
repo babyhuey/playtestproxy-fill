@@ -115,6 +115,38 @@ class TestDetectSource:
             ("7593392",),
         )
 
+    def test_scryfall_url_with_user(self):
+        # Canonical Scryfall deck URLs include the @user segment.
+        assert fill.detect_source(
+            "https://scryfall.com/@user/decks/12345678-1234-1234-1234-123456789012"
+        ) == ("scryfall", ("12345678-1234-1234-1234-123456789012",))
+
+    def test_scryfall_url_without_user(self):
+        # Bare /decks/<uuid> form is also accepted.
+        assert fill.detect_source(
+            "https://scryfall.com/decks/abcdef01-2345-6789-abcd-ef0123456789"
+        ) == ("scryfall", ("abcdef01-2345-6789-abcd-ef0123456789",))
+
+    def test_scryfall_url_rejects_non_uuid(self):
+        # The Scryfall regex insists on the full 8-4-4-4-12 hex shape so
+        # garbage like `/decks/abc12345xyz0` doesn't false-positive. The
+        # alphanumeric-id fallback only applies to bare ids (not URLs),
+        # so a Scryfall URL with a non-UUID falls through to SystemExit.
+        with pytest.raises(SystemExit):
+            fill.detect_source("https://scryfall.com/decks/abc12345xyz0")
+
+    def test_deckbox_url(self):
+        assert fill.detect_source("https://deckbox.org/sets/3456789") == (
+            "deckbox",
+            ("3456789",),
+        )
+
+    def test_deckbox_url_with_slug_trailer(self):
+        assert fill.detect_source("https://deckbox.org/sets/3456789/my-deck") == (
+            "deckbox",
+            ("3456789",),
+        )
+
     def test_numeric_id_falls_to_archidekt(self):
         assert fill.detect_source("21170685") == ("archidekt", ("21170685",))
 
@@ -1054,6 +1086,358 @@ class TestScrubSource:
 def test_cloudflare_blocked_raises_with_helpful_message():
     with pytest.raises(SystemExit, match="Cloudflare.*--decklist"):
         fill._fetch_cloudflare_blocked("Deckstats", "126143", "4305047")
+
+
+# --- Scryfall + Deckbox text-export fetchers -----------------------------
+
+
+@responses.activate
+def test_fetch_scryfall_resolves_via_decklist_parser():
+    """Scryfall ships the deck as plain text from the export endpoint."""
+    deck_id = "12345678-1234-1234-1234-123456789012"
+    responses.add(
+        responses.GET,
+        f"https://api.scryfall.com/decks/{deck_id}/export/text",
+        body="3 Lightning Bolt\n1 Sol Ring\n",
+        status=200,
+        content_type="text/plain",
+    )
+    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/cards/named",
+            json={"id": uid, "name": name},
+            status=200,
+        )
+    jobs = fill._fetch_scryfall(deck_id)
+    assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
+
+
+@responses.activate
+def test_fetch_scryfall_4xx_raises():
+    deck_id = "00000000-0000-0000-0000-000000000000"
+    responses.add(
+        responses.GET,
+        f"https://api.scryfall.com/decks/{deck_id}/export/text",
+        json={"details": "Not found"},
+        status=404,
+    )
+    with pytest.raises(SystemExit, match="Scryfall returned 404"):
+        fill._fetch_scryfall(deck_id)
+
+
+@responses.activate
+def test_fetch_deckbox_resolves_via_decklist_parser():
+    responses.add(
+        responses.GET,
+        "https://deckbox.org/sets/123/export?format=tcg",
+        body="2 Lightning Bolt\n1 Sol Ring\n",
+        status=200,
+        content_type="text/plain",
+    )
+    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/cards/named",
+            json={"id": uid, "name": name},
+            status=200,
+        )
+    jobs = fill._fetch_deckbox("123")
+    assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 2), ("Sol Ring", 1)}
+
+
+@responses.activate
+def test_fetch_deckbox_private_set_detected_via_html_redirect():
+    """Private Deckbox sets redirect to a login HTML page; without the
+    explicit redirect-detection guard the parser would silently produce
+    zero cards and the user would have no idea why."""
+    responses.add(
+        responses.GET,
+        "https://deckbox.org/sets/999/export?format=tcg",
+        body="<html><body>Please log in</body></html>",
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="looks private"):
+        fill._fetch_deckbox("999")
+
+
+# --- ManaBox / generic CSV decklist parsing -----------------------------
+
+
+class TestLooksLikeCsv:
+    def test_manabox_header_detected(self):
+        text = (
+            "Name,Set code,Set name,Collector number,Foil,Rarity,Quantity\n"
+            '"Sol Ring","cmm","Commander Masters","343","normal","uncommon","1"\n'
+        )
+        assert fill._looks_like_csv(text)
+
+    def test_card_with_comma_in_name_isnt_csv(self):
+        # `Bosco, Just a Bear` contains a comma but isn't a CSV header.
+        # Without the both-name-and-quantity gate, this would false-positive.
+        assert not fill._looks_like_csv("1 Bosco, Just a Bear\n4 Lightning Bolt\n")
+
+    def test_quantity_only_header_isnt_csv(self):
+        # A header with `Quantity` but no `Name` shouldn't trigger CSV mode.
+        assert not fill._looks_like_csv("Quantity,SomethingElse\n1,foo\n")
+
+    def test_blank_text_isnt_csv(self):
+        assert not fill._looks_like_csv("")
+
+
+class TestParseCsvDecklist:
+    def test_basic_manabox_export(self):
+        text = (
+            "Name,Set code,Collector number,Quantity\n"
+            '"Sol Ring","cmm","343","1"\n'
+            '"Lightning Bolt","m21","162","4"\n'
+        )
+        assert fill._parse_csv_decklist(text) == [
+            (1, "Sol Ring", "cmm", "343"),
+            (4, "Lightning Bolt", "m21", "162"),
+        ]
+
+    def test_section_column_skips_sideboard(self):
+        text = 'Name,Quantity,Section\n"Sol Ring","1","Mainboard"\n"Negate","2","Sideboard"\n'
+        assert fill._parse_csv_decklist(text) == [(1, "Sol Ring", None, None)]
+
+    def test_zero_or_invalid_qty_skipped(self):
+        text = "Name,Quantity\nGood,1\nBad,abc\nZero,0\n"
+        assert fill._parse_csv_decklist(text) == [(1, "Good", None, None)]
+
+    def test_case_insensitive_headers(self):
+        text = "name,QTY\nSol Ring,1\n"
+        assert fill._parse_csv_decklist(text) == [(1, "Sol Ring", None, None)]
+
+    def test_missing_required_columns_returns_empty(self):
+        # No quantity column → can't build a meaningful decklist.
+        text = "Name,SetCode\nSol Ring,cmm\n"
+        assert fill._parse_csv_decklist(text) == []
+
+
+class TestParseDecklistRoutesToCsv:
+    """The dispatcher in `_parse_decklist` recognises CSV input and
+    routes to the CSV parser instead of the line-by-line parser."""
+
+    def test_csv_routed_to_csv_parser(self):
+        text = "Name,Quantity\nSol Ring,1\nLightning Bolt,4\n"
+        assert fill._parse_decklist(text) == [
+            (1, "Sol Ring", None, None),
+            (4, "Lightning Bolt", None, None),
+        ]
+
+    def test_csv_with_section_excludes_sideboard(self):
+        text = "Name,Quantity,Section\nSol Ring,1,Mainboard\nNegate,2,Sideboard\n"
+        assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
+
+
+# --- Oracle-text token heuristic ----------------------------------------
+
+
+class TestExtractTokenPhrases:
+    def test_named_token(self):
+        assert fill._extract_token_phrases("Create a Treasure token.") == ["Treasure"]
+
+    def test_creature_token_with_pt(self):
+        text = "Create a 1/1 white Soldier creature token."
+        assert fill._extract_token_phrases(text) == ["1/1 white Soldier creature"]
+
+    def test_multiple_matches(self):
+        text = (
+            "Whenever this attacks, create a Treasure token. "
+            "When it dies, create three 1/1 white Spirit creature tokens with flying."
+        )
+        # The 'with flying' clause sits AFTER `tokens` so it's not captured.
+        assert fill._extract_token_phrases(text) == [
+            "Treasure",
+            "1/1 white Spirit creature",
+        ]
+
+    def test_no_match(self):
+        assert fill._extract_token_phrases("Lightning Bolt deals 3 damage to any target.") == []
+
+    def test_empty_input(self):
+        assert fill._extract_token_phrases("") == []
+        assert fill._extract_token_phrases(None) == []  # type: ignore[arg-type]
+
+
+class TestTokenPhraseToQuery:
+    def test_named_token_uses_name_match(self):
+        q = fill._token_phrase_to_query("Treasure")
+        assert "is:token" in q and 'name:"Treasure"' in q
+
+    def test_pt_creature_includes_color_type_pt(self):
+        q = fill._token_phrase_to_query("1/1 white Soldier creature")
+        assert "is:token" in q
+        assert "pt:1/1" in q
+        assert "c=w" in q
+        assert "t:soldier" in q
+
+    def test_multicolor_creature(self):
+        q = fill._token_phrase_to_query("2/2 black and red Zombie creature")
+        # Both colors emitted as a single c= clause.
+        assert "c=br" in q or "c=rb" in q
+        assert "t:zombie" in q
+
+
+@responses.activate
+def test_resolve_token_phrase_picks_first_search_hit():
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"data": [{"id": "treasure-token-uid", "name": "Treasure"}]},
+        status=200,
+    )
+    uid = fill._resolve_token_phrase("Treasure", fill.requests.Session())
+    assert uid == "treasure-token-uid"
+
+
+@responses.activate
+def test_resolve_token_phrase_returns_none_on_404():
+    """A search miss is not an error — Scryfall returns 404 for queries
+    that match nothing. We just skip the phrase silently."""
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"object": "error", "code": "not_found"},
+        status=404,
+    )
+    assert fill._resolve_token_phrase("Imaginary", fill.requests.Session()) is None
+
+
+@responses.activate
+def test_discover_tokens_thorough_extends_all_parts_results():
+    """Thorough mode picks up tokens that all_parts misses by oracle-text
+    scan, while still emitting tokens that all_parts already names."""
+    fill._scryfall_payload_cache.clear()
+    # Card A: all_parts has the token, oracle_text doesn't mention it.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/has-allparts",
+        json={
+            "id": "has-allparts",
+            "all_parts": [
+                {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+            ],
+            "oracle_text": "Some unrelated text.",
+        },
+        status=200,
+    )
+    # Card B: all_parts is empty (Scryfall metadata gap), but oracle text
+    # mentions creating a Food token. Thorough mode should rescue this.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/missing-allparts",
+        json={
+            "id": "missing-allparts",
+            "all_parts": [],
+            "oracle_text": "When this enters, create a Food token.",
+        },
+        status=200,
+    )
+    # Search returns the Food token.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"data": [{"id": "food-uid", "name": "Food"}]},
+        status=200,
+    )
+    # Token payload lookup for the resolved Food UID — needs name+type
+    # for the dedupe key.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/food-uid",
+        json={"id": "food-uid", "name": "Food", "type_line": "Token Artifact — Food"},
+        status=200,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    jobs = [J("HasAllparts", "has-allparts"), J("MissingAllparts", "missing-allparts")]
+    new_jobs, failures = fill._discover_tokens(jobs, fill.requests.Session(), thorough=True)
+
+    # Both tokens present — Treasure from all_parts, Food from oracle scan.
+    names = sorted(j.name for j in new_jobs)
+    assert names == ["Food (token)", "Treasure (token)"]
+    assert failures == []
+
+
+@responses.activate
+def test_discover_tokens_thorough_caches_phrase_lookups():
+    """Two cards minting the same Treasure token via oracle text should
+    only burn one Scryfall search request between them."""
+    fill._scryfall_payload_cache.clear()
+    for cid in ("card-x", "card-y"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [],  # force the oracle path to do the work
+                "oracle_text": "Whenever this attacks, create a Treasure token.",
+            },
+            status=200,
+        )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"data": [{"id": "treasure-uid", "name": "Treasure"}]},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/treasure-uid",
+        json={"id": "treasure-uid", "name": "Treasure", "type_line": "Token Artifact — Treasure"},
+        status=200,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("X", "card-x"), J("Y", "card-y")],
+        fill.requests.Session(),
+        thorough=True,
+    )
+
+    assert [j.name for j in new_jobs] == ["Treasure (token)"]
+    assert failures == []
+    # Count search requests — phrase cache must collapse two cards' worth
+    # of "Treasure" mentions into a single search.
+    search_calls = [c for c in responses.calls if "/cards/search" in c.request.url]
+    assert len(search_calls) == 1
+
+
+def test_discover_tokens_default_does_not_oracle_scan(monkeypatch):
+    """Without thorough=True, oracle-text scanning must NOT run — even if
+    the regex would match. Cheap regression guard against accidentally
+    flipping the default."""
+    called = {"count": 0}
+
+    def fake_extract(_text):
+        called["count"] += 1
+        return ["Treasure"]
+
+    monkeypatch.setattr(fill, "_extract_token_phrases", fake_extract)
+    fill._discover_tokens([], fill.requests.Session())  # thorough defaults False
+    assert called["count"] == 0
 
 
 # --- Scryfall image-URL resolver ----------------------------------------
