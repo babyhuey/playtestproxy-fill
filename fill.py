@@ -762,8 +762,10 @@ def _discover_tokens(
     Treasures) only burn one search request between them."""
     token_jobs: dict[tuple[str, str], CardJob] = {}
     failures: list[str] = []
-    # Cache key is (descriptor_lower, named_lower) so phrases that share a
-    # descriptor but differ only in the `named X` clause stay distinct.
+    # Cache key is (descriptor.lower(), (named or "").lower()) so phrases
+    # that share a descriptor but differ only in the `named X` clause stay
+    # distinct (an absent `named` becomes the empty string, not None, so
+    # the tuple is hashable without special-casing).
     phrase_cache: dict[tuple[str, str], str | None] = {}
     for job in jobs:
         if not job.scryfall_uid:
