@@ -762,7 +762,9 @@ def _discover_tokens(
     Treasures) only burn one search request between them."""
     token_jobs: dict[tuple[str, str], CardJob] = {}
     failures: list[str] = []
-    phrase_cache: dict[str, str | None] = {}
+    # Cache key is (descriptor_lower, named_lower) so phrases that share a
+    # descriptor but differ only in the `named X` clause stay distinct.
+    phrase_cache: dict[tuple[str, str], str | None] = {}
     for job in jobs:
         if not job.scryfall_uid:
             continue
@@ -823,6 +825,11 @@ def _discover_tokens(
                 if not tok_name:
                     continue
                 key = (tok_name.lower(), tok_type.lower())
+                # Mark the UID seen regardless of whether the (name, type_line)
+                # key is new — if all_parts already inserted this token under
+                # the same UID, a later phrase resolving to that UID still
+                # shouldn't trigger a redundant payload fetch.
+                seen_uids.add(token_uid)
                 if key not in token_jobs:
                     token_jobs[key] = CardJob(
                         name=f"{tok_name} (token)",
@@ -832,7 +839,6 @@ def _discover_tokens(
                         set_code=None,
                         collector_number=None,
                     )
-                    seen_uids.add(token_uid)
     return list(token_jobs.values()), failures
 
 
@@ -879,9 +885,9 @@ _TOKEN_PHRASE_RE = re.compile(
     # "create a colorless artifact token named Treasure" hide the actual
     # token name here — without this capture we'd search for the descriptor
     # ("colorless artifact") and miss every Treasure / Clue / Food the card
-    # mints. Cap the name at three words to stop the engine from greedy-
-    # eating into a following clause ("named Tuktuk the Returned that's a
-    # 5/5..." — name is "Tuktuk the Returned", not the rest).
+    # mints. The {0,2} hard cap bounds the name at three words so a phrase
+    # like "named Tuktuk the Returned that's a 5/5..." matches just the
+    # name and doesn't run the capture into the trailing clause.
     r"(?:\s+named\s+(?P<named>\w[\w'-]*(?:\s+\w[\w'-]*){0,2}))?"
     r"\b",
     re.IGNORECASE,
@@ -1006,16 +1012,17 @@ def _resolve_token_phrase(
 
     Returns a (uid, error) tuple:
       - (uid, None) — Scryfall returned a hit; cache it.
-      - (None, None) — search ran cleanly and found nothing (legitimate
-        miss, e.g. unresolvable copy-of-X token); cache as None.
+      - (None, None) — clean miss; cache it. Three sub-cases:
+          * Scryfall search returned 404 (zero results)
+          * Scryfall search returned an empty `data` array
+          * The descriptor stripped to nothing usable, so no search ran —
+            a Scryfall round-trip wouldn't have helped, and re-trying on
+            every later card with the same descriptor would just waste
+            requests.
       - (None, "reason") — TRANSIENT failure (network error, 5xx, malformed
-        JSON, or the phrase didn't yield a meaningful query). Caller MUST
-        NOT cache this — a single early blip would otherwise poison every
-        later card minting the same token. Reason gets pushed to the
-        run-level failures list.
-
-    Scryfall's 404 is treated as a clean "not found" because the search
-    endpoint really does return 404 for zero-result queries."""
+        JSON). Caller MUST NOT cache — a single early blip would otherwise
+        poison every later card minting the same token. Reason gets pushed
+        to the run-level failures list."""
     query = _token_phrase_to_query(phrase, named)
     if query is None:
         # Descriptor stripped to nothing meaningful — skip the search

@@ -750,9 +750,10 @@ const TOKEN_QUANTIFIERS =
 // `named X` is captured as a separate group because real cards like
 // "create a colorless artifact token named Treasure" hide the actual token
 // name AFTER the word `token` — without this group we'd query the
-// descriptor and miss every Treasure / Clue / Food the card mints. Name is
-// capped at three words to stop the engine greedy-eating into a following
-// clause ("named Tuktuk the Returned that's a 5/5..." → just the name).
+// descriptor and miss every Treasure / Clue / Food the card mints. The
+// {0,2} hard cap bounds the name at three words so "named Tuktuk the
+// Returned that's a 5/5..." matches just the name and doesn't run the
+// capture into the trailing clause.
 const TOKEN_PHRASE_RE = new RegExp(
   String.raw`\bcreate[s]?\s+(?:up\s+to\s+)?(?:\d+|${TOKEN_QUANTIFIERS})(?:\s+or\s+more)?\s+(.{1,120}?)\s+token[s]?(?:\s+named\s+(\w[\w'-]*(?:\s+\w[\w'-]*){0,2}))?\b`,
   "gi",
@@ -912,8 +913,11 @@ async function discoverTokens(jobs, opts = {}) {
         const { uid, error } = await resolveTokenPhrase(descriptor, named);
         if (error) {
           // Transient — DON'T cache (let the next card retry) and surface
-          // the reason so the user knows the run was incomplete.
-          failures.push({ name: `${job.name} (thorough)`, error });
+          // the reason so the user knows the run was incomplete. Bare
+          // job.name keeps the failure shape symmetric with the all_parts
+          // path so the run() wrapper's "Token discovery: ..." prefix
+          // doesn't get a redundant "(thorough)" suffix appended.
+          failures.push({ name: job.name, error });
           continue;
         }
         phraseCache.set(cacheKey, uid);
@@ -924,13 +928,17 @@ async function discoverTokens(jobs, opts = {}) {
       try {
         tok = await scryfallCard(tokenUid);
       } catch (e) {
-        failures.push({ name: `${job.name} (thorough token ${tokenUid})`, error: e.message });
+        failures.push({ name: job.name, error: `token ${tokenUid}: ${e.message}` });
         continue;
       }
       const tokName = (tok.name || "").trim();
       const tokType = (tok.type_line || "").trim().toLowerCase();
       if (!tokName) continue;
       const key = `${tokName.toLowerCase()}|${tokType}`;
+      // Mark the UID seen unconditionally — even if the (name, type_line)
+      // key already exists from all_parts, a later phrase resolving to
+      // the same UID shouldn't trigger a redundant payload fetch.
+      seenUids.add(tokenUid);
       if (!seen.has(key)) {
         seen.set(key, {
           name: `${tokName} (token)`,
@@ -939,7 +947,6 @@ async function discoverTokens(jobs, opts = {}) {
           customUrl: null,
           isToken: true,
         });
-        seenUids.add(tokenUid);
       }
     }
   }
