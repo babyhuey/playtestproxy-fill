@@ -1586,6 +1586,26 @@ $("opt-back-file").addEventListener("change", (e) => {
     : '— bundled "You Wouldn\'t Proxy a Magic Card" —';
 });
 
+// Token-option dependencies. `opt-tokens-thorough` and `opt-pair-tokens` are
+// both refinements of `opt-tokens` — neither has any effect unless the
+// parent is on. Without this wiring a user could check "Thorough token
+// scan" alone and see no tokens added, with no UI signal explaining why.
+// Mirrors the CLI's `--tokens-thorough has no effect without
+// --include-tokens` notice.
+function bindTokenChild(childId) {
+  $(childId).addEventListener("change", (e) => {
+    if (e.target.checked) $("opt-tokens").checked = true;
+  });
+}
+bindTokenChild("opt-tokens-thorough");
+bindTokenChild("opt-pair-tokens");
+$("opt-tokens").addEventListener("change", (e) => {
+  if (!e.target.checked) {
+    $("opt-tokens-thorough").checked = false;
+    $("opt-pair-tokens").checked = false;
+  }
+});
+
 els.download.addEventListener("click", () => {
   if (!lastZipBlob) return;
   const a = document.createElement("a");
