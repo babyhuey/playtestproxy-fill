@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import requests
@@ -714,13 +714,20 @@ def _apply_token_jobs(
 
     Returns (jobs_to_append, warning_msg). Pure function, no I/O — exists
     so the gating rules (--pair-tokens needs --pair-backs; need ≥2 tokens
-    to pair) are independently testable."""
+    to pair) are independently testable.
+
+    When pairing, qty>1 token jobs are first expanded into singles so
+    each copy gets its own pair slot — otherwise smart-qty's extra
+    Treasures would collapse into one slot and quietly disappear."""
     if not token_jobs:
         return [], None
     if pair_tokens and not pair_backs:
         return token_jobs, "--pair-tokens needs --pair-backs; falling back to single-sided"
-    if pair_tokens and pair_backs and len(token_jobs) >= 2:
-        return _pair_tokens(token_jobs), None
+    if pair_tokens and pair_backs:
+        expanded = _expand_token_qty(token_jobs)
+        if len(expanded) >= 2:
+            return _pair_tokens(expanded), None
+        return expanded, None
     return token_jobs, None
 
 
@@ -755,14 +762,33 @@ def _discover_tokens(
     session: requests.Session,
     thorough: bool = False,
 ) -> tuple[list[CardJob], list[str]]:
+    """Backward-compatible wrapper around `_discover_tokens_with_sources`
+    that drops the per-token minter map. Existing callers / tests that
+    only need (jobs, failures) keep their original shape."""
+    token_jobs, _minters, failures = _discover_tokens_with_sources(jobs, session, thorough=thorough)
+    return token_jobs, failures
+
+
+def _discover_tokens_with_sources(
+    jobs: list[CardJob],
+    session: requests.Session,
+    thorough: bool = False,
+) -> tuple[list[CardJob], dict[str, set[str]], list[str]]:
     """Walk every main-deck card's all_parts and return (new_token_jobs,
-    failure_messages). Dedupes by (lowercased name, type_line) so
-    different printings of "Treasure" / "Faerie Rogue" collapse — but
-    legitimately distinct same-named tokens (e.g. the 1/1 W flying Spirit
-    vs. the Kamigawa colorless Spirit) stay separate. Cards without a
-    scryfall_uid (Archidekt customs) are skipped silently. Network /
-    runtime failures on any one card are recorded but don't abort
-    discovery.
+    minters_by_uid, failure_messages). Dedupes by (lowercased name,
+    type_line) so different printings of "Treasure" / "Faerie Rogue"
+    collapse — but legitimately distinct same-named tokens (e.g. the 1/1
+    W flying Spirit vs. the Kamigawa colorless Spirit) stay separate.
+    Cards without a scryfall_uid (Archidekt customs) are skipped
+    silently. Network / runtime failures on any one card are recorded
+    but don't abort discovery.
+
+    `minters_by_uid` is keyed by the token's Scryfall UID (matches
+    `CardJob.scryfall_uid`) and gives the set of deck-card names that
+    mint that token. `_apply_token_qty` uses the per-token minter count
+    to size the printed output when the user opts into smart quantities.
+    A token whose every minter happens to share a name still ends up
+    with `minter_count == 1` — the rare-but-possible mirror-deck case.
 
     `thorough=True` additionally regex-scans each card's oracle_text for
     'create ... token' phrases and resolves each via Scryfall search. This
@@ -771,6 +797,7 @@ def _discover_tokens(
     cached so two cards that mint the same token (e.g. both create
     Treasures) only burn one search request between them."""
     token_jobs: dict[tuple[str, str], CardJob] = {}
+    minters: dict[str, set[str]] = {}
     failures: list[str] = []
     # Cache key is (descriptor.lower(), (named or "").lower()) so phrases
     # that share a descriptor but differ only in the `named X` clause stay
@@ -796,6 +823,7 @@ def _discover_tokens(
                     set_code=None,
                     collector_number=None,
                 )
+            minters.setdefault(token_uid, set()).add(job.name)
         if thorough:
             try:
                 payload = scryfall_card_payload(job.scryfall_uid, session)
@@ -821,7 +849,12 @@ def _discover_tokens(
                         continue
                     phrase_cache[cache_key] = uid
                 token_uid = phrase_cache[cache_key]
-                if not token_uid or token_uid in seen_uids:
+                if not token_uid:
+                    continue
+                # Record this card as a minter even if we won't add a
+                # new token job below — minter count still grows.
+                minters.setdefault(token_uid, set()).add(job.name)
+                if token_uid in seen_uids:
                     continue
                 try:
                     tok = scryfall_card_payload(token_uid, session)
@@ -851,7 +884,106 @@ def _discover_tokens(
                         set_code=None,
                         collector_number=None,
                     )
-    return list(token_jobs.values()), failures
+    return list(token_jobs.values()), minters, failures
+
+
+# --- Smart token quantities ---------------------------------------------
+# `--token-qty` lets the user scale the printed-token count by how many
+# deck cards actually mint each token, optionally factoring in token-
+# doubler effects (Doubling Season etc.). Default `one` keeps the
+# pre-feature behaviour: exactly one of each unique token.
+
+_TOKEN_QTY_STRATEGIES = ("one", "conservative", "standard", "aggressive")
+_TOKEN_QTY_CAPS = {"conservative": 4, "standard": 8, "aggressive": 12}
+
+# Doubler oracle-text fingerprint. "twice that many" covers Doubling Season,
+# Anointed Procession, Parallel Lives, Mondrak, Adrix and Nev, Primal Vigor.
+# The "one more / one extra" patterns catch Annie Joins Up. We deliberately
+# don't try to match every token-multiplying card on Scryfall — the goal is
+# a heuristic, not an exhaustive solver.
+_TOKEN_DOUBLER_RE = re.compile(
+    r"\b(?:twice that many|create[s]? one more|one (?:additional|extra) token|that many plus one)\b",
+    re.IGNORECASE,
+)
+
+
+def _count_token_doublers(jobs: list[CardJob], session: requests.Session) -> int:
+    """Count distinct deck cards whose oracle_text matches a token-doubler
+    fingerprint (Doubling Season, Anointed Procession, Mondrak, Annie Joins
+    Up, etc.). Used as a multiplier in `_apply_token_qty`. Cards we can't
+    fetch a payload for are skipped silently — a missing doubler degrades
+    to a smaller estimate, not a crash."""
+    count = 0
+    for job in jobs:
+        if not job.scryfall_uid:
+            continue
+        try:
+            payload = scryfall_card_payload(job.scryfall_uid, session)
+        except (requests.RequestException, RuntimeError):
+            continue
+        oracles: list[str] = []
+        if payload.get("oracle_text"):
+            oracles.append(payload["oracle_text"])
+        for face in payload.get("card_faces") or []:
+            if face.get("oracle_text"):
+                oracles.append(face["oracle_text"])
+        if any(_TOKEN_DOUBLER_RE.search(t) for t in oracles):
+            count += 1
+    return count
+
+
+def _apply_token_qty(
+    token_jobs: list[CardJob],
+    minters: dict[str, set[str]],
+    doubler_count: int,
+    strategy: str,
+) -> None:
+    """Mutate each token CardJob's `qty` according to the chosen strategy.
+
+    Strategies:
+      - "one": qty stays at 1 (the discovery default — no-op here).
+      - "conservative": qty = number of distinct deck cards that mint this
+        token, capped at 4. Doublers ignored.
+      - "standard": minter count multiplied by 2 if any doubler is in the
+        deck. Capped at 8.
+      - "aggressive": minter count multiplied by 2 ** min(doubler_count, 2)
+        — so 1 doubler → 2x, ≥2 doublers → 4x. Capped at 12.
+
+    `minters` is keyed by token Scryfall UID and provides the set of
+    minter card names per token; `len(minters[uid])` is the per-token
+    minter count. A token whose UID isn't in `minters` (defensive — every
+    token returned by discovery should be there) defaults to 1 minter."""
+    if strategy == "one":
+        return
+    if strategy not in _TOKEN_QTY_CAPS:
+        raise ValueError(f"Unknown token-qty strategy: {strategy!r}")
+    cap = _TOKEN_QTY_CAPS[strategy]
+    for job in token_jobs:
+        minter_count = len(minters.get(job.scryfall_uid or "", {job.name}))
+        if strategy == "conservative":
+            qty = minter_count
+        elif strategy == "standard":
+            qty = minter_count * (2 if doubler_count > 0 else 1)
+        else:  # aggressive
+            qty = minter_count * 2 ** min(doubler_count, 2)
+        job.qty = max(1, min(qty, cap))
+
+
+def _expand_token_qty(token_jobs: list[CardJob]) -> list[CardJob]:
+    """Flatten N-qty token jobs into N single-qty copies. `_pair_tokens`
+    pairs the input list two-at-a-time, treating each entry as one
+    physical card — without expansion a `qty=3` Treasure would collapse
+    into a single pair slot, hiding two of the three copies the user
+    asked for. Non-pair flow doesn't need this since the slot-writer
+    already iterates `range(1, job.qty + 1)`."""
+    expanded: list[CardJob] = []
+    for job in token_jobs:
+        if job.qty <= 1:
+            expanded.append(job)
+            continue
+        for _ in range(job.qty):
+            expanded.append(replace(job, qty=1))
+    return expanded
 
 
 # Magic oracle text uses a small fixed set of quantifiers before "token".
@@ -1223,6 +1355,16 @@ def main() -> int:
         "Catches tokens that Scryfall's all_parts metadata omits, but is "
         "much slower (one extra search request per unique descriptor).",
     )
+    ap.add_argument(
+        "--token-qty",
+        choices=list(_TOKEN_QTY_STRATEGIES),
+        default="one",
+        help="How many of each token to print (only with --include-tokens). "
+        "'one' = 1 of each (default). 'conservative' = number of distinct "
+        "deck cards minting this token, cap 4. 'standard' = same, doubled "
+        "if any doubler (Doubling Season etc.) is in the deck, cap 8. "
+        "'aggressive' = 4x for two or more doublers, cap 12.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out)
@@ -1274,10 +1416,24 @@ def main() -> int:
 
     if args.tokens_thorough and not args.include_tokens:
         print("  (--tokens-thorough has no effect without --include-tokens; ignoring)")
+    if args.token_qty != "one" and not args.include_tokens:
+        print(f"  (--token-qty {args.token_qty} has no effect without --include-tokens; ignoring)")
     if args.include_tokens:
         if args.tokens_thorough:
             print("  (thorough token scan enabled — expect slower discovery)")
-        token_jobs, token_failures = _discover_tokens(jobs, session, thorough=args.tokens_thorough)
+        token_jobs, minters, token_failures = _discover_tokens_with_sources(
+            jobs, session, thorough=args.tokens_thorough
+        )
+        if args.token_qty != "one":
+            doubler_count = _count_token_doublers(jobs, session)
+            _apply_token_qty(token_jobs, minters, doubler_count, args.token_qty)
+            total_copies = sum(j.qty for j in token_jobs)
+            print(
+                f"  (--token-qty {args.token_qty}: {total_copies} total token copies "
+                f"across {len(token_jobs)} unique tokens"
+                + (f", {doubler_count} doubler(s) detected" if doubler_count else "")
+                + ")"
+            )
         appended, warning = _apply_token_jobs(token_jobs, args.pair_tokens, args.pair_backs)
         if warning:
             print(f"  ({warning})")

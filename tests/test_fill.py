@@ -956,6 +956,275 @@ class TestApplyTokenJobs:
         assert out == toks
         assert warn is None
 
+    def test_pair_tokens_expands_qty_before_pairing(self):
+        # Smart-qty can leave a token CardJob with qty=3 before pairing.
+        # _apply_token_jobs must expand into 3 separate single-qty entries
+        # so each copy gets its own pair slot. Without expansion all three
+        # Treasures would collapse into one paired card and the user would
+        # silently receive 1/3 of the smart-qty count they asked for.
+        a = _tok("A", "uid-a")
+        b = _tok("B", "uid-b")
+        a.qty = 3  # smart-qty bumped this token
+        out, warn = fill._apply_token_jobs([a, b], pair_tokens=True, pair_backs=True)
+        # Three A copies + one B → pair into ⌈4/2⌉ = 2 paired cards.
+        assert warn is None
+        assert len(out) == 2
+        assert [c.qty for c in out] == [1, 1]
+        # Pair shape: A/A, A/B (or A/B, A/A — depends on ordering of expansion)
+        names = [c.name for c in out]
+        assert names == ["A / A", "A / B"]
+
+
+# --- Smart token quantities (--token-qty) -------------------------------
+
+
+class TestApplyTokenQty:
+    """Per-strategy behaviour of `_apply_token_qty`. The function mutates
+    qty on each token CardJob and is purely arithmetic on the minter map +
+    doubler count, so no Scryfall/network mocking is needed."""
+
+    def _treasure_with_minters(self, n_minters):
+        job = fill.CardJob(
+            name="Treasure (token)",
+            qty=1,
+            scryfall_uid="tok-treasure",
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+        minters = {"tok-treasure": {f"Card {i}" for i in range(n_minters)}}
+        return job, minters
+
+    def test_one_strategy_is_noop(self):
+        job, minters = self._treasure_with_minters(5)
+        fill._apply_token_qty([job], minters, doubler_count=2, strategy="one")
+        assert job.qty == 1  # unchanged regardless of minter / doubler counts
+
+    def test_conservative_uses_minter_count(self):
+        job, minters = self._treasure_with_minters(3)
+        fill._apply_token_qty([job], minters, doubler_count=0, strategy="conservative")
+        assert job.qty == 3
+
+    def test_conservative_caps_at_4(self):
+        job, minters = self._treasure_with_minters(20)
+        fill._apply_token_qty([job], minters, doubler_count=0, strategy="conservative")
+        assert job.qty == 4
+
+    def test_conservative_ignores_doublers(self):
+        job, minters = self._treasure_with_minters(2)
+        fill._apply_token_qty([job], minters, doubler_count=3, strategy="conservative")
+        assert job.qty == 2
+
+    def test_standard_no_doubler(self):
+        job, minters = self._treasure_with_minters(3)
+        fill._apply_token_qty([job], minters, doubler_count=0, strategy="standard")
+        assert job.qty == 3
+
+    def test_standard_one_doubler_doubles(self):
+        job, minters = self._treasure_with_minters(3)
+        fill._apply_token_qty([job], minters, doubler_count=1, strategy="standard")
+        assert job.qty == 6
+
+    def test_standard_caps_at_8(self):
+        job, minters = self._treasure_with_minters(6)
+        fill._apply_token_qty([job], minters, doubler_count=2, strategy="standard")
+        # 6 minters × 2 (any-doubler multiplier) = 12, capped at 8.
+        assert job.qty == 8
+
+    def test_aggressive_two_doublers_quadruples(self):
+        job, minters = self._treasure_with_minters(2)
+        fill._apply_token_qty([job], minters, doubler_count=2, strategy="aggressive")
+        # 2 × 2**min(2,2) = 2 × 4 = 8.
+        assert job.qty == 8
+
+    def test_aggressive_three_doublers_still_caps_multiplier_at_4x(self):
+        job, minters = self._treasure_with_minters(2)
+        fill._apply_token_qty([job], minters, doubler_count=5, strategy="aggressive")
+        # min(5, 2) = 2, so multiplier is 4x. 2 × 4 = 8.
+        assert job.qty == 8
+
+    def test_aggressive_caps_at_12(self):
+        job, minters = self._treasure_with_minters(10)
+        fill._apply_token_qty([job], minters, doubler_count=2, strategy="aggressive")
+        # 10 × 4 = 40, capped at 12.
+        assert job.qty == 12
+
+    def test_floor_is_1_when_minter_map_missing_uid(self):
+        # Defensive: if a token job's UID isn't in `minters` (shouldn't
+        # happen but possible for hand-built jobs), the floor is 1, not 0.
+        job = fill.CardJob(
+            name="Stray (token)",
+            qty=1,
+            scryfall_uid="not-in-minters",
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+        fill._apply_token_qty([job], {}, doubler_count=0, strategy="conservative")
+        assert job.qty == 1  # default of 1 minter, capped trivially
+
+    def test_unknown_strategy_raises(self):
+        job, minters = self._treasure_with_minters(2)
+        with pytest.raises(ValueError, match="Unknown token-qty strategy"):
+            fill._apply_token_qty([job], minters, doubler_count=0, strategy="bogus")
+
+
+class TestExpandTokenQty:
+    def test_qty_one_passthrough(self):
+        a = _tok("A", "uid-a")
+        b = _tok("B", "uid-b")
+        out = fill._expand_token_qty([a, b])
+        assert out == [a, b]
+
+    def test_qty_three_expands_into_three_singles(self):
+        a = _tok("A", "uid-a")
+        a.qty = 3
+        out = fill._expand_token_qty([a])
+        assert len(out) == 3
+        assert all(j.qty == 1 for j in out)
+        assert all(j.scryfall_uid == "uid-a" for j in out)
+        # Must be deep copies — mutating one shouldn't affect the others.
+        out[0].qty = 99
+        assert out[1].qty == 1
+        assert out[2].qty == 1
+
+    def test_mixed_input(self):
+        a = _tok("A", "uid-a")  # qty=1
+        b = _tok("B", "uid-b")
+        b.qty = 2
+        c = _tok("C", "uid-c")  # qty=1
+        out = fill._expand_token_qty([a, b, c])
+        assert [j.name for j in out] == ["A", "B", "B", "C"]
+        assert all(j.qty == 1 for j in out)
+
+
+@responses.activate
+def test_count_token_doublers_finds_known_phrasings():
+    """The doubler regex must catch the dominant 'twice that many' phrasing
+    plus a few related variants. False negatives quietly degrade the
+    smart-qty estimate, so this test pins the recognised vocabulary."""
+    fill._scryfall_payload_cache.clear()
+    payloads = {
+        "doubling-season": (
+            "If an effect would create one or more tokens under your control, "
+            "it creates twice that many of those tokens instead."
+        ),
+        "annie": "create one more of those tokens instead.",
+        "extra": "create one extra token instead.",
+        "additional": "create one additional token instead.",
+        "lightning-bolt": "deals 3 damage to any target.",
+        "creates-tokens-but-no-multiplier": "Whenever this dies, create a Treasure token.",
+    }
+    for cid, text in payloads.items():
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={"id": cid, "oracle_text": text},
+            status=200,
+        )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    jobs = [J(cid, cid) for cid in payloads]
+    count = fill._count_token_doublers(jobs, fill.requests.Session())
+    # 4 of the 6 payloads match (doubling-season, annie, extra, additional);
+    # bolt and treasure-creator do not.
+    assert count == 4
+
+
+@responses.activate
+def test_count_token_doublers_walks_dfc_faces():
+    """DFC cards split oracle_text per face; a doubler effect on the back
+    face must still be counted."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/dfc-doubler",
+        json={
+            "id": "dfc-doubler",
+            "oracle_text": "",
+            "card_faces": [
+                {"oracle_text": "Front: nothing token-related."},
+                {"oracle_text": "Back: it creates twice that many of those tokens instead."},
+            ],
+        },
+        status=200,
+    )
+    job = fill.CardJob(
+        name="DFC",
+        qty=1,
+        scryfall_uid="dfc-doubler",
+        custom_image_url=None,
+        set_code=None,
+        collector_number=None,
+    )
+    assert fill._count_token_doublers([job], fill.requests.Session()) == 1
+
+
+@responses.activate
+def test_count_token_doublers_skips_no_uid():
+    # Custom-art cards (no UID) and payload-fetch failures must not crash
+    # the doubler count. Returns 0 cleanly.
+    fill._scryfall_payload_cache.clear()
+    job = fill.CardJob(
+        name="Custom",
+        qty=1,
+        scryfall_uid=None,
+        custom_image_url="https://x/foo.png",
+        set_code=None,
+        collector_number=None,
+    )
+    assert fill._count_token_doublers([job], fill.requests.Session()) == 0
+
+
+@responses.activate
+def test_discover_tokens_with_sources_returns_minter_map():
+    """End-to-end: `_discover_tokens_with_sources` should return a minter
+    map keyed by token UID, with each deck card that mints a given token
+    recorded under that token's set. Pairs with `_apply_token_qty` to size
+    smart-qty output."""
+    fill._scryfall_payload_cache.clear()
+    # Two deck cards both mint Treasure (same all_parts UID).
+    for cid in ("smothering-tithe", "pitiless-plunderer"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [
+                    {"id": "treasure-uid", "name": "Treasure", "component": "token"},
+                ],
+            },
+            status=200,
+        )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    jobs = [
+        J("Smothering Tithe", "smothering-tithe"),
+        J("Pitiless Plunderer", "pitiless-plunderer"),
+    ]
+    tokens, minters, failures = fill._discover_tokens_with_sources(jobs, fill.requests.Session())
+    assert failures == []
+    assert [t.name for t in tokens] == ["Treasure (token)"]
+    assert minters == {"treasure-uid": {"Smothering Tithe", "Pitiless Plunderer"}}
+
 
 @responses.activate
 def test_resolve_urls_back_override_wins_over_pair_back_uid(tmp_path):
