@@ -1227,6 +1227,19 @@ class TestParseCsvDecklist:
         assert "Bad" in out
         assert "Fraction" in out
 
+    def test_utf8_bom_prefixed_export(self):
+        # ManaBox occasionally ships exports with a leading UTF-8 BOM.
+        # Python's default lstrip() does NOT strip ﻿, so without the
+        # explicit BOM strip the first header would read as "﻿Name"
+        # and the lookup against {"name", "card name", ...} would miss —
+        # the whole CSV would silently parse to zero cards.
+        text = "﻿Name,Quantity\nSol Ring,1\nLightning Bolt,4\n"
+        assert fill._looks_like_csv(text)
+        assert fill._parse_csv_decklist(text) == [
+            (1, "Sol Ring", None, None),
+            (4, "Lightning Bolt", None, None),
+        ]
+
     def test_real_manabox_15col_shape(self):
         # Real ManaBox CSV exports carry ~15 columns. The parser must pick
         # the right ones by header name and ignore the rest. Earlier review
@@ -1296,6 +1309,27 @@ class TestExtractTokenPhrases:
     def test_up_to_n_quantifier(self):
         text = "Create up to two 1/1 white Soldier creature tokens."
         assert fill._extract_token_phrases(text) == [("1/1 white Soldier creature", None)]
+
+    def test_two_tokens_in_one_create_clause_only_first_captured(self):
+        # "Create a Treasure token and a Food token" — the regex requires
+        # `create[s]?` before each quantifier. The second token has no
+        # leading `create`, so only Treasure is captured. Documenting this
+        # behaviour: thorough mode will miss the second token in this
+        # uncommon phrasing. Real Magic oracle text almost always repeats
+        # `create` (or uses comma-then-create), so this rarely bites — but
+        # if a regression broke the first capture too we'd want to know.
+        text = "Create a Treasure token and a Food token."
+        assert fill._extract_token_phrases(text) == [("Treasure", None)]
+
+    def test_two_create_clauses_both_captured(self):
+        # Counterpart to the above: when each token gets its own `create`
+        # verb, both are captured. This is the dominant phrasing on real
+        # cards, and the case the regex was tuned for.
+        text = "Create a Treasure token. Create a Food token."
+        assert fill._extract_token_phrases(text) == [
+            ("Treasure", None),
+            ("Food", None),
+        ]
 
     def test_no_match(self):
         assert fill._extract_token_phrases("Lightning Bolt deals 3 damage to any target.") == []

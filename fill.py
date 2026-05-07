@@ -308,8 +308,13 @@ def _looks_like_csv(text: str) -> bool:
     """Header-row sniff for a ManaBox / generic CSV decklist. We require
     *both* a name and a quantity column on the first non-empty line —
     a single comma in a card name (`Yidris, Maelstrom Wielder`) on its
-    own line must not flip the parser into CSV mode."""
-    head = text.lstrip()
+    own line must not flip the parser into CSV mode.
+
+    ManaBox occasionally ships UTF-8 BOM-prefixed exports; Python's default
+    `lstrip()` does NOT strip `\\ufeff`, so the BOM would otherwise glue
+    onto the first header (`"\\ufeffName"`) and silently break detection.
+    The explicit BOM strip below covers that case."""
+    head = text.lstrip("﻿").lstrip()
     first = head.split("\n", 1)[0].strip()
     if "," not in first:
         return False
@@ -333,6 +338,11 @@ def _parse_csv_decklist(text: str) -> list[tuple[int, str, str | None, str | Non
     import csv
     from io import StringIO
 
+    # Strip a leading UTF-8 BOM so the first header doesn't read as
+    # `﻿Name` (which would never match the lower-cased lookup
+    # below). ManaBox ships these on some platforms.
+    if text.startswith("﻿"):
+        text = text[1:]
     reader = csv.DictReader(StringIO(text))
     if not reader.fieldnames:
         return []
