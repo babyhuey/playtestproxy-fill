@@ -71,6 +71,14 @@ Sideboard
         <label class="check"><input id="opt-tokens" type="checkbox"> Include tokens / emblems (one of each unique)</label>
         <label class="check"><input id="opt-pair-tokens" type="checkbox" checked> Pair tokens back-to-back (cuts token cost in half)</label>
         <label class="check"><input id="opt-tokens-thorough" type="checkbox"> Thorough token scan — also reads each card's oracle text (slower; catches tokens missing from Scryfall metadata)</label>
+        <label class="check">Token quantity:
+          <select id="opt-token-qty">
+            <option value="one">One of each (default)</option>
+            <option value="conservative">Conservative — minter count, cap 4</option>
+            <option value="standard">Standard — minter count + doublers, cap 8</option>
+            <option value="aggressive">Aggressive — minter count + 4× doublers, cap 12</option>
+          </select>
+        </label>
       </div>
       <div class="back-source">
         <div class="back-source-label">Default back for non-DFC cards (optional override)</div>

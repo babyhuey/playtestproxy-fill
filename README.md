@@ -25,6 +25,8 @@ The frontend covers the same options as the CLI:
 - Pair tokens back-to-back (cuts the token portion of the bill in half)
 - Thorough token scan — also reads each card's oracle text to catch tokens
   Scryfall's `all_parts` metadata sometimes omits (slower, opt-in)
+- Token quantity — print one of each (default), or scale by deck-card minter
+  count and optional doubler multiplier (Conservative / Standard / Aggressive)
 - Custom default back (file upload or URL paste)
 
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
@@ -202,6 +204,14 @@ fill.py [<deck_url_or_id>]
                           'create … token' phrases and resolve each via Scryfall
                           search. Catches tokens missing from Scryfall's all_parts
                           metadata, but slower (one extra search per descriptor).
+  --token-qty STRATEGY    How many of each token to print (only with
+                          --include-tokens). 'one' = 1 of each (default).
+                          'conservative' = number of distinct deck cards minting
+                          this token, cap 4. 'standard' adds a 2× doubler
+                          multiplier (Doubling Season / Anointed Procession /
+                          Mondrak / Annie Joins Up etc.), cap 8. 'aggressive'
+                          uses a 4× multiplier when 2 or more doublers are in
+                          the deck, cap 12.
 
 upload.py <images_dir>
   --headless              Run without a visible browser window

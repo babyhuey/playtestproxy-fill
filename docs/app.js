@@ -858,12 +858,42 @@ async function resolveTokenPhrase(phrase, named) {
   return { uid: cards[0].id, error: null };
 }
 
+// Doubler oracle-text fingerprint — mirrors fill.py:_TOKEN_DOUBLER_RE.
+// `twice that many` covers Doubling Season / Anointed Procession /
+// Parallel Lives / Mondrak / Adrix and Nev / Primal Vigor; the
+// `one more / one extra / one additional` variants catch Annie Joins
+// Up. Heuristic, not exhaustive.
+const TOKEN_DOUBLER_RE =
+  /\b(?:twice that many|create[s]? one more|one (?:additional|extra) token|that many plus one)\b/i;
+
+const TOKEN_QTY_STRATEGIES = ["one", "conservative", "standard", "aggressive"];
+const TOKEN_QTY_CAPS = { conservative: 4, standard: 8, aggressive: 12 };
+
+function oraclesFromPayload(payload) {
+  // Same walk used by oracleTokenPhrases — pulled out so the doubler
+  // scan can reuse the same data without a second function call shape.
+  const out = [];
+  if (payload.oracle_text) out.push(payload.oracle_text);
+  for (const face of payload.card_faces || []) {
+    if (face.oracle_text) out.push(face.oracle_text);
+  }
+  return out;
+}
+
 async function discoverTokens(jobs, opts = {}) {
   // Walk all_parts on every main-deck card and return one job per unique
   // token. Dedupes by (lowercased name, type_line) so different Scryfall
   // printings of the same token (e.g. "Treasure", "Faerie Rogue") collapse —
   // but legitimately distinct same-named tokens (e.g. 1/1 W flying Spirit
   // vs. Kamigawa colorless Spirit) stay separate.
+  //
+  // Returns { tokens, failures, minters, doublerCount }:
+  //   - tokens: list of token CardJob-shaped objects (qty defaults to 1)
+  //   - failures: list of {name, error} per-card-failure objects
+  //   - minters: Map<tokenUid, Set<minter card name>> — used by
+  //     applyTokenQty to scale the printed token count
+  //   - doublerCount: number of deck cards whose oracle_text matches the
+  //     token-doubler fingerprint (Doubling Season etc.)
   //
   // With { thorough: true } also regex-scans each card's oracle_text for
   // 'create ... token' phrases and resolves each via Scryfall search —
@@ -876,6 +906,8 @@ async function discoverTokens(jobs, opts = {}) {
   const seen = new Map();
   const failures = [];
   const phraseCache = new Map();
+  const minters = new Map();
+  let doublerCount = 0;
   for (const job of jobs) {
     if (!job.uid) continue;  // custom-art cards skip the Scryfall round-trip
     let data;
@@ -884,6 +916,12 @@ async function discoverTokens(jobs, opts = {}) {
     } catch (e) {
       failures.push({ name: job.name, error: e.message });
       continue;
+    }
+    // Doubler fingerprint check on the same payload — avoids a second
+    // pass over the deck just to count Doubling Seasons. Each card
+    // contributes at most 1 to the count even if the regex matches twice.
+    if (oraclesFromPayload(data).some((t) => TOKEN_DOUBLER_RE.test(t))) {
+      doublerCount += 1;
     }
     for (const part of data.all_parts || []) {
       if (part.component !== "token" || !part.id) continue;
@@ -900,6 +938,8 @@ async function discoverTokens(jobs, opts = {}) {
           isToken: true,
         });
       }
+      if (!minters.has(part.id)) minters.set(part.id, new Set());
+      minters.get(part.id).add(job.name);
     }
     if (!thorough) continue;
     // Token UIDs we've already taken — cross-checked alongside the
@@ -923,7 +963,12 @@ async function discoverTokens(jobs, opts = {}) {
         phraseCache.set(cacheKey, uid);
       }
       const tokenUid = phraseCache.get(cacheKey);
-      if (!tokenUid || seenUids.has(tokenUid)) continue;
+      if (!tokenUid) continue;
+      // Record this card as a minter even if we won't add a new token job
+      // below — minter count still grows for smart-qty.
+      if (!minters.has(tokenUid)) minters.set(tokenUid, new Set());
+      minters.get(tokenUid).add(job.name);
+      if (seenUids.has(tokenUid)) continue;
       let tok;
       try {
         tok = await scryfallCard(tokenUid);
@@ -950,7 +995,46 @@ async function discoverTokens(jobs, opts = {}) {
       }
     }
   }
-  return { tokens: [...seen.values()], failures };
+  return { tokens: [...seen.values()], failures, minters, doublerCount };
+}
+
+function applyTokenQty(tokens, minters, doublerCount, strategy) {
+  // Mirrors fill.py:_apply_token_qty. Mutates `tokens` in place.
+  // See the Python docstring for the strategy semantics.
+  if (strategy === "one") return;
+  const cap = TOKEN_QTY_CAPS[strategy];
+  if (!cap) throw new Error(`Unknown token-qty strategy: ${strategy}`);
+  for (const job of tokens) {
+    const minterSet = minters.get(job.uid);
+    const minterCount = minterSet ? minterSet.size : 1;
+    let qty;
+    if (strategy === "conservative") {
+      qty = minterCount;
+    } else if (strategy === "standard") {
+      qty = minterCount * (doublerCount > 0 ? 2 : 1);
+    } else {  // aggressive
+      qty = minterCount * 2 ** Math.min(doublerCount, 2);
+    }
+    job.qty = Math.max(1, Math.min(qty, cap));
+  }
+}
+
+function expandTokenQty(tokens) {
+  // Flatten qty>1 token jobs into qty=1 singles. Pair-tokens treats
+  // each entry as one physical card; without expansion a smart-qty=3
+  // Treasure would collapse into a single pair slot. Mirrors
+  // fill.py:_expand_token_qty.
+  const out = [];
+  for (const job of tokens) {
+    if (job.qty <= 1) {
+      out.push(job);
+      continue;
+    }
+    for (let i = 0; i < job.qty; i++) {
+      out.push({ ...job, qty: 1 });
+    }
+  }
+  return out;
 }
 
 async function processJob(state, job, opts, zip, gallery) {
@@ -1379,6 +1463,7 @@ async function run() {
       includeTokens: $("opt-tokens").checked,
       pairTokens: $("opt-pair-tokens").checked,
       tokensThorough: $("opt-tokens-thorough").checked,
+      tokenQty: $("opt-token-qty").value || "one",
     };
     zip = new JSZip();
     state = {
@@ -1424,7 +1509,7 @@ async function run() {
     // Run discovery against the merged main deck so tokens already
     // included from the first pass don't get printed again on the second.
     const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
-    const { tokens, failures: tokenFailures } = await discoverTokens(
+    const { tokens, failures: tokenFailures, minters, doublerCount } = await discoverTokens(
       baseJobsForDiscovery,
       { thorough: opts.tokensThorough },
     );
@@ -1439,19 +1524,37 @@ async function run() {
     }
     const fresh = tokens.filter((t) => !existingTokenUids.has(t.uid));
     if (fresh.length) {
+      // Smart-qty: scale each token's qty by minter count (and optional
+      // doubler multiplier) before pairing. Mutates `fresh` in place.
+      applyTokenQty(fresh, minters, doublerCount, opts.tokenQty);
+      const totalCopies = fresh.reduce((a, j) => a + j.qty, 0);
       if (opts.pairTokens && !opts.pairBacks) {
         passFailures.push({
           name: "Token pairing skipped",
           error: "Pair tokens needs Pair backs enabled — falling back to single-sided.",
         });
       }
-      if (opts.pairTokens && opts.pairBacks && fresh.length >= 2) {
-        const paired = pairTokens(fresh);
-        jobs = [...jobs, ...paired];
-        deckLabel = `${deckLabel} (+ ${fresh.length} tokens → ${paired.length} cards)`;
+      if (opts.pairTokens && opts.pairBacks) {
+        // Expand qty>1 jobs into singles before pairing so each copy gets
+        // its own pair slot. Mirrors fill.py:_apply_token_jobs.
+        const expanded = expandTokenQty(fresh);
+        if (expanded.length >= 2) {
+          const paired = pairTokens(expanded);
+          jobs = [...jobs, ...paired];
+          deckLabel =
+            `${deckLabel} (+ ${fresh.length} unique tokens` +
+            (totalCopies !== fresh.length ? `, ${totalCopies} copies` : "") +
+            ` → ${paired.length} cards)`;
+        } else {
+          jobs = [...jobs, ...expanded];
+          deckLabel = `${deckLabel} (+ ${fresh.length} tokens)`;
+        }
       } else {
         jobs = [...jobs, ...fresh];
-        deckLabel = `${deckLabel} (+ ${fresh.length} tokens)`;
+        deckLabel =
+          `${deckLabel} (+ ${fresh.length} unique tokens` +
+          (totalCopies !== fresh.length ? `, ${totalCopies} copies` : "") +
+          ")";
       }
     }
     newTokenFailures = tokenFailures;
@@ -1603,7 +1706,16 @@ $("opt-tokens").addEventListener("change", (e) => {
   if (!e.target.checked) {
     $("opt-tokens-thorough").checked = false;
     $("opt-pair-tokens").checked = false;
+    // Reset the qty select to "one" too — it's another no-op-without-parent
+    // option, and silently retaining a non-default value across the parent
+    // toggle would surprise the user on re-enable.
+    $("opt-token-qty").value = "one";
   }
+});
+// `opt-token-qty` is a select rather than a checkbox; same dependency on
+// opt-tokens. Picking any non-default value auto-enables the parent.
+$("opt-token-qty").addEventListener("change", (e) => {
+  if (e.target.value !== "one") $("opt-tokens").checked = true;
 });
 
 els.download.addEventListener("click", () => {
