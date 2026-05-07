@@ -1215,6 +1215,31 @@ class TestParseCsvDecklist:
         text = "Name,SetCode\nSol Ring,cmm\n"
         assert fill._parse_csv_decklist(text) == []
 
+    def test_invalid_qty_surfaces_warning(self, capsys):
+        # ManaBox occasionally exports `1.0` or empty Quantity; the parser
+        # silently skips those rows. The user needs to know — verify the
+        # WARNING is emitted to stdout listing the affected rows.
+        text = "Name,Quantity\nGood,1\nBad,abc\nFraction,1.5\n"
+        fill._parse_csv_decklist(text)
+        out = capsys.readouterr().out
+        assert "WARNING:" in out
+        assert "skipped 2" in out
+        assert "Bad" in out
+        assert "Fraction" in out
+
+    def test_real_manabox_15col_shape(self):
+        # Real ManaBox CSV exports carry ~15 columns. The parser must pick
+        # the right ones by header name and ignore the rest. Earlier review
+        # noted this column shape wasn't covered by the basic 4-7 col tests.
+        text = (
+            "Name,Set code,Set name,Collector number,Foil,Rarity,Quantity,"
+            "ManaBox ID,Scryfall ID,Purchase price,Misprint,Altered,"
+            "Condition,Language,Purchase price currency\n"
+            '"Sol Ring","cmm","Commander Masters","343","normal","uncommon","1",'
+            '"12345","abc-uid","0.50","false","false","Near Mint","English","USD"\n'
+        )
+        assert fill._parse_csv_decklist(text) == [(1, "Sol Ring", "cmm", "343")]
+
 
 class TestParseDecklistRoutesToCsv:
     """The dispatcher in `_parse_decklist` recognises CSV input and
@@ -1278,6 +1303,50 @@ class TestExtractTokenPhrases:
     def test_empty_input(self):
         assert fill._extract_token_phrases("") == []
         assert fill._extract_token_phrases(None) == []  # type: ignore[arg-type]
+
+
+class TestOracleTokenPhrases:
+    """Cover the DFC walk in `_oracle_token_phrases`. Single-faced cards
+    keep oracle_text on the root; transform / MDFC cards put it under each
+    `card_faces[*].oracle_text` (root oracle_text may be empty or absent).
+    Without explicit coverage of the face walk, a regression that drops it
+    would silently make thorough mode blind to back-face token mints."""
+
+    def test_single_face_payload(self):
+        payload = {"oracle_text": "Create a Treasure token."}
+        assert fill._oracle_token_phrases(payload) == [("Treasure", None)]
+
+    def test_dfc_payload_walks_card_faces(self):
+        # Simulates a transform card whose back face mints a token —
+        # the regex would never see it without the face walk.
+        payload = {
+            "oracle_text": "",
+            "card_faces": [
+                {"oracle_text": "Front face has no token text."},
+                {"oracle_text": "When this transforms, create a Food token."},
+            ],
+        }
+        assert fill._oracle_token_phrases(payload) == [("Food", None)]
+
+    def test_root_and_face_oracle_both_walked(self):
+        # Root + face oracle text both contribute. Order: root first, then
+        # each face in card_faces order.
+        payload = {
+            "oracle_text": "Create a Treasure token.",
+            "card_faces": [
+                {"oracle_text": "Whenever this dies, create a Clue token."},
+            ],
+        }
+        assert fill._oracle_token_phrases(payload) == [
+            ("Treasure", None),
+            ("Clue", None),
+        ]
+
+    def test_payload_without_any_oracle(self):
+        assert fill._oracle_token_phrases({}) == []
+        assert fill._oracle_token_phrases({"card_faces": []}) == []
+        # `card_faces` is None (Scryfall sometimes ships null) — must not crash.
+        assert fill._oracle_token_phrases({"card_faces": None}) == []
 
 
 class TestTokenPhraseToQuery:

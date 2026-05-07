@@ -1,9 +1,10 @@
 # playtestproxy-fill
 
-Pull a deck from Archidekt, Moxfield, TappedOut, EDHREC, or any pasted decklist
-and produce print-ready images for [tcgplaytest.com](https://www.tcgplaytest.com/).
-Includes a Python CLI, a Playwright auto-uploader, and a no-install web
-frontend at <https://babyhuey.github.io/playtestproxy-fill/>.
+Pull a deck from Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC,
+a pasted decklist, or a ManaBox / generic CSV export — and produce print-ready
+images for [tcgplaytest.com](https://www.tcgplaytest.com/). Includes a Python
+CLI, a Playwright auto-uploader, and a no-install web frontend at
+<https://babyhuey.github.io/playtestproxy-fill/>.
 
 Verified end-to-end on `https://archidekt.com/decks/21170685/` (commander
 deck, 100 main-deck cards, 3 DFCs, paired backs uploaded via the
@@ -22,6 +23,8 @@ The frontend covers the same options as the CLI:
 - Pair backs (DFC face-2 + a default back for everything else)
 - Include tokens / emblems (off by default)
 - Pair tokens back-to-back (cuts the token portion of the bill in half)
+- Thorough token scan — also reads each card's oracle text to catch tokens
+  Scryfall's `all_parts` metadata sometimes omits (slower, opt-in)
 - Custom default back (file upload or URL paste)
 
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
@@ -73,11 +76,13 @@ Cloudflare JS challenges. The tool prints a clear message asking you to
 copy the deck text and use `--decklist` instead.
 
 What this does:
-1. Fetches the deck JSON from Archidekt / Moxfield, or the text export
-   from TappedOut. Card inclusion follows Archidekt's per-deck
-   `categories[].includedInDeck` against each card's *primary* (first)
-   category, so a Land tagged "Maybeboard" only counts if its primary
-   category is excluded.
+1. Fetches the deck — Archidekt and Moxfield via their JSON APIs;
+   Scryfall, Deckbox, TappedOut, and EDHREC via their text exports
+   (and the EDHREC `__NEXT_DATA__` blob). Plain decklists / ManaBox CSVs
+   come straight in via `--decklist`. Card inclusion on Archidekt
+   follows the per-deck `categories[].includedInDeck` against each
+   card's *primary* (first) category, so a Land tagged "Maybeboard"
+   only counts if its primary category is excluded.
 2. For each card, picks an image source in this order:
    1. `overrides/<card_slug>.png` if present (drop your own art here).
       `overrides/<card_slug>.back.png` overrides a DFC's back face.
@@ -89,10 +94,14 @@ What this does:
    adventure, aftermath) emit only the front because the card is one
    physical piece.
 4. With `--include-tokens`, walks each card's Scryfall `all_parts`,
-   dedupes by token UID, and appends one of each unique token at the
-   end. With `--pair-tokens` (and `--pair-backs`), prints two unrelated
-   tokens back-to-back on a single card — you only ever need one face
-   up at a time, so this halves the token portion of the order.
+   dedupes by (token name, type_line), and appends one of each unique
+   token at the end. With `--pair-tokens` (and `--pair-backs`), prints
+   two unrelated tokens back-to-back on a single card — you only ever
+   need one face up at a time, so this halves the token portion of the
+   order. `--tokens-thorough` additionally regex-scans each card's
+   oracle text for "create N … token [named X]" phrases and resolves
+   each via Scryfall search; catches tokens missing from `all_parts`,
+   at the cost of one extra search per unique descriptor (cached).
 5. Writes one PNG per card slot (the unmodified Scryfall image), plus
    `manifest.json`. tcgplaytest applies the print-bleed expansion on
    their end after upload — pick **"No Bleed"** in their modal.
@@ -159,7 +168,7 @@ Open <https://www.tcgplaytest.com/?view=design> and:
 3. Click Next → Customize Back. If you used `--pair-backs`, drag
    everything in `out/backs/` into the **Sequential Backs** uploader
    (image N → slot N).
-5. Finish Preview → Add to Cart.
+4. Finish Preview → Add to Cart.
 
 The upload step has to happen in the same browser tab the editor was
 opened in — tcgplaytest's design page is fully client-side and the
