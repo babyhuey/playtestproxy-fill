@@ -307,8 +307,8 @@ _SECTION_HEADERS = re.compile(
 def _looks_like_csv(text: str) -> bool:
     """Header-row sniff for a ManaBox / generic CSV decklist. We require
     *both* a name and a quantity column on the first non-empty line —
-    a single comma in a card name (`Bosco, Just a Bear`) on its own line
-    must not flip the parser into CSV mode."""
+    a single comma in a card name (`Yidris, Maelstrom Wielder`) on its
+    own line must not flip the parser into CSV mode."""
     head = text.lstrip()
     first = head.split("\n", 1)[0].strip()
     if "," not in first:
@@ -355,14 +355,20 @@ def _parse_csv_decklist(text: str) -> list[tuple[int, str, str | None, str | Non
     section_key = pick("section", "board", "type")
 
     out: list[tuple[int, str, str | None, str | None]] = []
+    bad_qty_rows: list[str] = []  # non-integer Quantity values, surfaced after parse
     for row in reader:
         if section_key:
             sec = (row.get(section_key) or "").strip().lower()
             if sec in _CSV_EXCLUDED_SECTIONS:
                 continue
+        raw_qty = str(row.get(qty_key) or "0").strip()
         try:
-            qty = int(str(row.get(qty_key) or "0").strip())
+            qty = int(raw_qty)
         except ValueError:
+            # ManaBox occasionally exports `1.0` or empty — surface the
+            # count rather than silently dropping rows the user expected.
+            name_for_log = (row.get(name_key) or "?").strip() or "?"
+            bad_qty_rows.append(f"{name_for_log!r} (qty={raw_qty!r})")
             continue
         name = (row.get(name_key) or "").strip()
         if qty <= 0 or not name:
@@ -370,6 +376,14 @@ def _parse_csv_decklist(text: str) -> list[tuple[int, str, str | None, str | Non
         set_code = (row.get(set_key) or "").strip().lower() or None if set_key else None
         cn = (row.get(cn_key) or "").strip() or None if cn_key else None
         out.append((qty, name, set_code, cn))
+    if bad_qty_rows:
+        # Match the existing "WARNING: ..." surface used by `_jobs_from_decklist`
+        # for unresolved cards. stdout is fine — the CLI prints progress here too.
+        print(f"WARNING: skipped {len(bad_qty_rows)} CSV row(s) with non-integer Quantity:")
+        for entry in bad_qty_rows[:10]:
+            print(f"  - {entry}")
+        if len(bad_qty_rows) > 10:
+            print(f"  ... and {len(bad_qty_rows) - 10} more")
     return out
 
 
@@ -776,16 +790,33 @@ def _discover_tokens(
                 # there; payload caching means a second failure is the same
                 # underlying network/HTTP error.
                 continue
-            for phrase in _oracle_token_phrases(payload):
-                norm = phrase.lower()
-                if norm not in phrase_cache:
-                    phrase_cache[norm] = _resolve_token_phrase(phrase, session)
-                token_uid = phrase_cache[norm]
-                if not token_uid:
+            # Token UIDs we've already accepted — checked alongside the
+            # (name, type_line) dedupe so a token resolved via oracle-scan
+            # can't double up with the same token resolved via all_parts
+            # if their name/type strings happened to differ subtly.
+            seen_uids = {j.scryfall_uid for j in token_jobs.values()}
+            for descriptor, named in _oracle_token_phrases(payload):
+                cache_key = (descriptor.lower(), (named or "").lower())
+                if cache_key not in phrase_cache:
+                    uid, error = _resolve_token_phrase(descriptor, named, session)
+                    if error is not None:
+                        # Transient — DON'T cache (we want a retry on the
+                        # next card minting this token). Record so the
+                        # user knows the run was incomplete.
+                        failures.append(f"{job.name} (thorough): {error}")
+                        continue
+                    phrase_cache[cache_key] = uid
+                token_uid = phrase_cache[cache_key]
+                if not token_uid or token_uid in seen_uids:
                     continue
                 try:
                     tok = scryfall_card_payload(token_uid, session)
-                except (requests.RequestException, RuntimeError):
+                except (requests.RequestException, RuntimeError) as e:
+                    # The phrase resolved to a UID, but that UID's payload
+                    # fetch failed — surface it. Without this the user
+                    # sees fewer tokens than thorough mode found and has
+                    # no signal of why.
+                    failures.append(f"{job.name} (thorough token {token_uid}): {e}")
                     continue
                 tok_name = (tok.get("name") or "").strip()
                 tok_type = (tok.get("type_line") or "").strip()
@@ -801,6 +832,7 @@ def _discover_tokens(
                         set_code=None,
                         collector_number=None,
                     )
+                    seen_uids.add(token_uid)
     return list(token_jobs.values()), failures
 
 
@@ -834,12 +866,24 @@ _TOKEN_QUANTIFIERS = (
 )
 _TOKEN_PHRASE_RE = re.compile(
     r"\bcreate[s]?\s+"
+    # Optional "up to N ..." prefix — Magic uses both "create up to two
+    # 1/1 Soldier tokens" and the bare "create two 1/1 ...".
+    r"(?:up\s+to\s+)?"
     r"(?:\d+|" + "|".join(_TOKEN_QUANTIFIERS) + r")"
     r"(?:\s+or\s+more)?"
     # Lazy descriptor capped at 120 chars so a missing 'token' suffix can't
     # eat the rest of the oracle text. Whitespace+token closes the match.
     r"\s+(?P<descriptor>.{1,120}?)"
-    r"\s+token[s]?\b",
+    r"\s+token[s]?"
+    # Optional `named X` clause that appears AFTER `token`. Real cards like
+    # "create a colorless artifact token named Treasure" hide the actual
+    # token name here — without this capture we'd search for the descriptor
+    # ("colorless artifact") and miss every Treasure / Clue / Food the card
+    # mints. Cap the name at three words to stop the engine from greedy-
+    # eating into a following clause ("named Tuktuk the Returned that's a
+    # 5/5..." — name is "Tuktuk the Returned", not the rest).
+    r"(?:\s+named\s+(?P<named>\w[\w'-]*(?:\s+\w[\w'-]*){0,2}))?"
+    r"\b",
     re.IGNORECASE,
 )
 _TOKEN_COLOR_WORDS = {
@@ -857,47 +901,65 @@ _TOKEN_FILLER_WORDS = frozenset(
 )
 
 
-def _extract_token_phrases(oracle_text: str) -> list[str]:
-    """Pull `create N <descriptor> token` descriptors out of oracle text.
-    The descriptor is what appears between the quantifier and the literal
-    word 'token' — e.g. '1/1 white Soldier creature' or 'Treasure'. Trailing
-    'with X', 'named X', and 'that's a copy of X' clauses come AFTER 'token',
-    so the lazy capture doesn't pick them up. Returns [] for empty/None
+def _extract_token_phrases(oracle_text: str) -> list[tuple[str, str | None]]:
+    """Pull `create N <descriptor> token [named X]` clauses out of oracle text.
+    Returns a list of (descriptor, named_or_None) tuples — the descriptor is
+    everything between the quantifier and `token` ('1/1 white Soldier creature'
+    or 'Treasure'); `named` is the optional name clause that appears AFTER
+    `token` ('colorless artifact token named Treasure' → ('colorless artifact',
+    'Treasure')). Trailing 'with X' / 'that's a copy of X' clauses come after
+    `token` and the regex's lazy capture skips them. Returns [] for empty/None
     input or no matches."""
     if not oracle_text:
         return []
-    out: list[str] = []
+    out: list[tuple[str, str | None]] = []
     for m in _TOKEN_PHRASE_RE.finditer(oracle_text):
         descriptor = re.sub(r"\s+", " ", m.group("descriptor").strip())
-        if descriptor:
-            out.append(descriptor)
+        if not descriptor:
+            continue
+        named = m.group("named")
+        named = re.sub(r"\s+", " ", named.strip()) if named else None
+        out.append((descriptor, named))
     return out
 
 
-def _oracle_token_phrases(payload: dict) -> list[str]:
+def _oracle_token_phrases(payload: dict) -> list[tuple[str, str | None]]:
     """Extract token-create phrases from a Scryfall card payload. Walks
     both the card-level oracle_text and per-face oracle_text (DFCs put
-    their rules text on the faces, not the root)."""
+    their rules text on the faces, not the root). See `_extract_token_phrases`
+    for the tuple shape."""
     texts: list[str] = []
     if payload.get("oracle_text"):
         texts.append(payload["oracle_text"])
     for face in payload.get("card_faces") or []:
         if face.get("oracle_text"):
             texts.append(face["oracle_text"])
-    out: list[str] = []
+    out: list[tuple[str, str | None]] = []
     for text in texts:
         out.extend(_extract_token_phrases(text))
     return out
 
 
-def _token_phrase_to_query(phrase: str) -> str:
-    """Convert a captured descriptor into a Scryfall search query.
+def _token_phrase_to_query(phrase: str, named: str | None = None) -> str | None:
+    """Convert a captured descriptor (and optional `named X` clause) into a
+    Scryfall search query.
 
-    Two shapes:
-      - P/T descriptor ('1/1 white Soldier creature') → creature token,
-        encode pt + colors + creature subtypes.
-      - Bare name ('Treasure', 'Food', 'Clue') → match by exact token name.
-    """
+    Priority:
+      - If `named` was captured, use it directly — it's the token's actual
+        name and is more precise than the descriptor.
+      - Else if the descriptor carries a P/T ('1/1 white Soldier creature') →
+        creature-token query with pt + colors + creature subtypes.
+      - Else bare name ('Treasure', 'Food') → exact-name query, with filler
+        words ('tapped', 'legendary') and color words stripped first.
+        Without that strip, "create a tapped Treasure token" emits
+        `name:"tapped Treasure"`, which Scryfall returns nothing for.
+
+    Returns None when the descriptor strips down to nothing actionable
+    (e.g. "create a token that's a copy of X" leaves an empty descriptor)
+    so the caller can skip cleanly instead of issuing a guaranteed-empty
+    search."""
+    if named:
+        return f'is:token name:"{named.strip().rstrip(".,;:")}"'
     p = phrase.strip().rstrip(".,;:")
     pt_match = re.search(r"\b(\d+)/(\d+)\b", p)
     if pt_match:
@@ -922,15 +984,44 @@ def _token_phrase_to_query(phrase: str) -> str:
         for t in types:
             terms.append(f"t:{t}")
         return " ".join(terms)
-    # Named/predefined tokens (Treasure, Food, Clue, Blood, Map, etc.).
-    return f'is:token name:"{p}"'
+    # Bare-name path: strip filler / color words before quoting. "tapped
+    # Treasure" → "Treasure"; "colorless artifact" → "" (no useful name —
+    # signal to caller via None).
+    words = re.findall(r"[A-Za-z]+", p)
+    keep = [
+        w
+        for w in words
+        if w.lower() not in _TOKEN_FILLER_WORDS and w.lower() not in _TOKEN_COLOR_WORDS
+    ]
+    if not keep:
+        return None
+    return f'is:token name:"{" ".join(keep)}"'
 
 
-def _resolve_token_phrase(phrase: str, session: requests.Session) -> str | None:
-    """Resolve a captured oracle-text descriptor to a Scryfall token UID.
-    Returns None if Scryfall finds nothing — the caller silently skips
-    unresolvable phrases rather than aborting the build."""
-    query = _token_phrase_to_query(phrase)
+def _resolve_token_phrase(
+    phrase: str, named: str | None, session: requests.Session
+) -> tuple[str | None, str | None]:
+    """Resolve a captured oracle-text descriptor (plus optional `named X`)
+    to a Scryfall token UID.
+
+    Returns a (uid, error) tuple:
+      - (uid, None) — Scryfall returned a hit; cache it.
+      - (None, None) — search ran cleanly and found nothing (legitimate
+        miss, e.g. unresolvable copy-of-X token); cache as None.
+      - (None, "reason") — TRANSIENT failure (network error, 5xx, malformed
+        JSON, or the phrase didn't yield a meaningful query). Caller MUST
+        NOT cache this — a single early blip would otherwise poison every
+        later card minting the same token. Reason gets pushed to the
+        run-level failures list.
+
+    Scryfall's 404 is treated as a clean "not found" because the search
+    endpoint really does return 404 for zero-result queries."""
+    query = _token_phrase_to_query(phrase, named)
+    if query is None:
+        # Descriptor stripped to nothing meaningful — skip the search
+        # entirely. Cache as None (not a transient error) so we don't
+        # retry on every subsequent card with the same descriptor.
+        return None, None
     _scryfall_wait()
     try:
         r = session.get(
@@ -939,18 +1030,20 @@ def _resolve_token_phrase(phrase: str, session: requests.Session) -> str | None:
             headers=UA,
             timeout=20,
         )
-    except requests.RequestException:
-        return None
-    if r.status_code == 404 or not r.ok:
-        return None
+    except requests.RequestException as e:
+        return None, f"Scryfall search failed for {phrase!r}: {e}"
+    if r.status_code == 404:
+        return None, None  # genuine "no such token" — cache the miss
+    if not r.ok:
+        return None, f"Scryfall search returned {r.status_code} for {phrase!r}"
     try:
         data = r.json()
-    except ValueError:
-        return None
+    except ValueError as e:
+        return None, f"Scryfall search returned malformed JSON for {phrase!r}: {e}"
     cards = data.get("data") or []
     if not cards:
-        return None
-    return cards[0].get("id")
+        return None, None
+    return cards[0].get("id"), None
 
 
 def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, str, str]]:

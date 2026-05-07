@@ -509,14 +509,27 @@ async function fetchScryfallDeckText(deckId) {
 }
 
 async function fetchDeckboxText(setId) {
-  // Deckbox's `?format=tcg` export ships `N Card Name` lines. Private sets
-  // redirect to a login page (HTML) — detect that and throw a clear error
-  // instead of feeding the HTML to the decklist parser and getting 0 cards.
+  // Deckbox's `?format=tcg` export ships `N Card Name` lines. Three things
+  // can come back as HTML instead:
+  //   1. Deckbox login redirect (private set) — the common case
+  //   2. corsproxy.io rate-limit page (200 with HTML body) — same hazard
+  //      `parseJsonStrict` documents for the JSON path; a public set would
+  //      be misreported as private without this branch
+  //   3. Some unexpected upstream HTML — generic fallback
+  // We sniff a wider window (500 chars) so `<!DOCTYPE html>` plus the
+  // service-identifying string both fit before the cutoff.
   const text = await fetchProxiedText(DECKBOX_EXPORT(setId), "Deckbox");
-  if (text.trimStart().slice(0, 200).toLowerCase().includes("<html")) {
+  const head = text.trimStart().slice(0, 500).toLowerCase();
+  if (head.includes("<html") || head.includes("<!doctype")) {
+    if (head.includes("corsproxy")) {
+      throw new Error(
+        "corsproxy.io rate-limited the Deckbox request. Wait a minute and try again, " +
+        "or copy the decklist into the Paste decklist tab."
+      );
+    }
     throw new Error(
       `Deckbox set '${setId}' looks private (export returned HTML). ` +
-      "Make the set public, or copy the decklist into the Paste decklist tab."
+      "Make the set public, or copy the decklist into the Paste decklist tab.",
     );
   }
   return text;
@@ -733,20 +746,30 @@ function pairTokens(tokens) {
 const TOKEN_QUANTIFIERS =
   "a|an|x|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|" +
   "thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty";
+// `up to N` prefix and `or more` suffix both appear in real oracle text.
+// `named X` is captured as a separate group because real cards like
+// "create a colorless artifact token named Treasure" hide the actual token
+// name AFTER the word `token` — without this group we'd query the
+// descriptor and miss every Treasure / Clue / Food the card mints. Name is
+// capped at three words to stop the engine greedy-eating into a following
+// clause ("named Tuktuk the Returned that's a 5/5..." → just the name).
 const TOKEN_PHRASE_RE = new RegExp(
-  String.raw`\bcreate[s]?\s+(?:\d+|${TOKEN_QUANTIFIERS})(?:\s+or\s+more)?\s+(.{1,120}?)\s+token[s]?\b`,
+  String.raw`\bcreate[s]?\s+(?:up\s+to\s+)?(?:\d+|${TOKEN_QUANTIFIERS})(?:\s+or\s+more)?\s+(.{1,120}?)\s+token[s]?(?:\s+named\s+(\w[\w'-]*(?:\s+\w[\w'-]*){0,2}))?\b`,
   "gi",
 );
 const TOKEN_COLOR_WORDS = { white: "w", blue: "u", black: "b", red: "r", green: "g", colorless: "c" };
 const TOKEN_FILLER_WORDS = new Set(["creature", "artifact", "enchantment", "and", "or", "tapped", "legendary"]);
 
 function extractTokenPhrases(oracleText) {
+  // Returns [{ descriptor, named: string|null }, ...]. `named` is the
+  // optional capture from the `... token named X` clause.
   if (!oracleText) return [];
   const out = [];
-  // matchAll on a /g regex; reset isn't needed because we don't reuse lastIndex.
   for (const m of oracleText.matchAll(TOKEN_PHRASE_RE)) {
     const desc = m[1].trim().replace(/\s+/g, " ");
-    if (desc) out.push(desc);
+    if (!desc) continue;
+    const named = m[2] ? m[2].trim().replace(/\s+/g, " ") : null;
+    out.push({ descriptor: desc, named });
   }
   return out;
 }
@@ -763,7 +786,11 @@ function oracleTokenPhrases(payload) {
   return out;
 }
 
-function tokenPhraseToQuery(phrase) {
+function tokenPhraseToQuery(phrase, named) {
+  // Three-tier priority — see fill.py:_token_phrase_to_query for the
+  // canonical version. Returns null when the descriptor strips down to
+  // nothing actionable so the caller can skip the search entirely.
+  if (named) return `is:token name:"${named.trim().replace(/[.,;:]+$/, "")}"`;
   const p = phrase.trim().replace(/[.,;:]+$/, "");
   const ptMatch = p.match(/\b(\d+)\/(\d+)\b/);
   if (ptMatch) {
@@ -782,28 +809,52 @@ function tokenPhraseToQuery(phrase) {
     for (const t of types) terms.push(`t:${t}`);
     return terms.join(" ");
   }
-  return `is:token name:"${p}"`;
+  // Bare-name path: strip filler/color words before quoting. "tapped
+  // Treasure" → "Treasure"; "colorless artifact" → "" (no useful name —
+  // signal to caller via null).
+  const words = p.match(/[A-Za-z]+/g) || [];
+  const keep = words.filter(
+    (w) => !TOKEN_FILLER_WORDS.has(w.toLowerCase()) && !(w.toLowerCase() in TOKEN_COLOR_WORDS),
+  );
+  if (!keep.length) return null;
+  return `is:token name:"${keep.join(" ")}"`;
 }
 
-async function resolveTokenPhrase(phrase) {
-  // 80ms politeness gap — same convention as the per-card resolver.
-  // Returns null on miss / network error: the caller silently skips
-  // unresolvable phrases rather than aborting the whole build.
+async function resolveTokenPhrase(phrase, named) {
+  // Returns { uid, error }:
+  //   uid set, error null   → cache the hit
+  //   uid null, error null  → clean miss (cache it; e.g. 404 / empty result
+  //                           / unresolvable copy-of-X)
+  //   uid null, error set   → TRANSIENT failure; caller MUST NOT cache,
+  //                           and pushes the reason to failures[]. Without
+  //                           this distinction a single 5xx on the first
+  //                           card poisons the cache for every later card
+  //                           minting the same token.
+  const query = tokenPhraseToQuery(phrase, named);
+  if (query == null) return { uid: null, error: null };
   await new Promise((r) => setTimeout(r, 80));
   const url = `${SCRYFALL_SEARCH}?${new URLSearchParams({
-    q: tokenPhraseToQuery(phrase),
+    q: query,
     unique: "cards",
     order: "released",
   })}`;
+  let r;
   try {
-    const r = await fetch(url);
-    if (!r.ok) return null;
-    const data = await r.json();
-    const cards = data.data || [];
-    return cards.length ? cards[0].id : null;
-  } catch {
-    return null;
+    r = await fetch(url);
+  } catch (e) {
+    return { uid: null, error: `Scryfall search failed for "${phrase}": ${e.message}` };
   }
+  if (r.status === 404) return { uid: null, error: null };  // genuine miss
+  if (!r.ok) return { uid: null, error: `Scryfall search returned ${r.status} for "${phrase}"` };
+  let data;
+  try {
+    data = await r.json();
+  } catch (e) {
+    return { uid: null, error: `Scryfall search returned malformed JSON for "${phrase}": ${e.message}` };
+  }
+  const cards = data.data || [];
+  if (!cards.length) return { uid: null, error: null };
+  return { uid: cards[0].id, error: null };
 }
 
 async function discoverTokens(jobs, opts = {}) {
@@ -817,7 +868,9 @@ async function discoverTokens(jobs, opts = {}) {
   // 'create ... token' phrases and resolves each via Scryfall search —
   // catches tokens missing from all_parts at the cost of one search
   // request per unique descriptor (cached so two cards minting the same
-  // token only burn one round-trip).
+  // token only burn one round-trip). Transient search failures are pushed
+  // to `failures` rather than silently caching null, so a single rate-limit
+  // can't suppress every later card minting the same token.
   const { thorough = false } = opts;
   const seen = new Map();
   const failures = [];
@@ -848,17 +901,30 @@ async function discoverTokens(jobs, opts = {}) {
       }
     }
     if (!thorough) continue;
-    for (const phrase of oracleTokenPhrases(data)) {
-      const norm = phrase.toLowerCase();
-      if (!phraseCache.has(norm)) {
-        phraseCache.set(norm, await resolveTokenPhrase(phrase));
+    // Token UIDs we've already taken — cross-checked alongside the
+    // (name, type_line) key so a token resolved via oracle-scan can't
+    // duplicate one already collected from all_parts if the type_line
+    // strings happen to differ subtly between the two sources.
+    const seenUids = new Set(Array.from(seen.values(), (j) => j.uid));
+    for (const { descriptor, named } of oracleTokenPhrases(data)) {
+      const cacheKey = `${descriptor.toLowerCase()}|${(named || "").toLowerCase()}`;
+      if (!phraseCache.has(cacheKey)) {
+        const { uid, error } = await resolveTokenPhrase(descriptor, named);
+        if (error) {
+          // Transient — DON'T cache (let the next card retry) and surface
+          // the reason so the user knows the run was incomplete.
+          failures.push({ name: `${job.name} (thorough)`, error });
+          continue;
+        }
+        phraseCache.set(cacheKey, uid);
       }
-      const tokenUid = phraseCache.get(norm);
-      if (!tokenUid) continue;
+      const tokenUid = phraseCache.get(cacheKey);
+      if (!tokenUid || seenUids.has(tokenUid)) continue;
       let tok;
       try {
         tok = await scryfallCard(tokenUid);
-      } catch {
+      } catch (e) {
+        failures.push({ name: `${job.name} (thorough token ${tokenUid})`, error: e.message });
         continue;
       }
       const tokName = (tok.name || "").trim();
@@ -873,6 +939,7 @@ async function discoverTokens(jobs, opts = {}) {
           customUrl: null,
           isToken: true,
         });
+        seenUids.add(tokenUid);
       }
     }
   }

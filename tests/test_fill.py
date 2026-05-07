@@ -194,7 +194,7 @@ class TestParseDecklist:
         assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
 
     def test_skips_maybeboard_and_tokens(self):
-        text = "1 Sol Ring\nMaybeboard:\n1 Bosco\nTokens\n1 Treasure"
+        text = "1 Sol Ring\nMaybeboard:\n1 Counterspell\nTokens\n1 Treasure"
         assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
 
     def test_returns_to_main_after_section(self):
@@ -343,7 +343,7 @@ def archidekt_payload():
                 "quantity": 1,
                 "card": {
                     "uid": "ghi-789",
-                    "oracleCard": {"name": "Bosco, Just a Bear"},
+                    "oracleCard": {"name": "Yidris, Maelstrom Wielder"},
                     "edition": {"editioncode": "lci"},
                     "collectorNumber": "5",
                 },
@@ -1174,9 +1174,9 @@ class TestLooksLikeCsv:
         assert fill._looks_like_csv(text)
 
     def test_card_with_comma_in_name_isnt_csv(self):
-        # `Bosco, Just a Bear` contains a comma but isn't a CSV header.
+        # `Yidris, Maelstrom Wielder` contains a comma but isn't a CSV header.
         # Without the both-name-and-quantity gate, this would false-positive.
-        assert not fill._looks_like_csv("1 Bosco, Just a Bear\n4 Lightning Bolt\n")
+        assert not fill._looks_like_csv("1 Yidris, Maelstrom Wielder\n4 Lightning Bolt\n")
 
     def test_quantity_only_header_isnt_csv(self):
         # A header with `Quantity` but no `Name` shouldn't trigger CSV mode.
@@ -1237,11 +1237,11 @@ class TestParseDecklistRoutesToCsv:
 
 class TestExtractTokenPhrases:
     def test_named_token(self):
-        assert fill._extract_token_phrases("Create a Treasure token.") == ["Treasure"]
+        assert fill._extract_token_phrases("Create a Treasure token.") == [("Treasure", None)]
 
     def test_creature_token_with_pt(self):
         text = "Create a 1/1 white Soldier creature token."
-        assert fill._extract_token_phrases(text) == ["1/1 white Soldier creature"]
+        assert fill._extract_token_phrases(text) == [("1/1 white Soldier creature", None)]
 
     def test_multiple_matches(self):
         text = (
@@ -1250,9 +1250,27 @@ class TestExtractTokenPhrases:
         )
         # The 'with flying' clause sits AFTER `tokens` so it's not captured.
         assert fill._extract_token_phrases(text) == [
-            "Treasure",
-            "1/1 white Spirit creature",
+            ("Treasure", None),
+            ("1/1 white Spirit creature", None),
         ]
+
+    def test_named_clause_after_token_captured(self):
+        # Pre-2020 phrasing: token's actual name is AFTER the word `token`.
+        # Without the named-clause capture we'd query for "colorless artifact"
+        # and miss every Treasure on Ixalan-era cards.
+        text = "Create a colorless artifact token named Treasure."
+        assert fill._extract_token_phrases(text) == [("colorless artifact", "Treasure")]
+
+    def test_named_clause_creature_token(self):
+        # Tuktuk the Explorer's named-token phrasing — multi-word name.
+        text = "Create a 5/5 red Goblin Golem artifact creature token named Tuktuk the Returned."
+        assert fill._extract_token_phrases(text) == [
+            ("5/5 red Goblin Golem artifact creature", "Tuktuk the Returned")
+        ]
+
+    def test_up_to_n_quantifier(self):
+        text = "Create up to two 1/1 white Soldier creature tokens."
+        assert fill._extract_token_phrases(text) == [("1/1 white Soldier creature", None)]
 
     def test_no_match(self):
         assert fill._extract_token_phrases("Lightning Bolt deals 3 damage to any target.") == []
@@ -1265,10 +1283,11 @@ class TestExtractTokenPhrases:
 class TestTokenPhraseToQuery:
     def test_named_token_uses_name_match(self):
         q = fill._token_phrase_to_query("Treasure")
-        assert "is:token" in q and 'name:"Treasure"' in q
+        assert q is not None and "is:token" in q and 'name:"Treasure"' in q
 
     def test_pt_creature_includes_color_type_pt(self):
         q = fill._token_phrase_to_query("1/1 white Soldier creature")
+        assert q is not None
         assert "is:token" in q
         assert "pt:1/1" in q
         assert "c=w" in q
@@ -1277,8 +1296,36 @@ class TestTokenPhraseToQuery:
     def test_multicolor_creature(self):
         q = fill._token_phrase_to_query("2/2 black and red Zombie creature")
         # Both colors emitted as a single c= clause.
+        assert q is not None
         assert "c=br" in q or "c=rb" in q
         assert "t:zombie" in q
+
+    def test_named_clause_overrides_descriptor(self):
+        # When a `named X` clause was captured it's the real token name —
+        # use it instead of the descriptor.
+        q = fill._token_phrase_to_query("colorless artifact", named="Treasure")
+        assert q == 'is:token name:"Treasure"'
+
+    def test_named_clause_overrides_pt_descriptor(self):
+        # `Tuktuk the Returned` is the actual token name; the 5/5 red Goblin
+        # Golem descriptor is a worse search target.
+        q = fill._token_phrase_to_query(
+            "5/5 red Goblin Golem artifact creature", named="Tuktuk the Returned"
+        )
+        assert q == 'is:token name:"Tuktuk the Returned"'
+
+    def test_filler_words_stripped_from_named_fallback(self):
+        # "create a tapped Treasure token" → captures "tapped Treasure" as
+        # the descriptor. Without filler-word stripping this would search
+        # for `name:"tapped Treasure"` and silently miss every real Treasure.
+        q = fill._token_phrase_to_query("tapped Treasure")
+        assert q == 'is:token name:"Treasure"'
+
+    def test_descriptor_strips_to_nothing_returns_none(self):
+        # "colorless artifact" with no `named X` clause: every word is
+        # filler/color. No useful query — return None so the caller can
+        # skip cleanly instead of issuing an empty Scryfall search.
+        assert fill._token_phrase_to_query("colorless artifact") is None
 
 
 @responses.activate
@@ -1290,21 +1337,71 @@ def test_resolve_token_phrase_picks_first_search_hit():
         json={"data": [{"id": "treasure-token-uid", "name": "Treasure"}]},
         status=200,
     )
-    uid = fill._resolve_token_phrase("Treasure", fill.requests.Session())
+    uid, error = fill._resolve_token_phrase("Treasure", None, fill.requests.Session())
     assert uid == "treasure-token-uid"
+    assert error is None
 
 
 @responses.activate
 def test_resolve_token_phrase_returns_none_on_404():
-    """A search miss is not an error — Scryfall returns 404 for queries
-    that match nothing. We just skip the phrase silently."""
+    """A 404 from Scryfall search means a clean 'no such token' result —
+    return (None, None), not a transient error. Caller can cache the miss."""
     responses.add(
         responses.GET,
         "https://api.scryfall.com/cards/search",
         json={"object": "error", "code": "not_found"},
         status=404,
     )
-    assert fill._resolve_token_phrase("Imaginary", fill.requests.Session()) is None
+    uid, error = fill._resolve_token_phrase("Imaginary", None, fill.requests.Session())
+    assert uid is None
+    assert error is None
+
+
+def test_resolve_token_phrase_skips_empty_query():
+    # Descriptor reduces to nothing actionable → skip the search entirely
+    # (no HTTP request) and return a clean miss. responses isn't activated
+    # so any HTTP call would error — verifies no network was hit.
+    uid, error = fill._resolve_token_phrase("colorless artifact", None, fill.requests.Session())
+    assert uid is None
+    assert error is None
+
+
+@responses.activate
+def test_resolve_token_phrase_surfaces_5xx_as_transient():
+    """A 5xx response is a transient failure — return an error string so
+    the caller can record it on `failures[]` instead of silently caching
+    None and suppressing every later card minting the same token."""
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"err": "server"},
+        status=503,
+    )
+    uid, error = fill._resolve_token_phrase("Treasure", None, fill.requests.Session())
+    assert uid is None
+    assert error is not None and "503" in error
+
+
+@responses.activate
+def test_resolve_token_phrase_uses_named_clause_when_present():
+    """Verify that when `named` is passed, the search query targets that
+    name (not the descriptor). Catches a regression where the named arg
+    is dropped on the way to query-builder."""
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"data": [{"id": "treasure-uid", "name": "Treasure"}]},
+        status=200,
+    )
+    uid, error = fill._resolve_token_phrase(
+        "colorless artifact", "Treasure", fill.requests.Session()
+    )
+    assert uid == "treasure-uid"
+    assert error is None
+    # The query in the URL must contain Treasure, not "colorless artifact".
+    last_url = responses.calls[-1].request.url
+    assert "Treasure" in last_url
+    assert "colorless+artifact" not in last_url and "colorless%20artifact" not in last_url
 
 
 @responses.activate
@@ -1425,19 +1522,147 @@ def test_discover_tokens_thorough_caches_phrase_lookups():
     assert len(search_calls) == 1
 
 
+@responses.activate
 def test_discover_tokens_default_does_not_oracle_scan(monkeypatch):
     """Without thorough=True, oracle-text scanning must NOT run — even if
-    the regex would match. Cheap regression guard against accidentally
-    flipping the default."""
+    the regex would match. Regression guard against accidentally flipping
+    the default. Important: the loop has to actually iterate a job, so we
+    pass a real CardJob whose payload mocks include `oracle_text`. If the
+    test passed an empty job list the assertion would be vacuously true
+    even with the default flipped."""
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/has-oracle",
+        json={
+            "id": "has-oracle",
+            "oracle_text": "Create a Treasure token.",  # would match if scanned
+            "all_parts": [],
+        },
+        status=200,
+    )
     called = {"count": 0}
 
     def fake_extract(_text):
         called["count"] += 1
-        return ["Treasure"]
+        return [("Treasure", None)]
 
     monkeypatch.setattr(fill, "_extract_token_phrases", fake_extract)
-    fill._discover_tokens([], fill.requests.Session())  # thorough defaults False
+
+    job = fill.CardJob(
+        name="HasOracle",
+        qty=1,
+        scryfall_uid="has-oracle",
+        custom_image_url=None,
+        set_code=None,
+        collector_number=None,
+    )
+    fill._discover_tokens([job], fill.requests.Session())  # thorough defaults False
     assert called["count"] == 0
+
+
+@responses.activate
+def test_discover_tokens_thorough_surfaces_transient_errors():
+    """A 5xx during oracle-scan must land in `failures[]` rather than
+    silently caching None — the user opted into thorough mode and a
+    transient blip would otherwise suppress every later card minting the
+    same token. This is the regression guarded by PR #43 follow-up."""
+    fill._scryfall_payload_cache.clear()
+    # Two cards both creating a Treasure token via oracle text.
+    for cid in ("card-a", "card-b"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [],
+                "oracle_text": "Create a Treasure token.",
+            },
+            status=200,
+        )
+    # First search call: 503 transient. Second call (because we DON'T cache
+    # the failure): also 503 — both surface as failures.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"err": "boom"},
+        status=503,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"err": "boom"},
+        status=503,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("CardA", "card-a"), J("CardB", "card-b")],
+        fill.requests.Session(),
+        thorough=True,
+    )
+
+    assert new_jobs == []
+    # Both cards surfaced their own transient — proves the cache was NOT
+    # poisoned with None on the first failure.
+    assert len(failures) == 2
+    assert all("503" in f for f in failures)
+
+
+@responses.activate
+def test_discover_tokens_thorough_caches_legitimate_misses():
+    """A clean Scryfall 404 ("no such token") IS cached — we don't want to
+    re-spend a search request per card on a phrase that genuinely won't
+    resolve. Symmetric counterpart to the transient-error test above."""
+    fill._scryfall_payload_cache.clear()
+    for cid in ("card-a", "card-b"):
+        responses.add(
+            responses.GET,
+            f"https://api.scryfall.com/cards/{cid}",
+            json={
+                "id": cid,
+                "all_parts": [],
+                "oracle_text": "Create a Treasure token.",
+            },
+            status=200,
+        )
+    # 404 for the first search; if the cache works, no second search fires.
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/search",
+        json={"object": "error"},
+        status=404,
+    )
+
+    def J(name, uid):
+        return fill.CardJob(
+            name=name,
+            qty=1,
+            scryfall_uid=uid,
+            custom_image_url=None,
+            set_code=None,
+            collector_number=None,
+        )
+
+    new_jobs, failures = fill._discover_tokens(
+        [J("CardA", "card-a"), J("CardB", "card-b")],
+        fill.requests.Session(),
+        thorough=True,
+    )
+
+    assert new_jobs == []
+    assert failures == []
+    search_calls = [c for c in responses.calls if "/cards/search" in c.request.url]
+    assert len(search_calls) == 1  # second card hit the cached 404
 
 
 # --- Scryfall image-URL resolver ----------------------------------------
