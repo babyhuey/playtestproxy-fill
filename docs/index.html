@@ -47,19 +47,19 @@
     </div>
 
     <div id="mode-url-pane">
-      <label for="deck-input">Archidekt, Moxfield, TappedOut, or EDHREC</label>
-      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  tappedout.net/mtg-decks/…  ·  edhrec.com/deckpreview/…" autocomplete="off">
+      <label for="deck-input">Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, or EDHREC</label>
+      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  scryfall.com/@user/decks/…  ·  deckbox.org/sets/…  ·  tappedout.net/mtg-decks/…  ·  edhrec.com/deckpreview/…" autocomplete="off">
     </div>
 
     <div id="mode-text-pane" hidden>
-      <label for="decklist-input">Decklist — one card per line</label>
+      <label for="decklist-input">Decklist — one card per line, or a CSV export</label>
       <textarea id="decklist-input" rows="8" placeholder="1 Sol Ring
 4 Lightning Bolt (M21) 162
 1 Forest
 
 Sideboard
 2 Negate"></textarea>
-      <p class="hint small">Accepts MTG Arena exports, MTGO <code>.dek</code> XML, copy/paste from any deck builder, plain "N Card Name" lines. Set codes / collector numbers in parens are optional. Sections labelled <em>Sideboard / Maybeboard / Tokens</em> are skipped.</p>
+      <p class="hint small">Accepts MTG Arena exports, MTGO <code>.dek</code> XML, ManaBox / generic CSV with Name + Quantity columns, copy/paste from any deck builder, plain "N Card Name" lines. Set codes / collector numbers in parens are optional. Sections labelled <em>Sideboard / Maybeboard / Tokens</em> are skipped.</p>
     </div>
 
     <details class="opts">
@@ -70,6 +70,7 @@ Sideboard
         <label class="check"><input id="opt-pair-backs" type="checkbox" checked> Pair backs (DFC face-2 + default for others)</label>
         <label class="check"><input id="opt-tokens" type="checkbox"> Include tokens / emblems (one of each unique)</label>
         <label class="check"><input id="opt-pair-tokens" type="checkbox" checked> Pair tokens back-to-back (cuts token cost in half)</label>
+        <label class="check"><input id="opt-tokens-thorough" type="checkbox"> Thorough token scan — also reads each card's oracle text (slower; catches tokens missing from Scryfall metadata)</label>
       </div>
       <div class="back-source">
         <div class="back-source-label">Default back for non-DFC cards (optional override)</div>
@@ -114,7 +115,7 @@ Sideboard
   <section class="card help">
     <h2>How it works</h2>
     <ol>
-      <li>Fetches the deck JSON from Archidekt or Moxfield (via a public CORS proxy — both APIs are locked to their own origins).</li>
+      <li>Fetches the deck from Archidekt / Moxfield (JSON), Scryfall / Deckbox / TappedOut / EDHREC (text exports). The deck-builder APIs are locked to their own origins so the request is routed through a public CORS proxy where direct fetch fails.</li>
       <li>For each card, pulls the exact printing's PNG from Scryfall — Secret Lair / alt-art selections come through faithfully.</li>
       <li>Bundles the unmodified Scryfall PNGs into a ZIP for you to download.</li>
     </ol>
@@ -123,7 +124,7 @@ Sideboard
 </main>
 
 <footer>
-  <span>Deck-builder API traffic (Archidekt, Moxfield, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall and the bundled image are fetched directly.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall (cards + decks) and the bundled image are fetched directly.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 
