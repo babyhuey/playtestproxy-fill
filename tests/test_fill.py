@@ -115,6 +115,24 @@ class TestDetectSource:
             ("7593392",),
         )
 
+    def test_mtgdecks_url(self):
+        # Capture the format-folder + slug-with-id, which is what the fetcher
+        # reconstructs the URL from.
+        assert fill.detect_source(
+            "https://mtgdecks.net/Standard/azorius-control-decklist-by-artsiom-bendzitau-2877465"
+        ) == (
+            "mtgdecks",
+            ("Standard/azorius-control-decklist-by-artsiom-bendzitau-2877465",),
+        )
+
+    def test_mtgdecks_archetype_listing_rejected(self):
+        # Archetype-listing pages (no `-<digits>` deck-id tail) shouldn't
+        # match the deck pattern; they fall through to the general
+        # alphanumeric-id branch (Moxfield) only if the bare string
+        # qualifies, so for a bare URL string this raises.
+        with pytest.raises(SystemExit):
+            fill.detect_source("https://mtgdecks.net/Standard/azorius-control")
+
     def test_scryfall_url_with_user(self):
         # Canonical Scryfall deck URLs include the @user segment.
         assert fill.detect_source(
@@ -603,6 +621,118 @@ def test_fetch_edhrec_schema_drift_detected():
     )
     with pytest.raises(SystemExit, match="EDHREC deck shape changed"):
         fill._fetch_edhrec("changed")
+
+
+def _mtgdecks_html(rows):
+    """Build a minimal mtgdecks.net deck page. `rows` is a list of
+    `(type_label, [(qty, name), ...])` tuples — one tuple per `<table>`
+    block on the rendered page. We only model the markup the scraper
+    actually reads (the `<th class="type X">` heading + `<tr
+    class="cardItem" data-required="N" data-card-id="Name">` rows)."""
+    parts = ["<!DOCTYPE html><html><body>"]
+    for type_label, cards in rows:
+        parts.append("<table>")
+        parts.append(f'<tr><th colspan="3" class="type {type_label}">{type_label}</th></tr>')
+        for qty, name in cards:
+            parts.append(
+                f'<tr data-required="{qty}" data-card-id="{name}" class="cardItem"></tr>'
+            )
+        parts.append("</table>")
+    parts.append("</body></html>")
+    return "\n".join(parts)
+
+
+@responses.activate
+def test_fetch_mtgdecks_returns_jobs():
+    """Scrape the cardItem rows out of the rendered deck page and route
+    through the existing decklist parser. Mainboard `<th class="type X">`
+    sections accumulate; only `<th class="type Sideboard">` flips the
+    accumulator into the sideboard bucket."""
+    html = _mtgdecks_html([
+        ("Creature", [(2, "Beza, the Bounding Spring")]),
+        ("Instant", [(4, "Get Lost")]),
+        ("Sideboard", [(2, "Negate")]),
+    ])
+    responses.add(
+        responses.GET,
+        "https://mtgdecks.net/Standard/some-deck-1234",
+        body=html,
+        status=200,
+        content_type="text/html",
+    )
+    for name, uid in [("Beza, the Bounding Spring", "beza-uid"), ("Get Lost", "gl-uid")]:
+        responses.add(
+            responses.GET,
+            "https://api.scryfall.com/cards/named",
+            json={"id": uid, "name": name},
+            status=200,
+        )
+    jobs = fill._fetch_mtgdecks("Standard/some-deck-1234")
+    # Sideboard always excluded for the CLI path — _parse_decklist treats the
+    # `Sideboard` section as off-deck. The frontend's checkbox can opt in.
+    assert {(j.name, j.qty) for j in jobs} == {
+        ("Beza, the Bounding Spring", 2),
+        ("Get Lost", 4),
+    }
+
+
+@responses.activate
+def test_fetch_mtgdecks_decodes_html_entities():
+    """Card names with characters like `Æ` come through as numeric / named
+    HTML entities in `data-card-id`; the scraper must decode them so
+    Scryfall lookups succeed."""
+    html = (
+        '<table>'
+        '<tr><th colspan="3" class="type Artifact">Artifact</th></tr>'
+        '<tr data-required="4" data-card-id="&#198;ther Vial" class="cardItem"></tr>'
+        '</table>'
+    )
+    responses.add(
+        responses.GET,
+        "https://mtgdecks.net/Modern/aether-deck-99999",
+        body=html,
+        status=200,
+        content_type="text/html",
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/named",
+        json={"id": "av-uid", "name": "Æther Vial"},
+        status=200,
+    )
+    jobs = fill._fetch_mtgdecks("Modern/aether-deck-99999")
+    assert len(jobs) == 1
+    assert jobs[0].name == "Æther Vial"
+    assert jobs[0].qty == 4
+
+
+@responses.activate
+def test_fetch_mtgdecks_layout_drift_errors():
+    """If mtgdecks.net ever changes the row markup so neither the type
+    heading nor the cardItem rows match, we'd otherwise call
+    `_jobs_from_decklist` with empty text and emit an inscrutable
+    'Could not parse any cards' message. Surface it as a layout-drift
+    error pointing at the page URL instead."""
+    responses.add(
+        responses.GET,
+        "https://mtgdecks.net/Standard/empty-deck-22222",
+        body="<html><body><p>No deck data here.</p></body></html>",
+        status=200,
+        content_type="text/html",
+    )
+    with pytest.raises(SystemExit, match="layout may have changed"):
+        fill._fetch_mtgdecks("Standard/empty-deck-22222")
+
+
+@responses.activate
+def test_fetch_mtgdecks_404_surfaces_clean_error():
+    responses.add(
+        responses.GET,
+        "https://mtgdecks.net/Standard/missing-deck-33333",
+        status=404,
+    )
+    with pytest.raises(SystemExit, match="404"):
+        fill._fetch_mtgdecks("Standard/missing-deck-33333")
 
 
 @responses.activate

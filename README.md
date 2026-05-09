@@ -1,7 +1,7 @@
 # playtestproxy-fill
 
 Pull a deck from Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC,
-a pasted decklist, or a ManaBox / generic CSV export — and produce print-ready
+mtgdecks.net, a pasted decklist, or a ManaBox / generic CSV export — and produce print-ready
 images for [tcgplaytest.com](https://www.tcgplaytest.com/). Includes a Python
 CLI, a Playwright auto-uploader, and a no-install web frontend at
 <https://babyhuey.github.io/playtestproxy-fill/>.
@@ -67,6 +67,12 @@ Recognised inputs:
 - An **EDHREC** sample-deck URL
   (`https://edhrec.com/deckpreview/<hash>`). Reads the embedded
   `__NEXT_DATA__` blob — no rotating buildId chase.
+- An **mtgdecks.net** deck URL
+  (`https://mtgdecks.net/<Format>/<archetype-slug>-decklist-by-<player>-<id>`).
+  Scrapes the rendered deck-view table for the structured `data-required` /
+  `data-card-id` attributes; sideboard cards live in the
+  `<th class="type Sideboard">` table and follow the standard CLI / frontend
+  sideboard rules.
 - A plain decklist via `--decklist <path>` (or `--decklist -` for stdin).
   Accepts MTG Arena exports, MTGO `.dek` XML, **ManaBox / generic CSV**
   with Name + Quantity columns (Section column auto-skipped for
@@ -80,8 +86,9 @@ copy the deck text and use `--decklist` instead.
 What this does:
 1. Fetches the deck — Archidekt and Moxfield via their JSON APIs;
    Scryfall, Deckbox, TappedOut, and EDHREC via their text exports
-   (and the EDHREC `__NEXT_DATA__` blob). Plain decklists / ManaBox CSVs
-   come straight in via `--decklist`. Card inclusion on Archidekt
+   (and the EDHREC `__NEXT_DATA__` blob); mtgdecks.net by scraping the
+   rendered deck-view table. Plain decklists / ManaBox CSVs come straight
+   in via `--decklist`. Card inclusion on Archidekt
    follows the per-deck `categories[].includedInDeck` against each
    card's *primary* (first) category, so a Land tagged "Maybeboard"
    only counts if its primary category is excluded.

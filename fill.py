@@ -17,6 +17,7 @@ Pipeline:
 from __future__ import annotations
 
 import argparse
+import html
 import io
 import json
 import re
@@ -110,6 +111,15 @@ _SCRYFALL_DECK_RE = re.compile(
 # Deckbox uses numeric set ids in the URL (`/sets/<n>`); the slug after isn't
 # required for the export endpoint.
 _DECKBOX_RE = re.compile(r"deckbox\.org/sets/(\d+)", re.I)
+# mtgdecks.net deck URLs look like
+# `mtgdecks.net/<Format>/<archetype-slug>-decklist-by-<player>-<id>` (where
+# `<id>` is a 5+ digit numeric deck id). The full path-after-host is what we
+# fetch, so capture it as one group; the trailing `-<id>` anchor avoids
+# matching unrelated archetype-listing URLs.
+_MTGDECKS_RE = re.compile(
+    r"mtgdecks\.net/([A-Za-z0-9_-]+/[A-Za-z0-9_.-]+?-\d{4,})",
+    re.I,
+)
 
 
 def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
@@ -123,6 +133,7 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
       - TappedOut URL  -> ("tappedout",  (slug,))
       - Deckstats URL  -> ("deckstats",  (owner_id, deck_id))
       - MTGGoldfish URL-> ("mtggoldfish",(deck_id,))
+      - mtgdecks URL   -> ("mtgdecks",   (path,))
       - Numeric id     -> ("archidekt",  (id,))   (legacy CLI usage)
       - Alphanumeric id-> ("moxfield",   (id,))
     """
@@ -151,6 +162,9 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
     m = _MTGGOLDFISH_RE.search(s)
     if m:
         return "mtggoldfish", (m.group(1),)
+    m = _MTGDECKS_RE.search(s)
+    if m:
+        return "mtgdecks", (m.group(1),)
     if s.isdigit():
         return "archidekt", (s,)
     if re.fullmatch(r"[A-Za-z0-9_-]{12,}", s):
@@ -158,8 +172,8 @@ def detect_source(input_str: str) -> tuple[str, tuple[str, ...]]:
     raise SystemExit(
         f"Could not recognise '{input_str}' as a supported deck. "
         "Paste an Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC, "
-        "Deckstats, or MTGGoldfish URL, or use --decklist with a path / '-' "
-        "to pipe a plain decklist."
+        "Deckstats, MTGGoldfish, or mtgdecks.net URL, or use --decklist with a "
+        "path / '-' to pipe a plain decklist."
     )
 
 
@@ -174,6 +188,7 @@ def fetch_deck(input_str: str) -> list[CardJob]:
         "edhrec": _fetch_edhrec,
         "deckstats": lambda *a: _fetch_cloudflare_blocked("Deckstats", *a),
         "mtggoldfish": lambda *a: _fetch_cloudflare_blocked("MTGGoldfish", *a),
+        "mtgdecks": _fetch_mtgdecks,
     }
     fn = fetchers.get(source)
     if fn is None:
@@ -665,6 +680,65 @@ def _fetch_cloudflare_blocked(site: str, *_: str) -> list[CardJob]:
         "--decklist - (or save to a file). The text parser handles the standard "
         "MTGA / 'N Card Name' format."
     )
+
+
+# mtgdecks.net deck pages render every card as a `<tr class="cardItem"
+# data-required="N" data-card-id="Name">` row, grouped into `<table>`s
+# preceded by a `<th class="type X">` heading. We extract those structured
+# attributes and rebuild a plain text decklist so the existing
+# `_parse_decklist` / `_jobs_from_decklist` pipeline does the rest. The site
+# does not expose a direct text-export endpoint; the lazy-loaded `#arena` tab
+# is JS-rendered from the same row data, so scraping the rendered table is
+# the most stable surface.
+_MTGDECKS_TYPE_OR_CARD = re.compile(
+    r'<th\b[^>]*class="type\s+([A-Za-z]+)"'
+    r"|"
+    r'<tr\b[^>]*class="cardItem"[^>]*>',
+    re.I,
+)
+_MTGDECKS_QTY = re.compile(r'data-required="(\d+)"', re.I)
+_MTGDECKS_NAME = re.compile(r'data-card-id="([^"]+)"', re.I)
+
+
+def _fetch_mtgdecks(path: str) -> list[CardJob]:
+    url = f"https://mtgdecks.net/{path.lstrip('/')}"
+    r = requests.get(url, headers=UA, timeout=30)
+    if 400 <= r.status_code < 500:
+        raise SystemExit(
+            f"mtgdecks.net returned {r.status_code} for {url}. "
+            "Check that the deck URL is correct and the page is public."
+        )
+    r.raise_for_status()
+    main_lines: list[str] = []
+    side_lines: list[str] = []
+    in_sideboard = False
+    for m in _MTGDECKS_TYPE_OR_CARD.finditer(r.text):
+        ttype = m.group(1)
+        if ttype is not None:
+            in_sideboard = ttype.lower() == "sideboard"
+            continue
+        row = m.group(0)
+        qm = _MTGDECKS_QTY.search(row)
+        nm = _MTGDECKS_NAME.search(row)
+        if not qm or not nm:
+            continue
+        qty = int(qm.group(1))
+        name = html.unescape(nm.group(1)).strip()
+        if qty <= 0 or not name:
+            continue
+        (side_lines if in_sideboard else main_lines).append(f"{qty} {name}")
+    if not main_lines and not side_lines:
+        raise SystemExit(
+            f"mtgdecks.net page parsed but no cards were found at {url}. "
+            "The page layout may have changed — please open an issue."
+        )
+    text = "\n".join(main_lines)
+    if side_lines:
+        # Emit the sideboard with a section header. `_parse_decklist` always
+        # excludes sideboards in the CLI (consistent with --decklist behavior);
+        # the frontend's "Skip Sideboard / Maybeboard" checkbox can opt in.
+        text += "\n\nSideboard\n" + "\n".join(side_lines)
+    return _jobs_from_decklist(text)
 
 
 SINGLE_PIECE_LAYOUTS = {"split", "flip", "adventure", "aftermath", "fuse"}
