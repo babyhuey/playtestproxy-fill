@@ -269,6 +269,66 @@ class TestParseDecklist:
         with pytest.raises(SystemExit, match="Could not parse MTGO"):
             fill._parse_decklist("<?xml version='1.0'?><Deck><Cards")
 
+    def test_moxfield_section_headers_with_count_suffix(self):
+        # Moxfield's "format-specific separators" toggle exports every section
+        # with a "(N)" count: "Commander (1)", "Companion (0)", "Deck (99)",
+        # "Sideboard (10)". Pre-fix, "Companion (0)" wasn't a recognised
+        # header, but our regex matched the bare "Companion" wouldn't either —
+        # the real bug was: if any *recognised* excluded header (e.g. a literal
+        # "Companion" without a count) flipped in_excluded=True, a subsequent
+        # "Deck (99)" failed to match and the entire mainboard was silently
+        # dropped. Confirm both: counted sections are recognised, and Commander
+        # cards land in mainboard rather than being excluded.
+        text = (
+            "Commander (1)\n"
+            "1 Atraxa, Praetors' Voice (NCC) 350\n"
+            "\n"
+            "Companion (0)\n"
+            "\n"
+            "Deck (99)\n"
+            "1 Approach of the Second Sun (AKR) 1\n"
+            "33 Forest\n"
+            "4 Lightning Bolt\n"
+            "\n"
+            "Sideboard (10)\n"
+            "1 Negate\n"
+        )
+        assert fill._parse_decklist(text) == [
+            (1, "Atraxa, Praetors' Voice", "ncc", "350"),
+            (1, "Approach of the Second Sun", "akr", "1"),
+            (33, "Forest", None, None),
+            (4, "Lightning Bolt", None, None),
+        ]
+
+    def test_companion_then_deck_with_count_recovers_mainboard(self):
+        # The exact pre-fix failure mode: Companion (recognised, excluded)
+        # latched in_excluded=True, then "Deck (99)" wasn't recognised so the
+        # flag never reset — every mainboard card silently dropped.
+        text = "Companion\n1 Lurrus of the Dream-Den\nDeck (60)\n4 Lightning Bolt"
+        assert fill._parse_decklist(text) == [(4, "Lightning Bolt", None, None)]
+
+    def test_foil_marker_after_collector_number(self):
+        # MTGO/Moxfield export foiled cards as "N Card (SET) CN *F*". Pre-fix,
+        # the trailing " *F*" broke the \s*$ anchor on the optional set/cn
+        # group; in Python the line silently failed to match (card dropped).
+        assert fill._parse_decklist("4 Lightning Bolt (LEA) 167 *F*") == [
+            (4, "Lightning Bolt", "lea", "167"),
+        ]
+        # Etched marker too.
+        assert fill._parse_decklist("1 Sol Ring (CMR) 472 *E*") == [
+            (1, "Sol Ring", "cmr", "472"),
+        ]
+
+    def test_commander_section_cards_kept_in_mainboard(self):
+        # Whether Moxfield writes "Commander" or "Commanders", the named card
+        # should land in the deck — it's a card the user wants printed, not a
+        # sideboard entry.
+        text = "Commander\n1 Atraxa, Praetors' Voice\n\nDeck\n4 Lightning Bolt"
+        assert fill._parse_decklist(text) == [
+            (1, "Atraxa, Praetors' Voice", None, None),
+            (4, "Lightning Bolt", None, None),
+        ]
+
 
 class TestScryfallWait:
     def test_first_call_no_sleep(self):

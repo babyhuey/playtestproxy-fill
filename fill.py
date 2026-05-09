@@ -293,13 +293,21 @@ _DECKLIST_LINE = re.compile(
         \s*[xX]?\s+                              # 'x' separator optional
         ([^()\n]+?)                              # card name (lazy)
         (?:\s+\(([A-Za-z0-9]{2,6})\)             # optional (SET) — anchors collector
-           (?:\s+([\w*★]+))?                     # collector number, only if SET present
+           (?:\s+([\w★]+))?                      # collector number, only if SET present
         )?
+        (?:\s+\*\w+\*)*                          # trailing *F*/*E*/etc. foil/etched markers
         \s*$""",
     re.VERBOSE,
 )
+# `(\d+)` count suffix — Moxfield's format-specific exports tag every section as
+# "Deck (99)", "Companion (0)" etc. Without it, the unrecognised header keeps
+# whatever `in_excluded` state the prior recognised header set, which silently
+# drops the entire mainboard if Companion/Tokens appear first.
 _SECTION_HEADERS = re.compile(
-    r"^\s*(?://|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard)\s*:?\s*$",
+    r"^\s*(?://|#|--)?\s*"
+    r"(sideboard|maybeboard|considering|companion|tokens?|cut|extra"
+    r"|deck|main|mainboard|commanders?)"
+    r"(?:\s+\(\d+\))?\s*:?\s*$",
     re.I,
 )
 
@@ -446,7 +454,9 @@ def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
             continue
         sec = _SECTION_HEADERS.match(line)
         if sec:
-            in_excluded = sec.group(1).lower() not in {"deck", "main", "mainboard"}
+            in_excluded = sec.group(1).lower() not in {
+                "deck", "main", "mainboard", "commander", "commanders",
+            }
             continue
         if line.lstrip().startswith(("//", "#")):
             continue

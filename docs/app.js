@@ -43,8 +43,13 @@ const DECKBOX_RE = /deckbox\.org\/sets\/(\d+)/i;
 const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatureSpells"];
 
 // "1 Card Name" / "4x Lightning Bolt" / "1 Sol Ring (CMM) 343" — same as fill.py.
-const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+(.+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w*★]+))?)?\s*$/;
-const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard)\s*:?\s*$/i;
+// Trailing "*F*"/"*E*" markers (foil/etched) are tolerated but discarded.
+const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+([^()\n]+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w★]+))?)?(?:\s+\*\w+\*)*\s*$/;
+// `(\d+)` count suffix — Moxfield's format-specific exports tag every section
+// as "Deck (99)", "Companion (0)" etc. Without it the unrecognised header
+// keeps whatever inExcluded state the prior recognised header set, silently
+// dropping the entire mainboard if Companion/Tokens appear first.
+const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard|commanders?)(?:\s+\(\d+\))?\s*:?\s*$/i;
 
 // DOM
 const $ = (id) => document.getElementById(id);
@@ -377,7 +382,7 @@ function parseDecklist(text) {
     const sec = line.match(SECTION_HEADER);
     if (sec) {
       const name = sec[1].toLowerCase();
-      inExcluded = !["deck", "main", "mainboard"].includes(name);
+      inExcluded = !["deck", "main", "mainboard", "commander", "commanders"].includes(name);
       continue;
     }
     if (line.trim().startsWith("//") || line.trim().startsWith("#")) continue;
