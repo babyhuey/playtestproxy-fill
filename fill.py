@@ -455,7 +455,11 @@ def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
         sec = _SECTION_HEADERS.match(line)
         if sec:
             in_excluded = sec.group(1).lower() not in {
-                "deck", "main", "mainboard", "commander", "commanders",
+                "deck",
+                "main",
+                "mainboard",
+                "commander",
+                "commanders",
             }
             continue
         if line.lstrip().startswith(("//", "#")):
