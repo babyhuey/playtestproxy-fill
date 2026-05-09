@@ -634,9 +634,7 @@ def _mtgdecks_html(rows):
         parts.append("<table>")
         parts.append(f'<tr><th colspan="3" class="type {type_label}">{type_label}</th></tr>')
         for qty, name in cards:
-            parts.append(
-                f'<tr data-required="{qty}" data-card-id="{name}" class="cardItem"></tr>'
-            )
+            parts.append(f'<tr data-required="{qty}" data-card-id="{name}" class="cardItem"></tr>')
         parts.append("</table>")
     parts.append("</body></html>")
     return "\n".join(parts)
@@ -648,11 +646,13 @@ def test_fetch_mtgdecks_returns_jobs():
     through the existing decklist parser. Mainboard `<th class="type X">`
     sections accumulate; only `<th class="type Sideboard">` flips the
     accumulator into the sideboard bucket."""
-    html = _mtgdecks_html([
-        ("Creature", [(2, "Beza, the Bounding Spring")]),
-        ("Instant", [(4, "Get Lost")]),
-        ("Sideboard", [(2, "Negate")]),
-    ])
+    html = _mtgdecks_html(
+        [
+            ("Creature", [(2, "Beza, the Bounding Spring")]),
+            ("Instant", [(4, "Get Lost")]),
+            ("Sideboard", [(2, "Negate")]),
+        ]
+    )
     responses.add(
         responses.GET,
         "https://mtgdecks.net/Standard/some-deck-1234",
@@ -682,10 +682,10 @@ def test_fetch_mtgdecks_decodes_html_entities():
     HTML entities in `data-card-id`; the scraper must decode them so
     Scryfall lookups succeed."""
     html = (
-        '<table>'
+        "<table>"
         '<tr><th colspan="3" class="type Artifact">Artifact</th></tr>'
         '<tr data-required="4" data-card-id="&#198;ther Vial" class="cardItem"></tr>'
-        '</table>'
+        "</table>"
     )
     responses.add(
         responses.GET,
