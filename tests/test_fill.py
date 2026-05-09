@@ -485,12 +485,17 @@ def test_fetch_moxfield_walks_deck_boards_and_sorts():
 @responses.activate
 def test_fetch_tappedout_returns_jobs():
     decklist = "3 Lightning Bolt\n1 Sol Ring\n\nSideboard\n2 Negate\n"
+    # Include the `?fmt=txt` query so the mock only matches if the fetcher
+    # actually uses the text-export endpoint. Without it, the bare URL would
+    # also match the HTML deck-view page and the test would pass even if the
+    # fetcher silently fell back to that.
     responses.add(
         responses.GET,
-        "https://tappedout.net/mtg-decks/test-slug/",
+        "https://tappedout.net/mtg-decks/test-slug/?fmt=txt",
         body=decklist,
         status=200,
         content_type="text/plain",
+        match=[responses.matchers.query_param_matcher({"fmt": "txt"})],
     )
     # Mock Scryfall name-resolution.
     for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
@@ -1545,16 +1550,30 @@ class TestParseCsvDecklist:
         assert fill._parse_csv_decklist(text) == []
 
     def test_invalid_qty_surfaces_warning(self, capsys):
-        # ManaBox occasionally exports `1.0` or empty Quantity; the parser
-        # silently skips those rows. The user needs to know — verify the
-        # WARNING is emitted to stdout listing the affected rows.
-        text = "Name,Quantity\nGood,1\nBad,abc\nFraction,1.5\n"
-        fill._parse_csv_decklist(text)
+        # Truly non-numeric qty rows surface a WARNING listing the affected
+        # rows. Float-shaped values like "1.0"/"1.5" are not warnings — they
+        # parse cleanly via int(float(...)) (see test_float_qty_accepted).
+        text = "Name,Quantity\nGood,1\nBad,abc\nAlsoBad,n/a\n"
+        rows = fill._parse_csv_decklist(text)
         out = capsys.readouterr().out
+        assert rows == [(1, "Good", None, None)]
         assert "WARNING:" in out
         assert "skipped 2" in out
         assert "Bad" in out
-        assert "Fraction" in out
+        assert "AlsoBad" in out
+
+    def test_float_qty_accepted(self, capsys):
+        # ManaBox sometimes exports Quantity as "1.0" (and other float-shaped
+        # variants) instead of "1". int(float(...)) parses those cleanly
+        # and matches the JS `Number(...)` behaviour — no WARNING, no drop.
+        text = 'Name,Quantity\n"Sol Ring","1.0"\n"Lightning Bolt","4.0"\n"Half","1.5"\n'
+        rows = fill._parse_csv_decklist(text)
+        assert rows == [
+            (1, "Sol Ring", None, None),
+            (4, "Lightning Bolt", None, None),
+            (1, "Half", None, None),  # int truncation: 1.5 → 1
+        ]
+        assert "WARNING:" not in capsys.readouterr().out
 
     def test_utf8_bom_prefixed_export(self):
         # ManaBox occasionally ships exports with a leading UTF-8 BOM.
