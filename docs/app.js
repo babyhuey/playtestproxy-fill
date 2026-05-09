@@ -35,6 +35,11 @@ const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
 const EDHREC_RE = /edhrec\.com\/deckpreview\/([A-Za-z0-9_-]+)/i;
 const DECKSTATS_RE = /deckstats\.net\/decks\/(\d+)\/(\d+)/i;
 const MTGGOLDFISH_RE = /mtggoldfish\.com\/(?:deck|archetype)\/(\d+)/i;
+// mtgdecks.net deck URLs end in `-<id>` (5+ digit numeric deck id) under a
+// format folder. Capture the path-after-host as one group; the trailing
+// `-<id>` anchor avoids matching archetype-listing URLs.
+const MTGDECKS_RE =
+  /mtgdecks\.net\/([A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+?-\d{4,})/i;
 // Scryfall deck UUIDs are the standard 8-4-4-4-12 hex shape; the `@<user>/`
 // segment is canonical but optional in the URL.
 const SCRYFALL_DECK_RE =
@@ -99,6 +104,8 @@ function detectSource(input) {
   if (m) return { source: "deckstats", args: [m[1], m[2]] };
   m = s.match(MTGGOLDFISH_RE);
   if (m) return { source: "mtggoldfish", args: [m[1]] };
+  m = s.match(MTGDECKS_RE);
+  if (m) return { source: "mtgdecks", args: [m[1]] };
   if (/^\d+$/.test(s)) return { source: "archidekt", args: [s] };
   if (/^[A-Za-z0-9_-]{12,}$/.test(s)) return { source: "moxfield", args: [s] };
   return null;
@@ -582,6 +589,77 @@ async function fetchDeckboxText(setId) {
       "Make the set public, or copy the decklist into the Paste decklist tab.",
     );
   }
+  return text;
+}
+
+// mtgdecks.net deck pages render every card as a `<tr class="cardItem"
+// data-required="N" data-card-id="Name">` row, grouped into `<table>`s
+// preceded by a `<th class="type X">` heading. The site sets
+// `Access-Control-Allow-Origin: *`, so the browser fetches directly. We
+// scrape the structured attributes and rebuild a plain-text decklist —
+// the existing parseDecklist + buildJobsFromDecklist pipeline does the rest.
+const MTGDECKS_TYPE_OR_CARD =
+  /<th\b[^>]*class="type\s+([A-Za-z]+)"|<tr\b[^>]*class="cardItem"[^>]*>/gi;
+const MTGDECKS_QTY = /data-required="(\d+)"/i;
+const MTGDECKS_NAME = /data-card-id="([^"]+)"/i;
+
+function decodeHtmlEntities(s) {
+  // The card-id attribute can carry `&amp;` / `&#xC6;` for `Æ`-class names.
+  // We reuse the minimal entity decoder from parseMtgoDek above.
+  const xmlEntities = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+  return s.replace(/&(?:(amp|lt|gt|quot|apos)|#(\d+)|#x([0-9a-fA-F]+));/g, (_, n, dec, hex) => {
+    if (n) return xmlEntities[n];
+    if (dec) return String.fromCodePoint(Number(dec));
+    return String.fromCodePoint(parseInt(hex, 16));
+  });
+}
+
+async function fetchMtgdecksText(path) {
+  const url = `https://mtgdecks.net/${path.replace(/^\/+/, "")}`;
+  let r;
+  try {
+    r = await fetch(url);
+  } catch {
+    r = null;
+  }
+  if (!r || !r.ok) {
+    if (r && r.status >= 400 && r.status < 500) {
+      throw new FatalFetchError(`${r.status} ${r.statusText}`);
+    }
+    // Fallback to the corsproxy in case the direct CORS allowance ever flips.
+    r = await fetch(CORS_PROXY(url));
+    if (!r.ok) {
+      if (r.status >= 400 && r.status < 500) {
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      throw new Error(`mtgdecks.net fetch failed: ${r.status}`);
+    }
+  }
+  const html = await r.text();
+  const main = [];
+  const side = [];
+  let inSideboard = false;
+  for (const m of html.matchAll(MTGDECKS_TYPE_OR_CARD)) {
+    if (m[1] !== undefined) {
+      inSideboard = m[1].toLowerCase() === "sideboard";
+      continue;
+    }
+    const row = m[0];
+    const qm = row.match(MTGDECKS_QTY);
+    const nm = row.match(MTGDECKS_NAME);
+    if (!qm || !nm) continue;
+    const qty = Number(qm[1]);
+    const name = decodeHtmlEntities(nm[1]).trim();
+    if (!Number.isFinite(qty) || qty <= 0 || !name) continue;
+    (inSideboard ? side : main).push(`${qty} ${name}`);
+  }
+  if (!main.length && !side.length) {
+    throw new Error(
+      "mtgdecks.net page parsed but no cards were found — the layout may have changed."
+    );
+  }
+  let text = main.join("\n");
+  if (side.length) text += "\n\nSideboard\n" + side.join("\n");
   return text;
 }
 
@@ -1405,7 +1483,7 @@ async function loadJobs(opts) {
   const detected = detectSource(els.input.value);
   if (!detected) {
     throw new Error(
-      "Paste an Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, or EDHREC URL/id."
+      "Paste an Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC, or mtgdecks.net URL/id."
     );
   }
   const { source, args } = detected;
@@ -1424,12 +1502,19 @@ async function loadJobs(opts) {
     );
   }
 
-  if (source === "tappedout" || source === "edhrec" || source === "scryfall" || source === "deckbox") {
+  if (
+    source === "tappedout" ||
+    source === "edhrec" ||
+    source === "scryfall" ||
+    source === "deckbox" ||
+    source === "mtgdecks"
+  ) {
     const labelMap = {
       tappedout: "TappedOut",
       edhrec: "EDHREC",
       scryfall: "Scryfall",
       deckbox: "Deckbox",
+      mtgdecks: "mtgdecks.net",
     };
     const human = labelMap[source];
     setStatus(`Fetching decklist from ${human}...`);
@@ -1438,6 +1523,7 @@ async function loadJobs(opts) {
       edhrec: fetchEdhrecDecklist,
       scryfall: fetchScryfallDeckText,
       deckbox: fetchDeckboxText,
+      mtgdecks: fetchMtgdecksText,
     };
     const text = await fetcherMap[source](args[0]);
     setStatus("Resolving cards via Scryfall...");
