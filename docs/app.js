@@ -347,7 +347,13 @@ function splitCsvLine(line) {
   return out;
 }
 
-function parseCsvDecklist(text) {
+function parseCsvDecklist(text, opts = {}) {
+  const includeSideboard = opts.includeSideboard === true;
+  // "considering" is always off-deck (Moxfield's "thinking about it" pile);
+  // sideboard/maybeboard follow the user option.
+  const excludedSections = includeSideboard
+    ? new Set(["considering"])
+    : CSV_EXCLUDED_SECTIONS;
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
   if (!lines.length) return [];
   const headers = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
@@ -370,7 +376,7 @@ function parseCsvDecklist(text) {
     const cells = splitCsvLine(lines[i]);
     if (sectionIdx !== -1) {
       const sec = (cells[sectionIdx] || "").trim().toLowerCase();
-      if (CSV_EXCLUDED_SECTIONS.has(sec)) continue;
+      if (excludedSections.has(sec)) continue;
     }
     const qty = Number((cells[qtyIdx] || "0").trim());
     const name = (cells[nameIdx] || "").trim();
@@ -382,14 +388,20 @@ function parseCsvDecklist(text) {
   return out;
 }
 
-function parseDecklist(text) {
+function parseDecklist(text, opts = {}) {
   const head = text.trimStart();
   if (head.startsWith("<?xml") || head.startsWith("<Deck")) {
     return parseMtgoDek(text);
   }
   if (looksLikeCsv(text)) {
-    return parseCsvDecklist(text);
+    return parseCsvDecklist(text, opts);
   }
+  // includeSideboard flips ONLY sideboard / maybeboard back into the deck.
+  // Other off-deck sections (companion, tokens, considering, cut, extra) stay
+  // excluded — tokens have their own printing pipeline, and the rest are
+  // parking lots that aren't part of the played deck.
+  const includeSideboard = opts.includeSideboard === true;
+  const MAIN_SECTIONS = ["deck", "main", "mainboard", "commander", "commanders"];
   const out = [];
   let inExcluded = false;
   for (const raw of text.split(/\r?\n/)) {
@@ -398,11 +410,14 @@ function parseDecklist(text) {
     const sec = line.match(SECTION_HEADER);
     if (sec) {
       const name = sec[1].toLowerCase();
-      inExcluded = !["deck", "main", "mainboard", "commander", "commanders"].includes(name);
+      const isMain = MAIN_SECTIONS.includes(name);
+      const isSideOrMaybe = name === "sideboard" || name === "maybeboard";
+      inExcluded = !isMain && !(includeSideboard && isSideOrMaybe);
       continue;
     }
     if (line.trim().startsWith("//") || line.trim().startsWith("#")) continue;
-    if (inExcluded || line.trim().startsWith("SB:")) continue;
+    if (inExcluded) continue;
+    if (line.trim().startsWith("SB:") && !includeSideboard) continue;
     const m = line.match(DECKLIST_LINE);
     if (!m) continue;
     out.push({
@@ -446,8 +461,8 @@ async function scryfallLookupNamed(name, setCode, cn) {
   });
 }
 
-async function buildJobsFromDecklist(text, onProgress) {
-  const parsed = parseDecklist(text);
+async function buildJobsFromDecklist(text, opts, onProgress) {
+  const parsed = parseDecklist(text, { includeSideboard: !(opts && opts.skipSide) });
   if (!parsed.length) throw new Error("Couldn't parse any cards from the decklist.");
   if (parsed.length > MAX_DECKLIST_ENTRIES) {
     throw new Error(
@@ -1380,7 +1395,7 @@ async function loadJobs(opts) {
     setStatus("Resolving cards via Scryfall...");
     const total = (text.match(/^\s*\d+\s/gm) || []).length;
     setProgress(0, total || 1);
-    const { jobs, unresolved } = await buildJobsFromDecklist(text, (i, n, name) => {
+    const { jobs, unresolved } = await buildJobsFromDecklist(text, opts, (i, n, name) => {
       setProgress(i, n);
       setStatus(`Resolving ${i}/${n}: ${name}`);
     });
@@ -1428,7 +1443,7 @@ async function loadJobs(opts) {
     setStatus("Resolving cards via Scryfall...");
     const total = (text.match(/^\s*\d+\s/gm) || []).length;
     setProgress(0, total || 1);
-    const { jobs, unresolved } = await buildJobsFromDecklist(text, (i, n, name) => {
+    const { jobs, unresolved } = await buildJobsFromDecklist(text, opts, (i, n, name) => {
       setProgress(i, n);
       setStatus(`Resolving ${i}/${n}: ${name}`);
     });
