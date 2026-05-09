@@ -26,11 +26,11 @@ python3 -m venv .venv
 
 ## CI
 
-Two workflows gate every PR:
-- **CI** — Python lint/format/import-smoke + pytest with coverage, plus `node --check` on the static frontend.
-- **CodeQL** — security + maintainability scan on Python and JS, weekly on `main`.
+Two workflows run on every PR:
+- **CI** — Python lint/format/import-smoke + pytest with coverage, plus `node --check` and asset-presence on the static frontend.
+- **CodeQL** — security + maintainability scan on Python and JS; also runs weekly on `main` (Monday 14:37 UTC).
 
-Branch protection on `main` requires both green before merge.
+Both should be green before merge. Branch protection isn't currently configured, so the gate is convention rather than enforcement — please don't merge red PRs.
 
 ## Dependabot
 
