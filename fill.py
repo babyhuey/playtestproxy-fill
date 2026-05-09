@@ -381,10 +381,11 @@ def _parse_csv_decklist(text: str) -> list[tuple[int, str, str | None, str | Non
                 continue
         raw_qty = str(row.get(qty_key) or "0").strip()
         try:
-            qty = int(raw_qty)
+            # `int(float(...))` so ManaBox-style "1.0" parses as 1 (matches
+            # the JS `Number(...)` parity). True garbage ("abc", "x") still
+            # raises ValueError → row surfaces in the WARNING below.
+            qty = int(float(raw_qty))
         except ValueError:
-            # ManaBox occasionally exports `1.0` or empty — surface the
-            # count rather than silently dropping rows the user expected.
             name_for_log = (row.get(name_key) or "?").strip() or "?"
             bad_qty_rows.append(f"{name_for_log!r} (qty={raw_qty!r})")
             continue
@@ -1243,22 +1244,39 @@ def resolve_urls(
     intentional than an inferred token-pairing."""
     front_override = override_dir / f"{slug(job.name)}.png"
     back_override = override_dir / f"{slug(job.name)}.back.png"
+
+    # Resolve front and back independently so a front-only override on a DFC
+    # still picks up the Scryfall back face. Earlier shape collapsed to
+    # `(front, None)` whenever front_override existed without back_override,
+    # silently dropping the transform back.
+    need_scryfall_front = (
+        not front_override.exists() and not job.custom_image_url and job.scryfall_uid
+    )
+    need_scryfall_back = not back_override.exists() and not job.pair_back_uid and job.scryfall_uid
+    scry_front: str | None = None
+    scry_back: str | None = None
+    if need_scryfall_front or need_scryfall_back:
+        scry_front, scry_back = scryfall_image_urls(job.scryfall_uid, session)
+
     if front_override.exists():
         front = f"file://{front_override.resolve()}"
-        back = f"file://{back_override.resolve()}" if back_override.exists() else None
-        if back:
-            return front, back
     elif job.custom_image_url:
-        front, back = job.custom_image_url, None
-    elif job.scryfall_uid:
-        front, back = scryfall_image_urls(job.scryfall_uid, session)
+        front = job.custom_image_url
+    elif need_scryfall_front:
+        front = scry_front
     else:
         raise RuntimeError(f"No image source for {job.name}")
 
-    if job.pair_back_uid:
-        # Tokens are always single-faced, so the second tuple element from
-        # scryfall_image_urls is irrelevant.
+    if back_override.exists():
+        back = f"file://{back_override.resolve()}"
+    elif job.pair_back_uid:
+        # Tokens are usually single-faced, so the second tuple element from
+        # scryfall_image_urls is irrelevant for the common case.
         back, _ = scryfall_image_urls(job.pair_back_uid, session)
+    elif need_scryfall_back:
+        back = scry_back
+    else:
+        back = None
     return front, back
 
 

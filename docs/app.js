@@ -213,6 +213,22 @@ async function fetchBlob(url) {
   });
 }
 
+async function fetchJsonScryfall(url) {
+  // Scryfall has open CORS — never proxy. Footer promises "Scryfall is fetched
+  // directly". The generic fetchJson() falls through to corsproxy.io on 5xx,
+  // which would leak the user's full card list to the proxy operator during
+  // any Scryfall outage. Retry direct instead; if Scryfall is down, the proxy
+  // would just forward the same upstream error anyway.
+  return withRetry(async () => {
+    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    if (r.ok) return parseJsonStrict(r);
+    if (r.status >= 400 && r.status < 500 && r.status !== 429) {
+      throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
+    }
+    throw new Error(`Scryfall ${r.status} ${r.statusText}`);
+  });
+}
+
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
 async function loadCustomBackBlob() {
@@ -401,19 +417,33 @@ function parseDecklist(text) {
 
 async function scryfallLookupNamed(name, setCode, cn) {
   // Scryfall has open CORS, so direct fetch is fine.
-  if (setCode && cn) {
-    const r = await fetch(SCRYFALL_BY_SET(setCode, cn));
-    if (r.ok) return (await r.json()).id;
-  }
-  const params = new URLSearchParams({ exact: name });
-  if (setCode) params.set("set", setCode);
-  let r = await fetch(`${SCRYFALL_NAMED}?${params}`);
-  if (r.ok) return (await r.json()).id;
-  if (r.status === 404 && setCode) {
-    r = await fetch(`${SCRYFALL_NAMED}?exact=${encodeURIComponent(name)}`);
-    if (r.ok) return (await r.json()).id;
-  }
-  return null;
+  // Wrapped in withRetry so a 429 / 5xx / network blip doesn't silently mark
+  // the card as unresolved. Only a final 404 (card genuinely not found) or
+  // an explicit fatal 4xx returns null/throws — transient errors retry.
+  const tryGet = async (url) => {
+    const r = await fetch(url);
+    if (r.ok) return { id: (await r.json()).id, status: 200 };
+    if (r.status === 404) return { id: null, status: 404 };
+    if (r.status === 429 || r.status >= 500) {
+      throw new Error(`Scryfall ${r.status} ${r.statusText}`);
+    }
+    throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
+  };
+  return withRetry(async () => {
+    if (setCode && cn) {
+      const r = await tryGet(SCRYFALL_BY_SET(setCode, cn));
+      if (r.id) return r.id;
+    }
+    const params = new URLSearchParams({ exact: name });
+    if (setCode) params.set("set", setCode);
+    const named = await tryGet(`${SCRYFALL_NAMED}?${params}`);
+    if (named.id) return named.id;
+    if (named.status === 404 && setCode) {
+      const fallback = await tryGet(`${SCRYFALL_NAMED}?exact=${encodeURIComponent(name)}`);
+      if (fallback.id) return fallback.id;
+    }
+    return null;
+  });
 }
 
 async function buildJobsFromDecklist(text, onProgress) {
@@ -573,7 +603,11 @@ function buildJobsArchidekt(deck, opts) {
   for (const entry of deck.cards || []) {
     const cats = entry.categories || [];
     const primary = cats[0] || null;
-    if (opts.skipSide && primary && excludedPrimary.has(primary)) continue;
+    // Archidekt's `includedInDeck=false` categories are an explicit out-of-deck
+    // signal (sideboard / maybeboard / scratchpad). Always exclude them — the
+    // CLI does, and gating on opts.skipSide silently leaked sideboards into
+    // browser builds when the user unchecked "Skip sideboard".
+    if (primary && excludedPrimary.has(primary)) continue;
     const card = entry.card || {};
     const oracle = card.oracleCard || {};
     const customUrl =
@@ -678,7 +712,7 @@ function scryfallCard(uid) {
       return stored.data;
     }
     await new Promise((r) => setTimeout(r, 80));  // Scryfall rate-limit politeness
-    const data = await fetchJson(SCRYFALL(uid));
+    const data = await fetchJsonScryfall(SCRYFALL(uid));
     // Best-effort persist; awaiting is cheap because IDB writes are async-batched.
     idbSet(uid, { data, fetchedAt: Date.now() });
     return data;
@@ -713,13 +747,14 @@ async function _resolveSingle(job) {
 async function resolveUrls(job) {
   // Returns { front, back }. `back` is null unless this is a DFC OR the
   // job carries a `pairBackUid` (set by pairTokens() to print two tokens
-  // back-to-back). Tokens are always single-faced, so the paired back is
-  // just that other card's front face.
+  // back-to-back). The paired back is the OTHER token's front face — and
+  // some "tokens" (e.g. werewolf transform tokens) are themselves DFCs
+  // whose image lives on card_faces[0], not top-level image_uris. Reuse
+  // _resolveSingle so we get the same DFC handling as a normal job.
   const own = await _resolveSingle(job);
   if (job.pairBackUid) {
-    const other = await scryfallCard(job.pairBackUid);
-    const back = other.image_uris ? other.image_uris.png : null;
-    return { front: own.front, back };
+    const other = await _resolveSingle({ uid: job.pairBackUid, customUrl: null });
+    return { front: own.front, back: other.front };
   }
   return own;
 }
