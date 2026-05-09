@@ -229,11 +229,13 @@ upload.py <images_dir>
 
 ## Notes
 
-- The Archidekt / Moxfield JSON APIs are undocumented but stable. Both
-  CORS-block, so the web frontend routes their calls through
-  [corsproxy.io](https://corsproxy.io/). Scryfall has open CORS and is
-  fetched directly. The footer of the web app discloses the proxy
-  relationship.
+- Deck-builder traffic from the web frontend that CORS-blocks
+  (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through
+  [corsproxy.io](https://corsproxy.io/); Scryfall and mtgdecks.net send
+  `Access-Control-Allow-Origin: *` and are fetched directly (with a
+  corsproxy fallback for mtgdecks in case that ever changes). The
+  Archidekt / Moxfield JSON APIs are undocumented but have proven
+  stable. The footer of the web app discloses the proxy relationship.
 - Scryfall calls are globally rate-limited to ~10/s (their published cap)
   via a thread-shared lock in the CLI; the frontend uses the same 80–100ms
   gate.
