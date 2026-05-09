@@ -34,7 +34,7 @@ Two workflows run on every PR:
 - **CI** — Python lint/format/import-smoke + pytest with coverage, plus `node --check` and asset-presence on the static frontend.
 - **CodeQL** — security + maintainability scan on Python and JS; also runs weekly on `main` (Monday 14:37 UTC).
 
-Both should be green before merge. Branch protection isn't currently configured, so the gate is convention rather than enforcement — please don't merge red PRs.
+Both must be green before merge — branch protection on `main` requires the **Python — lint + import smoke test** and **Frontend — syntax + presence checks** contexts to pass. Force-pushes and branch deletion on `main` are disabled. Admins aren't bound by the rule, so emergency overrides are still possible from the GitHub UI.
 
 ## Dependabot
 
