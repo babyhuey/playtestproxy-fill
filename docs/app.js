@@ -36,6 +36,10 @@ const SCRYFALL_COLLECTION = "https://api.scryfall.com/cards/collection";
 // API applies on overage.
 const SCRYFALL_COLLECTION_BATCH_SIZE = 75;
 const SCRYFALL_NAMED_INTERVAL_MS = 550;
+// Per-card /cards/named calls (the unresolved-name fallback chain) are one
+// card per request, so we can stay comfortably under 2 req/sec with a short
+// gap — Scryfall's docs explicitly recommend 50–100ms for single-card calls.
+const SCRYFALL_SINGLE_INTERVAL_MS = 110;
 // Scryfall locks out for 30s on a 429. If a response omits Retry-After we
 // fall back to this (with a 2s cushion) so withRetry's last attempt lands
 // after the lockout has cleared instead of inside it.
@@ -609,6 +613,66 @@ function setCnKey(set, cn) {
   return `${(set || "").toLowerCase()}/${(cn || "").toLowerCase()}`;
 }
 
+async function scryfallResolveSingleName(name) {
+  // Per-card fallback for inputs that /cards/collection rejected. The bulk
+  // endpoint is stricter than /cards/named for some valid names — notably
+  // `_____` (Unhinged) and joined split/flip names like `Curse of the Fire
+  // Penguin // Curse of the Fire Penguin Creature`, both of which exist on
+  // Scryfall but the bulk endpoint returns them in `not_found`.
+  //
+  // Three lookups, in order, each short-circuiting on success:
+  //   1. /cards/named?exact   — rescues bulk-endpoint rejections.
+  //   2. Trailing-CN split    — for bare inputs like `B.F.M. (Big Furry
+  //      Monster) 28`, strip the trailing collector-number token, resolve
+  //      the prefix to discover the set, then look up {set}/{cn} so 28 and
+  //      29 map to distinct halves of BFM.
+  //   3. /cards/named?fuzzy   — last resort. Rescues Un-set variant suffixes
+  //      like `Sly Spy A` / `Everythingamajig A` by matching the closest
+  //      card; the user loses variant specificity but gets a printable card
+  //      instead of a silent failure.
+  const tryGet = async (url) => {
+    const r = await fetch(url);
+    if (r.ok) return await r.json();
+    if (r.status === 404) return null;
+    if (r.status === 429) {
+      const ra = parseRetryAfter(r.headers.get("Retry-After"));
+      throw new RateLimitError(`Scryfall 429 Too Many Requests`, ra ?? SCRYFALL_429_FALLBACK_MS);
+    }
+    if (r.status >= 500) throw new Error(`Scryfall ${r.status} ${r.statusText}`);
+    throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
+  };
+  return withRetry(async () => {
+    const exact = await tryGet(`${SCRYFALL_NAMED}?${new URLSearchParams({ exact: name })}`);
+    if (exact?.id) return exact.id;
+
+    const cnSplit = name.match(/^(.+?)\s+(\d+[a-zA-Z]?)\s*$/);
+    if (cnSplit) {
+      const prefix = cnSplit[1].trim();
+      const cn = cnSplit[2].toLowerCase();
+      let setHint = null;
+      const prefExact = await tryGet(
+        `${SCRYFALL_NAMED}?${new URLSearchParams({ exact: prefix })}`,
+      );
+      if (prefExact?.set) setHint = prefExact.set;
+      if (!setHint) {
+        const prefFuzzy = await tryGet(
+          `${SCRYFALL_NAMED}?${new URLSearchParams({ fuzzy: prefix })}`,
+        );
+        if (prefFuzzy?.set) setHint = prefFuzzy.set;
+      }
+      if (setHint) {
+        const specific = await tryGet(SCRYFALL_BY_SET(setHint, cn));
+        if (specific?.id) return specific.id;
+      }
+    }
+
+    const fuzzy = await tryGet(`${SCRYFALL_NAMED}?${new URLSearchParams({ fuzzy: name })}`);
+    if (fuzzy?.id) return fuzzy.id;
+
+    return null;
+  });
+}
+
 function indexScryfallByInputs(chunkIdentifiers, chunkParsed, matches, notFound, uidByName, uidBySetCn) {
   // Scryfall's /cards/collection returns `data` in the same order as input
   // identifiers, minus any items echoed in `not_found`. Walk both arrays in
@@ -699,6 +763,31 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
     const { matches, notFound } = await scryfallCollection(idChunk);
     indexScryfallCards(matches, uidByLowerName);
     indexScryfallByInputs(idChunk, chunk, matches, notFound, uidByLowerName, uidBySetCn);
+  }
+
+  // Third pass: per-card /cards/named for items still unresolved after the
+  // bulk lookups. /cards/collection rejects some names that /cards/named
+  // accepts (e.g. `_____`, `Curse of the Fire Penguin // ...`); also covers
+  // trailing-CN bare inputs (`B.F.M. (Big Furry Monster) 28`) and Un-set
+  // variant suffixes (`Sly Spy A`). Deduped on lowercased name so a paste
+  // with many copies of the same unresolved card hits Scryfall once.
+  const stillUnresolvedNames = new Map();
+  for (const p of parsed) {
+    const key = p.name.toLowerCase();
+    if (uidByLowerName.has(key)) continue;
+    if (p.set && p.cn && uidBySetCn.has(setCnKey(p.set, p.cn))) continue;
+    if (!stillUnresolvedNames.has(key)) stillUnresolvedNames.set(key, p.name);
+  }
+  let firstSingle = true;
+  for (const [key, originalName] of stillUnresolvedNames) {
+    if (!firstSingle) await new Promise((r) => setTimeout(r, SCRYFALL_SINGLE_INTERVAL_MS));
+    firstSingle = false;
+    try {
+      const uid = await scryfallResolveSingleName(originalName);
+      if (uid) uidByLowerName.set(key, uid);
+    } catch (_) {
+      // Transient failure — leave unresolved; user retry path still works.
+    }
   }
 
   const jobs = [];
