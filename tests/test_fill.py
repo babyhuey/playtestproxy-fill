@@ -290,6 +290,39 @@ class TestParseDecklist:
             (1, "Sol Ring", None, None),
         ]
 
+    def test_type_group_headers_are_transparent(self):
+        # Moxfield / Archidekt / TappedOut human-readable exports group cards
+        # under type headers ("Creatures (20)", "Lands (24)", etc.). Before
+        # the section regex was extended, those headers fell through to the
+        # bare-name fallback and became qty=1 cards that Scryfall would 404.
+        # Now they're recognised but transparent — the cards underneath stay
+        # in the same section the prior structural header set.
+        text = (
+            "Creatures (3)\n1 Birds of Paradise\nInstants\n1 Lightning Bolt\nLands (1)\n1 Forest\n"
+        )
+        assert fill._parse_decklist(text) == [
+            (1, "Birds of Paradise", None, None),
+            (1, "Lightning Bolt", None, None),
+            (1, "Forest", None, None),
+        ]
+
+    def test_type_group_headers_dont_leak_into_sideboard(self):
+        # `Creatures` under a `Sideboard` header should stay sideboard-only
+        # — it's transparent, not a new section start.
+        text = "1 Sol Ring\nSideboard\nCreatures\n2 Negate\n"
+        # Sideboard always excluded for the Python CLI.
+        assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
+
+    def test_type_group_headers_dont_swallow_real_card_names(self):
+        # Real cards like "Land Tax", "Spell Pierce", "Creature Guy" mustn't
+        # match the type-group regex — it anchors on the whole trimmed line.
+        text = "1 Land Tax\n1 Spell Pierce\n1 Creature Guy\n"
+        assert fill._parse_decklist(text) == [
+            (1, "Land Tax", None, None),
+            (1, "Spell Pierce", None, None),
+            (1, "Creature Guy", None, None),
+        ]
+
     def test_empty(self):
         assert fill._parse_decklist("") == []
 
@@ -905,6 +938,97 @@ def test_jobs_from_decklist_falls_back_to_name_when_set_cn_misses():
     assert len(jobs) == 1
     assert jobs[0].name == "Sol Ring"
     assert jobs[0].scryfall_uid == "sr-uid"
+
+
+@responses.activate
+def test_jobs_from_decklist_retries_on_429_with_retry_after(monkeypatch):
+    # A 429 from /cards/collection used to crash the CLI run via
+    # `raise_for_status`. The wrapper now honours `Retry-After`, sleeps, and
+    # retries. Monkeypatching `time.sleep` keeps the test fast and lets us
+    # assert the requested delay was respected.
+    sleeps: list[float] = []
+    monkeypatch.setattr(fill.time, "sleep", lambda s: sleeps.append(s))
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={"details": "Too Many Requests"},
+        status=429,
+        headers={"Retry-After": "2"},
+    )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "lb-uid", "name": "Lightning Bolt"}],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist("1 Lightning Bolt")
+    assert len(jobs) == 1
+    assert jobs[0].scryfall_uid == "lb-uid"
+    # 2 seconds from the Retry-After header should land in the recorded
+    # sleeps (any other sleeps in `_scryfall_wait` are < 1s and tolerated).
+    assert 2.0 in sleeps
+
+
+@responses.activate
+def test_jobs_from_decklist_429_falls_back_when_retry_after_missing(monkeypatch):
+    # When Scryfall returns a 429 without a Retry-After header (their docs
+    # describe a 30-second lockout), we wait `_SCRYFALL_429_FALLBACK_SECONDS`
+    # so the next attempt lands safely outside the cooldown window.
+    sleeps: list[float] = []
+    monkeypatch.setattr(fill.time, "sleep", lambda s: sleeps.append(s))
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={"details": "Too Many Requests"},
+        status=429,
+    )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "lb-uid", "name": "Lightning Bolt"}],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist("1 Lightning Bolt")
+    assert len(jobs) == 1
+    assert fill._SCRYFALL_429_FALLBACK_SECONDS in sleeps
+
+
+@responses.activate
+def test_jobs_from_decklist_paces_550ms_between_batches(monkeypatch):
+    # /cards/collection is rate-limited at 2 req/sec. The Python loop must
+    # sleep `_SCRYFALL_COLLECTION_INTERVAL` between batches (mirrors the JS
+    # `setTimeout(SCRYFALL_NAMED_INTERVAL_MS)` in buildJobsFromDecklist).
+    sleeps: list[float] = []
+    monkeypatch.setattr(fill.time, "sleep", lambda s: sleeps.append(s))
+    # Two-batch input (76 cards → batch1=75, batch2=1). Names are unique so
+    # every card resolves and no fallback pass runs.
+    parsed_text = "\n".join(f"1 Card{i:03d}" for i in range(76))
+    data = [{"id": f"uid-{i:03d}", "name": f"Card{i:03d}"} for i in range(76)]
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={"object": "list", "data": data[:75], "not_found": []},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={"object": "list", "data": data[75:], "not_found": []},
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(parsed_text)
+    assert len(jobs) == 76
+    # Exactly one `_SCRYFALL_COLLECTION_INTERVAL` sleep between the two
+    # batches (the first batch fires immediately).
+    assert sleeps.count(fill._SCRYFALL_COLLECTION_INTERVAL) == 1
 
 
 @responses.activate

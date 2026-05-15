@@ -318,12 +318,47 @@ _DECKLIST_LINE = re.compile(
 # "Deck (99)", "Companion (0)" etc. Without it, the unrecognised header keeps
 # whatever `in_excluded` state the prior recognised header set, which silently
 # drops the entire mainboard if Companion/Tokens appear first.
+#
+# Type-grouping headers (`Creatures`, `Lands`, `Spells`, etc.) are also matched
+# so they don't fall through to the bare-name fallback and become qty=1 cards.
+# They're handled as TRANSPARENT headers — recognised and skipped, but the
+# `in_excluded` state isn't touched, so the cards under them stay in whatever
+# section (deck / sideboard / etc.) the prior structural header set.
 _SECTION_HEADERS = re.compile(
     r"^\s*(?://|#|--)?\s*"
     r"(sideboard|maybeboard|considering|companion|tokens?|cut|extra"
-    r"|deck|main|mainboard|commanders?)"
+    r"|deck|main|mainboard|commanders?"
+    r"|creatures?|instants?|sorceries|sorcery|artifacts?"
+    r"|enchantments?|planeswalkers?|lands?|battles?|spells?)"
     r"(?:\s+\(\d+\))?\s*:?\s*$",
     re.I,
+)
+# Transparent type-grouping headers — recognised so they don't become bogus
+# qty=1 cards, but they don't flip `in_excluded`. Real card names like
+# `Land Tax`, `Spell Pierce`, `Creature Guy` aren't affected because the
+# section regex anchors `^…$` on the whole trimmed line — only a bare
+# `Creatures` or `Lands (24)` matches.
+_TYPE_GROUP_HEADERS = frozenset(
+    {
+        "creature",
+        "creatures",
+        "instant",
+        "instants",
+        "sorcery",
+        "sorceries",
+        "artifact",
+        "artifacts",
+        "enchantment",
+        "enchantments",
+        "planeswalker",
+        "planeswalkers",
+        "land",
+        "lands",
+        "battle",
+        "battles",
+        "spell",
+        "spells",
+    }
 )
 
 
@@ -470,7 +505,14 @@ def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
             continue
         sec = _SECTION_HEADERS.match(line)
         if sec:
-            in_excluded = sec.group(1).lower() not in {
+            name = sec.group(1).lower()
+            if name in _TYPE_GROUP_HEADERS:
+                # Transparent — skip the header line but leave `in_excluded`
+                # alone so cards under `Creatures` / `Lands` etc. stay in
+                # whatever section (deck / sideboard) the prior structural
+                # header set.
+                continue
+            in_excluded = name not in {
                 "deck",
                 "main",
                 "mainboard",
@@ -548,6 +590,12 @@ def _scryfall_lookup_named(
 # is rate-limited at 2 req/sec (500ms gap) like /cards/named, so a 480-card
 # deck resolves in ~7 batched calls instead of 480 per-card lookups.
 _SCRYFALL_COLLECTION_BATCH_SIZE = 75
+# Explicit inter-batch sleep between /cards/collection calls. The global
+# `_scryfall_wait` is calibrated for /cards/<uid> (10 req/sec); collection
+# needs the 2 req/sec floor instead, so the loop in `_jobs_from_decklist`
+# sleeps this long between batches. Mirrors `SCRYFALL_NAMED_INTERVAL_MS = 550`
+# in docs/app.js — the 50ms margin over 500ms keeps us safely under the cap.
+_SCRYFALL_COLLECTION_INTERVAL = 0.55
 
 
 def _index_scryfall_cards(cards: list[dict], target: dict[str, str]) -> None:
@@ -571,22 +619,76 @@ def _index_scryfall_cards(cards: list[dict], target: dict[str, str]) -> None:
             target.setdefault(key, uid)
 
 
+# Scryfall's docs: a 429 imposes a 30-second IP lockout. 32s puts the next
+# attempt safely outside that window when the response omits Retry-After.
+_SCRYFALL_429_FALLBACK_SECONDS = 32.0
+
+
+def _parse_retry_after(header: str | None) -> float | None:
+    """Parse a Retry-After header (RFC 7231 §7.1.3). Accepts either
+    delta-seconds or an HTTP-date. Returns seconds (float) or None when the
+    header is missing or unparseable."""
+    if not header:
+        return None
+    try:
+        seconds = float(header)
+    except ValueError:
+        pass
+    else:
+        return seconds if seconds >= 0 else None
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(header)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
 def _scryfall_collection_lookup(
-    identifiers: list[dict], session: requests.Session
+    identifiers: list[dict],
+    session: requests.Session,
+    attempts: int = 3,
 ) -> tuple[list[dict], list[dict]]:
     """POST a batch of identifiers (≤ 75) to /cards/collection. Returns
-    (matches, not_found). Caller is responsible for honouring the 500ms
-    pacing gate between batches via `_scryfall_wait`."""
-    _scryfall_wait()
-    r = session.post(
-        "https://api.scryfall.com/cards/collection",
-        headers={**UA, "Content-Type": "application/json"},
-        json={"identifiers": identifiers},
-        timeout=30,
-    )
-    r.raise_for_status()
-    payload = r.json()
-    return payload.get("data") or [], payload.get("not_found") or []
+    (matches, not_found). Owns its own 100ms `_scryfall_wait` gate, and
+    catches 429 by honouring the response's `Retry-After` header (or
+    `_SCRYFALL_429_FALLBACK_SECONDS` when absent) — Scryfall's 30s lockout
+    eats short exponential backoffs, so we wait the full window before the
+    next attempt. Mirrors `scryfallCollection` in docs/app.js."""
+    last_error: requests.HTTPError | None = None
+    for attempt in range(attempts):
+        _scryfall_wait()
+        r = session.post(
+            "https://api.scryfall.com/cards/collection",
+            headers={**UA, "Content-Type": "application/json"},
+            json={"identifiers": identifiers},
+            timeout=30,
+        )
+        if r.status_code == 429 and attempt < attempts - 1:
+            delay = _parse_retry_after(r.headers.get("Retry-After"))
+            if delay is None:
+                delay = _SCRYFALL_429_FALLBACK_SECONDS
+            time.sleep(delay)
+            continue
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as err:
+            last_error = err
+            if 500 <= r.status_code < 600 and attempt < attempts - 1:
+                # Transient 5xx — short backoff then retry.
+                time.sleep(0.5 * (2**attempt))
+                continue
+            raise
+        payload = r.json()
+        return payload.get("data") or [], payload.get("not_found") or []
+    # Loop exited without returning — re-raise the most recent error so the
+    # caller sees the original HTTP failure rather than a silent empty result.
+    assert last_error is not None
+    raise last_error
 
 
 def _jobs_from_decklist(text: str) -> list[CardJob]:
@@ -606,15 +708,19 @@ def _jobs_from_decklist(text: str) -> list[CardJob]:
     ]
     uid_by_lower_name: dict[str, str] = {}
     for i in range(0, len(identifiers), _SCRYFALL_COLLECTION_BATCH_SIZE):
+        if i > 0:
+            time.sleep(_SCRYFALL_COLLECTION_INTERVAL)
         chunk = identifiers[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]
         matches, _ = _scryfall_collection_lookup(chunk, session)
         _index_scryfall_cards(matches, uid_by_lower_name)
 
     # Second pass for the (set, cn) entries that didn't resolve — retry as
     # bare name. Matches the existing 404-with-set fallback in
-    # `_scryfall_lookup_named`.
+    # `_scryfall_lookup_named`. Sleep on every iteration (including the
+    # first) so the transition from the last main-pass batch is also paced.
     fallback = [(n,) for _, n, s, c in parsed if (s or c) and n.lower() not in uid_by_lower_name]
     for i in range(0, len(fallback), _SCRYFALL_COLLECTION_BATCH_SIZE):
+        time.sleep(_SCRYFALL_COLLECTION_INTERVAL)
         chunk = [{"name": t[0]} for t in fallback[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]]
         matches, _ = _scryfall_collection_lookup(chunk, session)
         _index_scryfall_cards(matches, uid_by_lower_name)
