@@ -426,13 +426,27 @@ function parseDecklist(text, opts = {}) {
     if (inExcluded) continue;
     if (line.trim().startsWith("SB:") && !includeSideboard) continue;
     const m = line.match(DECKLIST_LINE);
-    if (!m) continue;
-    out.push({
-      qty: Number(m[1]),
-      name: m[2].trim().replace(/,$/, ""),
-      set: (m[3] || "").toLowerCase() || null,
-      cn: m[4] || null,
-    });
+    if (m) {
+      out.push({
+        qty: Number(m[1]),
+        name: m[2].trim().replace(/,$/, ""),
+        set: (m[3] || "").toLowerCase() || null,
+        cn: m[4] || null,
+      });
+      continue;
+    }
+    // Bare-name fallback (no leading quantity). Mirrors fill.py:_parse_decklist.
+    // Lets users paste raw name-per-line lists (wiki dumps, Scryfall search,
+    // set-completion lists) without prefixing each line with "1 ", and
+    // rescues card names whose parens aren't a set code (e.g. "B.F.M. (Big
+    // Furry Monster)", "Hazmat Suit (Used)"). Lines whose first non-whitespace
+    // character is a digit are skipped — a typo like "1Lightning" shouldn't
+    // silently become a card named "1Lightning". An "SB:" prefix is stripped
+    // so a bare-name sideboard line is included only when sideboard is on.
+    let bare = line.trim();
+    if (bare.startsWith("SB:")) bare = bare.slice(3).trim();
+    if (!bare || /^\d/.test(bare)) continue;
+    out.push({ qty: 1, name: bare, set: null, cn: null });
   }
   return out;
 }
