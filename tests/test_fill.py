@@ -246,9 +246,49 @@ class TestParseDecklist:
             (1, "Venat, Heart of Hydaelyn // Hydaelyn, the Mothercrystal", None, None),
         ]
 
-    def test_unparseable_line_skipped(self):
-        text = "garbage line\n1 Sol Ring\nmore garbage"
-        assert fill._parse_decklist(text) == [(1, "Sol Ring", None, None)]
+    def test_bare_name_lines_treated_as_qty_one(self):
+        # Real-world: wiki dumps, Scryfall search-result text, set-completion
+        # lists — users paste card names with no leading quantity. Mixed
+        # qty-prefixed and bare-name lines coexist in one input.
+        text = "Lightning Bolt\n1 Sol Ring\nCounterspell"
+        assert fill._parse_decklist(text) == [
+            (1, "Lightning Bolt", None, None),
+            (1, "Sol Ring", None, None),
+            (1, "Counterspell", None, None),
+        ]
+
+    def test_bare_name_with_parens_in_name(self):
+        # Card names that contain parentheses ("B.F.M. (Big Furry Monster)",
+        # "Hazmat Suit (Used)") don't fit the strict regex's set-code shape
+        # — the bare-name fallback keeps the whole line as the name.
+        text = "B.F.M. (Big Furry Monster)\nHazmat Suit (Used)\n_____"
+        assert fill._parse_decklist(text) == [
+            (1, "B.F.M. (Big Furry Monster)", None, None),
+            (1, "Hazmat Suit (Used)", None, None),
+            (1, "_____", None, None),
+        ]
+
+    def test_bare_name_respects_section_and_comment_filters(self):
+        # The bare-name fallback runs AFTER section / comment / SB filters,
+        # so structural lines don't accidentally become card names.
+        text = (
+            "Lightning Bolt\n"
+            "// a comment\n"
+            "# another comment\n"
+            "Sideboard\n"
+            "Counterspell\n"
+            "Tokens\n"
+            "Goblin Token\n"
+        )
+        assert fill._parse_decklist(text) == [(1, "Lightning Bolt", None, None)]
+
+    def test_bare_name_skips_lines_starting_with_digit(self):
+        # "1Lightning" shouldn't silently become a card named "1Lightning"
+        # — it's almost certainly a missing-space typo and should be dropped
+        # the same way it was before the bare-name fallback existed.
+        assert fill._parse_decklist("1Lightning Bolt\nSol Ring") == [
+            (1, "Sol Ring", None, None),
+        ]
 
     def test_empty(self):
         assert fill._parse_decklist("") == []
