@@ -67,7 +67,25 @@ const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+([^()\n]+?)(?:\s+\(([A-Za-
 // as "Deck (99)", "Companion (0)" etc. Without it the unrecognised header
 // keeps whatever inExcluded state the prior recognised header set, silently
 // dropping the entire mainboard if Companion/Tokens appear first.
-const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard|commanders?)(?:\s+\(\d+\))?\s*:?\s*$/i;
+//
+// Type-grouping headers (`Creatures`, `Lands`, `Spells`, etc.) are also matched
+// so they don't fall through to the bare-name fallback as qty=1 cards. They're
+// TRANSPARENT — recognised and skipped, but `inExcluded` is left alone.
+const SECTION_HEADER = /^\s*(?:\/\/|#|--)?\s*(sideboard|maybeboard|considering|companion|tokens?|cut|extra|deck|main|mainboard|commanders?|creatures?|instants?|sorceries|sorcery|artifacts?|enchantments?|planeswalkers?|lands?|battles?|spells?)(?:\s+\(\d+\))?\s*:?\s*$/i;
+// Transparent type-grouping headers — see fill.py:_TYPE_GROUP_HEADERS. Real
+// card names like `Land Tax`, `Spell Pierce`, `Creature Guy` aren't affected
+// because SECTION_HEADER anchors on the whole trimmed line.
+const TYPE_GROUP_HEADERS = new Set([
+  "creature", "creatures",
+  "instant", "instants",
+  "sorcery", "sorceries",
+  "artifact", "artifacts",
+  "enchantment", "enchantments",
+  "planeswalker", "planeswalkers",
+  "land", "lands",
+  "battle", "battles",
+  "spell", "spells",
+]);
 
 // DOM
 const $ = (id) => document.getElementById(id);
@@ -454,6 +472,12 @@ function parseDecklist(text, opts = {}) {
     const sec = line.match(SECTION_HEADER);
     if (sec) {
       const name = sec[1].toLowerCase();
+      if (TYPE_GROUP_HEADERS.has(name)) {
+        // Transparent type-grouping header — skip the line but leave
+        // inExcluded alone so cards under `Creatures` / `Lands` etc. stay
+        // in whatever section the prior structural header set.
+        continue;
+      }
       const isMain = MAIN_SECTIONS.includes(name);
       const isSideOrMaybe = name === "sideboard" || name === "maybeboard";
       inExcluded = !isMain && !(includeSideboard && isSideOrMaybe);
