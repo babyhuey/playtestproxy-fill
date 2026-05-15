@@ -62,7 +62,10 @@ const MOXFIELD_DECK_BOARDS = ["commanders", "mainboard", "companions", "signatur
 
 // "1 Card Name" / "4x Lightning Bolt" / "1 Sol Ring (CMM) 343" — same as fill.py.
 // Trailing "*F*"/"*E*" markers (foil/etched) are tolerated but discarded.
-const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+([^()\n]+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w★]+))?)?(?:\s+\*\w+\*)*\s*$/;
+// Name is `.+?` (lazy) so card names with parens — `B.F.M. (Big Furry Monster)
+// (UGL) 28`, `Hazmat Suit (Used)` — parse correctly; the lazy quantifier
+// backtracks to the LAST `(SET) CN`-shaped tail at end of line.
+const DECKLIST_LINE = /^\s*(?:SB:\s*)?(\d+)\s*[xX]?\s+(.+?)(?:\s+\(([A-Za-z0-9]{2,6})\)(?:\s+([\w★]+))?)?(?:\s+\*\w+\*)*\s*$/;
 // `(\d+)` count suffix — Moxfield's format-specific exports tag every section
 // as "Deck (99)", "Companion (0)" etc. Without it the unrecognised header
 // keeps whatever inExcluded state the prior recognised header set, silently
@@ -498,12 +501,11 @@ function parseDecklist(text, opts = {}) {
     }
     // Bare-name fallback (no leading quantity). Mirrors fill.py:_parse_decklist.
     // Lets users paste raw name-per-line lists (wiki dumps, Scryfall search,
-    // set-completion lists) without prefixing each line with "1 ", and
-    // rescues card names whose parens aren't a set code (e.g. "B.F.M. (Big
-    // Furry Monster)", "Hazmat Suit (Used)"). Lines whose first non-whitespace
-    // character is a digit are skipped — a typo like "1Lightning" shouldn't
-    // silently become a card named "1Lightning". An "SB:" prefix is stripped
-    // so a bare-name sideboard line is included only when sideboard is on.
+    // set-completion lists) without prefixing each line with "1 ". Lines
+    // whose first non-whitespace character is a digit are skipped — a typo
+    // like "1Lightning" shouldn't silently become a card named "1Lightning".
+    // An "SB:" prefix is stripped so a bare-name sideboard line is included
+    // only when sideboard is on.
     let bare = line.trim();
     if (bare.startsWith("SB:")) bare = bare.slice(3).trim();
     if (!bare || /^\d/.test(bare)) continue;
@@ -591,6 +593,62 @@ function indexScryfallCards(cards, target) {
   }
 }
 
+// Key used to compare /cards/collection input identifiers against the response's
+// `not_found` echo. `not_found` returns the identifier object verbatim, so a
+// string key derived from its shape lets us pair inputs with their result.
+function scryfallIdentifierKey(id) {
+  if (id.set || id.collector_number) {
+    return `s:${(id.set || "").toLowerCase()}/${(id.collector_number || "").toLowerCase()}`;
+  }
+  if (id.id) return `i:${id.id.toLowerCase()}`;
+  if (id.oracle_id) return `o:${id.oracle_id.toLowerCase()}`;
+  return `n:${(id.name || "").toLowerCase()}`;
+}
+
+function setCnKey(set, cn) {
+  return `${(set || "").toLowerCase()}/${(cn || "").toLowerCase()}`;
+}
+
+function indexScryfallByInputs(chunkIdentifiers, chunkParsed, matches, notFound, uidByName, uidBySetCn) {
+  // Scryfall's /cards/collection returns `data` in the same order as input
+  // identifiers, minus any items echoed in `not_found`. Walk both arrays in
+  // lockstep so we can pair each match with the user's *original* typed input
+  // and index by it.
+  //
+  // Two indices are populated:
+  //  - uidByName: keyed by the user's typed name. Fixes silent misses when
+  //    Scryfall canonicalizes the input differently from how it was typed
+  //    (e.g. `Saute` → `Sauté`, unquoted `Ach! Hans, Run!` → quoted form).
+  //  - uidBySetCn: keyed by `set/cn`. Lets two parsed entries that share a
+  //    name but differ only in collector number (B.F.M. UGL 28 vs UGL 29 —
+  //    the two halves of Big Furry Monster) resolve to distinct UIDs.
+  const notFoundCount = new Map();
+  for (const id of notFound || []) {
+    const k = scryfallIdentifierKey(id);
+    notFoundCount.set(k, (notFoundCount.get(k) || 0) + 1);
+  }
+  let mi = 0;
+  for (let ci = 0; ci < chunkIdentifiers.length; ci++) {
+    const id = chunkIdentifiers[ci];
+    const k = scryfallIdentifierKey(id);
+    const missCount = notFoundCount.get(k) || 0;
+    if (missCount > 0) {
+      notFoundCount.set(k, missCount - 1);
+      continue;
+    }
+    const card = matches[mi++];
+    if (!card?.id) continue;
+    const p = chunkParsed[ci];
+    if (id.set && id.collector_number) {
+      const key = setCnKey(id.set, id.collector_number);
+      if (!uidBySetCn.has(key)) uidBySetCn.set(key, card.id);
+    } else if (p?.name) {
+      const key = p.name.toLowerCase();
+      if (!uidByName.has(key)) uidByName.set(key, card.id);
+    }
+  }
+}
+
 async function buildJobsFromDecklist(text, opts, onProgress) {
   const parsed = parseDecklist(text, { includeSideboard: !(opts && opts.skipSide) });
   if (!parsed.length) throw new Error("Couldn't parse any cards from the decklist.");
@@ -605,6 +663,7 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
   // identifiers and returns up to 75 matches per request. For 480 cards
   // that's 7 requests instead of 480, far under Scryfall's 2 req/sec ceiling.
   const uidByLowerName = new Map();
+  const uidBySetCn = new Map();
   let processed = 0;
   const tick = (name) => onProgress?.(++processed, parsed.length, name);
 
@@ -614,10 +673,12 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
   for (let i = 0; i < identifiers.length; i += SCRYFALL_COLLECTION_BATCH_SIZE) {
     if (i > 0) await new Promise((r) => setTimeout(r, SCRYFALL_NAMED_INTERVAL_MS));
     const chunk = identifiers.slice(i, i + SCRYFALL_COLLECTION_BATCH_SIZE);
+    const chunkParsed = parsed.slice(i, i + chunk.length);
     const sample = parsed[i]?.name || "";
     onProgress?.(processed + 1, parsed.length, sample);
-    const { matches } = await scryfallCollection(chunk);
+    const { matches, notFound } = await scryfallCollection(chunk);
     indexScryfallCards(matches, uidByLowerName);
+    indexScryfallByInputs(chunk, chunkParsed, matches, notFound, uidByLowerName, uidBySetCn);
     for (let k = 0; k < chunk.length; k++) tick(parsed[i + k]?.name || sample);
   }
 
@@ -626,19 +687,28 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
   // ran when (set, cn) returned 404 (typical: a set hint that's wrong for
   // the named card).
   const fallback = parsed.filter(
-    (p) => (p.set || p.cn) && !uidByLowerName.has(p.name.toLowerCase()),
+    (p) =>
+      p.set && p.cn
+        ? !uidBySetCn.has(setCnKey(p.set, p.cn)) && !uidByLowerName.has(p.name.toLowerCase())
+        : false,
   );
   for (let i = 0; i < fallback.length; i += SCRYFALL_COLLECTION_BATCH_SIZE) {
     await new Promise((r) => setTimeout(r, SCRYFALL_NAMED_INTERVAL_MS));
     const chunk = fallback.slice(i, i + SCRYFALL_COLLECTION_BATCH_SIZE);
-    const { matches } = await scryfallCollection(chunk.map((p) => ({ name: p.name })));
+    const idChunk = chunk.map((p) => ({ name: p.name }));
+    const { matches, notFound } = await scryfallCollection(idChunk);
     indexScryfallCards(matches, uidByLowerName);
+    indexScryfallByInputs(idChunk, chunk, matches, notFound, uidByLowerName, uidBySetCn);
   }
 
   const jobs = [];
   const unresolved = [];
   for (const p of parsed) {
-    const uid = uidByLowerName.get(p.name.toLowerCase());
+    // set+cn beats name: lets two parsed entries that share a name but pin
+    // different collector numbers (BFM UGL 28 / 29) resolve to distinct UIDs.
+    let uid =
+      p.set && p.cn ? uidBySetCn.get(setCnKey(p.set, p.cn)) : undefined;
+    if (!uid) uid = uidByLowerName.get(p.name.toLowerCase());
     if (uid) jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
     else unresolved.push(p.name);
   }

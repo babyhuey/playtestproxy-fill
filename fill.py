@@ -306,7 +306,12 @@ _DECKLIST_LINE = re.compile(
         (?:SB:\s*)?                              # Sideboard prefix (some exporters)
         (\d+)                                    # quantity
         \s*[xX]?\s+                              # 'x' separator optional
-        ([^()\n]+?)                              # card name (lazy)
+        (.+?)                                    # card name (lazy; allows parens
+                                                 # so "B.F.M. (Big Furry Monster)
+                                                 # (UGL) 28" parses correctly —
+                                                 # the lazy quantifier backtracks
+                                                 # to the LAST `(SET) CN`-shaped
+                                                 # tail at end of line)
         (?:\s+\(([A-Za-z0-9]{2,6})\)             # optional (SET) — anchors collector
            (?:\s+([\w★]+))?                      # collector number, only if SET present
         )?
@@ -534,12 +539,9 @@ def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
             continue
         # Bare-name fallback (no leading quantity). Lets users paste raw
         # name-per-line lists — wiki dumps, Scryfall search results, set-
-        # completion lists — without prefixing each line with "1 ". Also
-        # rescues lines whose names contain parens that aren't a set code
-        # (e.g. "B.F.M. (Big Furry Monster)", "Hazmat Suit (Used)") which the
-        # strict regex rejects via the `[^()\n]+?` name class. Lines whose
-        # first non-whitespace character is a digit are skipped — a typo
-        # like "1Lightning" shouldn't become a card named "1Lightning".
+        # completion lists — without prefixing each line with "1 ". Lines
+        # whose first non-whitespace character is a digit are skipped — a
+        # typo like "1Lightning" shouldn't become a card named "1Lightning".
         bare = line.strip()
         if bare and not bare[0].isdigit():
             out.append((1, bare, None, None))

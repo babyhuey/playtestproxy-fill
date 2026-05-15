@@ -259,13 +259,33 @@ class TestParseDecklist:
 
     def test_bare_name_with_parens_in_name(self):
         # Card names that contain parentheses ("B.F.M. (Big Furry Monster)",
-        # "Hazmat Suit (Used)") don't fit the strict regex's set-code shape
-        # — the bare-name fallback keeps the whole line as the name.
+        # "Hazmat Suit (Used)") without leading qty fall through the strict
+        # regex (which requires a leading number) — the bare-name fallback
+        # keeps the whole line as the name.
         text = "B.F.M. (Big Furry Monster)\nHazmat Suit (Used)\n_____"
         assert fill._parse_decklist(text) == [
             (1, "B.F.M. (Big Furry Monster)", None, None),
             (1, "Hazmat Suit (Used)", None, None),
             (1, "_____", None, None),
+        ]
+
+    def test_qty_prefixed_paren_name_with_set_and_collector(self):
+        # B.F.M. is two separate Unglued cards (UGL 28 = left half, UGL 29 =
+        # right half) sharing the same `name` — only the collector number
+        # distinguishes them. The strict regex's lazy name capture must
+        # backtrack to the trailing `(SET) CN` so qty-prefixed lines like
+        # `1 B.F.M. (Big Furry Monster) (UGL) 28` parse correctly. Without
+        # this, the line falls through to the bare-name fallback's
+        # digit-prefix guard and is silently dropped.
+        text = (
+            "1 B.F.M. (Big Furry Monster) (UGL) 28\n"
+            "1 B.F.M. (Big Furry Monster) (UGL) 29\n"
+            "1 B.F.M. (Big Furry Monster)\n"
+        )
+        assert fill._parse_decklist(text) == [
+            (1, "B.F.M. (Big Furry Monster)", "ugl", "28"),
+            (1, "B.F.M. (Big Furry Monster)", "ugl", "29"),
+            (1, "B.F.M. (Big Furry Monster)", None, None),
         ]
 
     def test_bare_name_respects_section_and_comment_filters(self):
