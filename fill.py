@@ -544,17 +544,85 @@ def _scryfall_lookup_named(
     return None
 
 
+# Scryfall caps /cards/collection at 75 identifiers per request. The endpoint
+# is rate-limited at 2 req/sec (500ms gap) like /cards/named, so a 480-card
+# deck resolves in ~7 batched calls instead of 480 per-card lookups.
+_SCRYFALL_COLLECTION_BATCH_SIZE = 75
+
+
+def _index_scryfall_cards(cards: list[dict], target: dict[str, str]) -> None:
+    """Index `cards` by every name each one answers to (full name + each
+    card-face name), lowercased. DFCs typed by either face resolve to the
+    same UID. First-write wins so duplicate face names across prints don't
+    clobber each other."""
+    for card in cards:
+        uid = card.get("id")
+        if not uid:
+            continue
+        keys: list[str] = []
+        name = card.get("name")
+        if name:
+            keys.append(name.lower())
+        for face in card.get("card_faces") or []:
+            face_name = (face or {}).get("name")
+            if face_name:
+                keys.append(face_name.lower())
+        for key in keys:
+            target.setdefault(key, uid)
+
+
+def _scryfall_collection_lookup(
+    identifiers: list[dict], session: requests.Session
+) -> tuple[list[dict], list[dict]]:
+    """POST a batch of identifiers (≤ 75) to /cards/collection. Returns
+    (matches, not_found). Caller is responsible for honouring the 500ms
+    pacing gate between batches via `_scryfall_wait`."""
+    _scryfall_wait()
+    r = session.post(
+        "https://api.scryfall.com/cards/collection",
+        headers={**UA, "Content-Type": "application/json"},
+        json={"identifiers": identifiers},
+        timeout=30,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    return payload.get("data") or [], payload.get("not_found") or []
+
+
 def _jobs_from_decklist(text: str) -> list[CardJob]:
-    """Parse decklist text and resolve each line via Scryfall name lookup."""
+    """Parse decklist text and resolve every line via Scryfall's batched
+    `/cards/collection` endpoint. Falls back to a name-only retry for any
+    entries that pinned a set/cn but didn't match — same recovery the old
+    per-card helper did when (set, cn) returned 404."""
     parsed = _parse_decklist(text)
     if not parsed:
         raise SystemExit("Could not parse any cards from the decklist.")
     session = requests.Session()
     session.headers.update(UA)
+
+    # Build the most-specific identifier we have for each parsed entry.
+    identifiers: list[dict] = [
+        {"set": s, "collector_number": c} if s and c else {"name": n} for _, n, s, c in parsed
+    ]
+    uid_by_lower_name: dict[str, str] = {}
+    for i in range(0, len(identifiers), _SCRYFALL_COLLECTION_BATCH_SIZE):
+        chunk = identifiers[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]
+        matches, _ = _scryfall_collection_lookup(chunk, session)
+        _index_scryfall_cards(matches, uid_by_lower_name)
+
+    # Second pass for the (set, cn) entries that didn't resolve — retry as
+    # bare name. Matches the existing 404-with-set fallback in
+    # `_scryfall_lookup_named`.
+    fallback = [(n,) for _, n, s, c in parsed if (s or c) and n.lower() not in uid_by_lower_name]
+    for i in range(0, len(fallback), _SCRYFALL_COLLECTION_BATCH_SIZE):
+        chunk = [{"name": t[0]} for t in fallback[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]]
+        matches, _ = _scryfall_collection_lookup(chunk, session)
+        _index_scryfall_cards(matches, uid_by_lower_name)
+
     jobs: list[CardJob] = []
     unresolved: list[str] = []
     for qty, name, set_code, collector in parsed:
-        uid = _scryfall_lookup_named(name, set_code, collector, session)
+        uid = uid_by_lower_name.get(name.lower())
         if not uid:
             unresolved.append(name)
             continue

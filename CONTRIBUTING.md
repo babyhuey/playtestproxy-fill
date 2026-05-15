@@ -7,11 +7,11 @@ Most users will only ever need the [web frontend](https://babyhuey.github.io/pla
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r dev-requirements.txt
-.venv/bin/playwright install chromium    # only needed for upload.py
+.venv/bin/playwright install chromium    # for upload.py + the frontend cache test
 .venv/bin/pre-commit install
 ```
 
-`pre-commit install` wires ruff + a couple of file-hygiene hooks so they run on every commit and your PR doesn't bounce on whitespace.
+`pre-commit install` wires ruff, a couple of file-hygiene hooks, and `pytest` so they run on every commit and your PR doesn't bounce on a lint nit or a unit-test regression. The pytest hook auto-skips the Playwright frontend cache test on machines that don't have `playwright` installed, so a fresh clone still passes — install Chromium (above) if you want the full local coverage CI runs.
 
 ## Running things locally
 

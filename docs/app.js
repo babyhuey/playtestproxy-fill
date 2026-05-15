@@ -13,9 +13,10 @@ if (window.top !== window.self) {
   try { window.top.location = window.self.location; } catch { /* cross-origin block — already safe */ }
 }
 
-// Hard cap on parsed decklist entries. The build is sequential at ~100ms
-// per card (Scryfall rate limit), so a 100k-line paste would burn hours
-// and OOM the tab. Self-DoS only, but worth a cheap upfront bound.
+// Hard cap on parsed decklist entries. Lookups go through Scryfall's
+// /cards/collection (75 ids / request, 500ms gap), so 2000 cards is
+// ~27 batched calls — finite, but a 100k-line paste would still OOM the
+// tab. Self-DoS only, but worth a cheap upfront bound.
 const MAX_DECKLIST_ENTRIES = 2000;
 
 const ARCHIDEKT = (id) => `https://archidekt.com/api/decks/${id}/`;
@@ -27,6 +28,18 @@ const CORS_PROXY = (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`;
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
 const SCRYFALL_NAMED = "https://api.scryfall.com/cards/named";
 const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn}`;
+const SCRYFALL_COLLECTION = "https://api.scryfall.com/cards/collection";
+// Per Scryfall's docs: collection accepts up to 75 identifiers per request,
+// and the /cards/* endpoints (named / search / random / collection) are
+// limited to 2 req/sec — a 500ms gap between calls. Picking 550ms gives a
+// small safety margin and avoids burning the 30-second 429 lockout the
+// API applies on overage.
+const SCRYFALL_COLLECTION_BATCH_SIZE = 75;
+const SCRYFALL_NAMED_INTERVAL_MS = 550;
+// Scryfall locks out for 30s on a 429. If a response omits Retry-After we
+// fall back to this (with a 2s cushion) so withRetry's last attempt lands
+// after the lockout has cleared instead of inside it.
+const SCRYFALL_429_FALLBACK_MS = 32_000;
 const SCRYFALL_SEARCH = "https://api.scryfall.com/cards/search";
 
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
@@ -154,6 +167,9 @@ function setProgress(done, total) {
 async function withRetry(fn, attempts = 3, baseDelay = 400) {
   // 400ms base, exponential — defending against transient corsproxy /
   // Scryfall hiccups, not against logic bugs. 4xx is final and bypasses retry.
+  // 429 throws a RateLimitError carrying the server's Retry-After (or our
+  // 32s fallback) and overrides the exponential delay — Scryfall's 30s
+  // lockout would eat both of the short retries otherwise.
   let lastErr;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -162,13 +178,34 @@ async function withRetry(fn, attempts = 3, baseDelay = 400) {
       if (e instanceof FatalFetchError) throw e;
       lastErr = e;
       if (i === attempts - 1) break;
-      await new Promise((r) => setTimeout(r, baseDelay * 2 ** i));
+      const delay =
+        e instanceof RateLimitError ? e.delayMs : baseDelay * 2 ** i;
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr;
 }
 
 class FatalFetchError extends Error {}  // 4xx — don't retry through proxy
+class RateLimitError extends Error {
+  // delayMs: how long withRetry should pause before the next attempt. Sourced
+  // from the response's Retry-After header when present, otherwise from
+  // SCRYFALL_429_FALLBACK_MS so we land outside the 30s lockout window.
+  constructor(message, delayMs) {
+    super(message);
+    this.delayMs = delayMs;
+  }
+}
+
+function parseRetryAfter(header) {
+  // Retry-After is either delta-seconds or an HTTP-date (RFC 7231 §7.1.3).
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const when = Date.parse(header);
+  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
+  return null;
+}
 
 async function parseJsonStrict(r) {
   // corsproxy.io can return 200 with an HTML rate-limit page; r.json() then
@@ -482,6 +519,54 @@ async function scryfallLookupNamed(name, setCode, cn) {
   });
 }
 
+async function scryfallCollection(identifiers) {
+  // POST /cards/collection — bulk lookup, up to 75 identifiers per call.
+  // Wrapped in withRetry so transient errors and 429 lockouts back off.
+  // Returns { matches, notFound }; not_found echoes the original identifier
+  // shape (so callers can map echoed identifiers back to their inputs).
+  return withRetry(async () => {
+    const r = await fetch(SCRYFALL_COLLECTION, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({ identifiers }),
+    });
+    if (r.ok) {
+      const json = await r.json();
+      return { matches: json.data || [], notFound: json.not_found || [] };
+    }
+    if (r.status === 429) {
+      const ra = parseRetryAfter(r.headers.get("Retry-After"));
+      throw new RateLimitError(
+        `Scryfall 429 Too Many Requests`,
+        ra ?? SCRYFALL_429_FALLBACK_MS,
+      );
+    }
+    if (r.status >= 500) throw new Error(`Scryfall ${r.status} ${r.statusText}`);
+    throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
+  });
+}
+
+function indexScryfallCards(cards, target) {
+  // Map each card's UID by every name it answers to (full name + each
+  // card_face name), all lowercased. DFCs typed by either face hit the
+  // same UID. Existing entries are not overwritten so the first match wins
+  // when two prints share a face name.
+  for (const card of cards) {
+    if (!card?.id) continue;
+    const keys = [];
+    if (card.name) keys.push(card.name.toLowerCase());
+    for (const face of card.card_faces || []) {
+      if (face?.name) keys.push(face.name.toLowerCase());
+    }
+    for (const key of keys) {
+      if (!target.has(key)) target.set(key, card.id);
+    }
+  }
+}
+
 async function buildJobsFromDecklist(text, opts, onProgress) {
   const parsed = parseDecklist(text, { includeSideboard: !(opts && opts.skipSide) });
   if (!parsed.length) throw new Error("Couldn't parse any cards from the decklist.");
@@ -491,19 +576,47 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
       "to avoid running for hours and OOM-ing the tab. Split into smaller decks."
     );
   }
+
+  // Bulk path: /cards/collection accepts {name} or {set, collector_number}
+  // identifiers and returns up to 75 matches per request. For 480 cards
+  // that's 7 requests instead of 480, far under Scryfall's 2 req/sec ceiling.
+  const uidByLowerName = new Map();
+  let processed = 0;
+  const tick = (name) => onProgress?.(++processed, parsed.length, name);
+
+  const identifiers = parsed.map((p) =>
+    p.set && p.cn ? { set: p.set, collector_number: p.cn } : { name: p.name },
+  );
+  for (let i = 0; i < identifiers.length; i += SCRYFALL_COLLECTION_BATCH_SIZE) {
+    if (i > 0) await new Promise((r) => setTimeout(r, SCRYFALL_NAMED_INTERVAL_MS));
+    const chunk = identifiers.slice(i, i + SCRYFALL_COLLECTION_BATCH_SIZE);
+    const sample = parsed[i]?.name || "";
+    onProgress?.(processed + 1, parsed.length, sample);
+    const { matches } = await scryfallCollection(chunk);
+    indexScryfallCards(matches, uidByLowerName);
+    for (let k = 0; k < chunk.length; k++) tick(parsed[i + k]?.name || sample);
+  }
+
+  // Second pass: entries that pinned a set/cn but didn't resolve — retry
+  // by bare name. Mirrors the exact-name fallback the old per-card helper
+  // ran when (set, cn) returned 404 (typical: a set hint that's wrong for
+  // the named card).
+  const fallback = parsed.filter(
+    (p) => (p.set || p.cn) && !uidByLowerName.has(p.name.toLowerCase()),
+  );
+  for (let i = 0; i < fallback.length; i += SCRYFALL_COLLECTION_BATCH_SIZE) {
+    await new Promise((r) => setTimeout(r, SCRYFALL_NAMED_INTERVAL_MS));
+    const chunk = fallback.slice(i, i + SCRYFALL_COLLECTION_BATCH_SIZE);
+    const { matches } = await scryfallCollection(chunk.map((p) => ({ name: p.name })));
+    indexScryfallCards(matches, uidByLowerName);
+  }
+
   const jobs = [];
   const unresolved = [];
-  for (let i = 0; i < parsed.length; i++) {
-    const p = parsed[i];
-    onProgress?.(i + 1, parsed.length, p.name);
-    // 80ms politeness gap — Scryfall asks for 50–100ms between requests.
-    await new Promise((r) => setTimeout(r, 80));
-    const uid = await scryfallLookupNamed(p.name, p.set, p.cn);
-    if (!uid) {
-      unresolved.push(p.name);
-      continue;
-    }
-    jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
+  for (const p of parsed) {
+    const uid = uidByLowerName.get(p.name.toLowerCase());
+    if (uid) jobs.push({ name: p.name, qty: p.qty, uid, customUrl: null });
+    else unresolved.push(p.name);
   }
   return { jobs, unresolved };
 }

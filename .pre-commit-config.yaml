@@ -1,5 +1,6 @@
-# Run with `pre-commit install` once, then ruff lint+format runs on every
-# commit. Mirrors the CI checks so PRs don't bounce on whitespace.
+# Run with `pre-commit install` once, then ruff lint+format and pytest run
+# on every commit. Mirrors the CI checks so PRs don't bounce on whitespace
+# or a regression caught by the unit-test suite.
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -20,3 +21,25 @@ repos:
       - id: check-added-large-files
         args: [--maxkb=500]
       - id: check-merge-conflict
+
+  - repo: local
+    hooks:
+      # Run the pytest suite the same way CI does, so a regression caught
+      # by tests can't slip through to a CI bounce. The pytest-playwright
+      # plugin blows up at collection time if `playwright` itself isn't
+      # importable, so we disable the plugin and skip the Playwright test
+      # file on machines without it — fresh clone still passes. Devs who
+      # `pip install -r dev-requirements.txt && playwright install` get
+      # full coverage locally including the frontend cache test.
+      - id: pytest
+        name: pytest
+        entry: >-
+          bash -c 'if python -c "import playwright" 2>/dev/null; then
+          pytest -q --no-header;
+          else
+          pytest -q --no-header -p no:playwright --ignore=tests/test_frontend_cache.py;
+          fi'
+        language: system
+        pass_filenames: false
+        types: [python]
+        stages: [pre-commit]
