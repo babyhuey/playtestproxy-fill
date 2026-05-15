@@ -120,13 +120,19 @@ def test_indexeddb_cache_avoids_repeat_uid_fetches():
         # Reload — clears in-memory cache; IDB persists.
         page.reload(wait_until="networkidle")
 
-        # Watch for /cards/<uid> requests; the named-lookup endpoint
-        # `/cards/named` is not the cache path so it's allowed.
+        # Watch for /cards/<uid> requests; the named-lookup endpoints
+        # `/cards/named` and `/cards/collection` are not the cache path so
+        # they're allowed (collection replaced named for batch resolution
+        # in the bulk-lookup refactor).
         uid_calls: list[str] = []
 
         def on_request(req):
             url = req.url
-            if "api.scryfall.com/cards/" in url and "/named" not in url:
+            if (
+                "api.scryfall.com/cards/" in url
+                and "/named" not in url
+                and "/collection" not in url
+            ):
                 uid_calls.append(url)
 
         page.on("request", on_request)

@@ -555,14 +555,20 @@ def test_fetch_tappedout_returns_jobs():
         content_type="text/plain",
         match=[responses.matchers.query_param_matcher({"fmt": "txt"})],
     )
-    # Mock Scryfall name-resolution.
-    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
-        responses.add(
-            responses.GET,
-            "https://api.scryfall.com/cards/named",
-            json={"id": uid, "name": name},
-            status=200,
-        )
+    # Mock Scryfall batch name-resolution via /cards/collection.
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "lb-uid", "name": "Lightning Bolt"},
+                {"id": "sr-uid", "name": "Sol Ring"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
     jobs = fill._fetch_tappedout("test-slug")
     assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
 
@@ -594,13 +600,19 @@ def test_fetch_edhrec_extracts_next_data():
         status=200,
         content_type="text/html",
     )
-    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
-        responses.add(
-            responses.GET,
-            "https://api.scryfall.com/cards/named",
-            json={"id": uid, "name": name},
-            status=200,
-        )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "lb-uid", "name": "Lightning Bolt"},
+                {"id": "sr-uid", "name": "Sol Ring"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
     jobs = fill._fetch_edhrec("abc123")
     assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
 
@@ -700,13 +712,19 @@ def test_fetch_mtgdecks_returns_jobs():
         status=200,
         content_type="text/html",
     )
-    for name, uid in [("Beza, the Bounding Spring", "beza-uid"), ("Get Lost", "gl-uid")]:
-        responses.add(
-            responses.GET,
-            "https://api.scryfall.com/cards/named",
-            json={"id": uid, "name": name},
-            status=200,
-        )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "beza-uid", "name": "Beza, the Bounding Spring"},
+                {"id": "gl-uid", "name": "Get Lost"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
     jobs = fill._fetch_mtgdecks("Standard/some-deck-1234")
     # Sideboard always excluded for the CLI path — _parse_decklist treats the
     # `Sideboard` section as off-deck. The frontend's checkbox can opt in.
@@ -735,9 +753,13 @@ def test_fetch_mtgdecks_decodes_html_entities():
         content_type="text/html",
     )
     responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/named",
-        json={"id": "av-uid", "name": "Æther Vial"},
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "av-uid", "name": "Æther Vial"}],
+            "not_found": [],
+        },
         status=200,
     )
     jobs = fill._fetch_mtgdecks("Modern/aether-deck-99999")
@@ -822,20 +844,83 @@ def test_make_default_back_missing_file_raises(monkeypatch, tmp_path):
 
 
 @responses.activate
-def test_jobs_from_decklist_warns_on_unresolved(capsys):
-    text = "1 Real Card\n1 Bogus Made Up Card\n"
-    # First call resolves; second returns 404.
+def test_jobs_from_decklist_indexes_dfc_face_names():
+    """Scryfall's /cards/collection returns DFC cards with `card_faces` and
+    a combined `name`. If the user typed just the front face, the bulk
+    indexer maps that face name → the card's UID so it still resolves."""
+    text = "1 Venat, Heart of Hydaelyn\n"
     responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/named",
-        json={"id": "uid-1"},
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {
+                    "id": "venat-uid",
+                    "name": "Venat, Heart of Hydaelyn // Hydaelyn, the Mothercrystal",
+                    "card_faces": [
+                        {"name": "Venat, Heart of Hydaelyn"},
+                        {"name": "Hydaelyn, the Mothercrystal"},
+                    ],
+                }
+            ],
+            "not_found": [],
+        },
         status=200,
     )
+    jobs = fill._jobs_from_decklist(text)
+    assert len(jobs) == 1
+    assert jobs[0].scryfall_uid == "venat-uid"
+
+
+@responses.activate
+def test_jobs_from_decklist_falls_back_to_name_when_set_cn_misses():
+    """If an entry pinned a (set, collector_number) that Scryfall doesn't
+    recognise, the bulk wrapper retries the bare name in a second batch.
+    Mirrors the 404-with-set fallback the old per-card helper ran."""
+    text = "1 Sol Ring (zzz) 999\n"
+    # First batch: (set=zzz, collector_number=999) — empty match.
     responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/named",
-        json={"details": "not found"},
-        status=404,
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [],
+            "not_found": [{"set": "zzz", "collector_number": "999"}],
+        },
+        status=200,
+    )
+    # Second batch: bare name — resolves.
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "sr-uid", "name": "Sol Ring"}],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(text)
+    assert len(jobs) == 1
+    assert jobs[0].name == "Sol Ring"
+    assert jobs[0].scryfall_uid == "sr-uid"
+
+
+@responses.activate
+def test_jobs_from_decklist_warns_on_unresolved(capsys):
+    text = "1 Real Card\n1 Bogus Made Up Card\n"
+    # /cards/collection returns one match and lists the missing identifier
+    # in not_found. The wrapper logs a warning per unresolved name.
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "uid-1", "name": "Real Card"}],
+            "not_found": [{"name": "Bogus Made Up Card"}],
+        },
+        status=200,
     )
     jobs = fill._jobs_from_decklist(text)
     assert len(jobs) == 1
@@ -1606,13 +1691,19 @@ def test_fetch_scryfall_resolves_via_decklist_parser():
         status=200,
         content_type="text/plain",
     )
-    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
-        responses.add(
-            responses.GET,
-            "https://api.scryfall.com/cards/named",
-            json={"id": uid, "name": name},
-            status=200,
-        )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "lb-uid", "name": "Lightning Bolt"},
+                {"id": "sr-uid", "name": "Sol Ring"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
     jobs = fill._fetch_scryfall(deck_id)
     assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 3), ("Sol Ring", 1)}
 
@@ -1639,13 +1730,19 @@ def test_fetch_deckbox_resolves_via_decklist_parser():
         status=200,
         content_type="text/plain",
     )
-    for name, uid in [("Lightning Bolt", "lb-uid"), ("Sol Ring", "sr-uid")]:
-        responses.add(
-            responses.GET,
-            "https://api.scryfall.com/cards/named",
-            json={"id": uid, "name": name},
-            status=200,
-        )
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "lb-uid", "name": "Lightning Bolt"},
+                {"id": "sr-uid", "name": "Sol Ring"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
     jobs = fill._fetch_deckbox("123")
     assert {(j.name, j.qty) for j in jobs} == {("Lightning Bolt", 2), ("Sol Ring", 1)}
 
