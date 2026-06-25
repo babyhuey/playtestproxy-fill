@@ -1855,6 +1855,43 @@ class TestScryfallJpgFallback:
         out = fill.fetch_image(self.PNG, fill.requests.Session())
         assert out.size == (4, 6)
 
+    def test_proxy_fallback_url(self):
+        proxied = fill._scryfall_proxy_fallback(self.PNG)
+        assert proxied.startswith("https://images.weserv.nl/?url=")
+        # The original URL (sans scheme) must round-trip out of the proxy param.
+        from urllib.parse import unquote
+
+        assert unquote(proxied.split("url=", 1)[1]) == self.PNG.removeprefix("https://")
+        # Non-Scryfall URLs are never proxied.
+        assert fill._scryfall_proxy_fallback("https://i.imgur.com/abc.png") is None
+
+    @responses.activate
+    def test_all_formats_404_falls_back_to_proxy(self):
+        # When every Scryfall format is a (negatively-cached) 404, the image
+        # proxy — a different edge — is the last resort before failing.
+        buf = BytesIO()
+        Image.new("RGB", (4, 6)).save(buf, "PNG")
+        responses.add(responses.GET, self.PNG, status=404)
+        responses.add(
+            responses.GET,
+            "https://cards.scryfall.io/large/front/d/d/ddc88ce9.jpg?1767952612",
+            status=404,
+        )
+        responses.add(
+            responses.GET,
+            "https://cards.scryfall.io/normal/front/d/d/ddc88ce9.jpg?1767952612",
+            status=404,
+        )
+        responses.add(
+            responses.GET,
+            fill._scryfall_proxy_fallback(self.PNG),
+            body=buf.getvalue(),
+            status=200,
+            content_type="image/png",
+        )
+        out = fill.fetch_image(self.PNG, fill.requests.Session())
+        assert out.size == (4, 6)
+
 
 class TestScrubSource:
     def test_keeps_https_url(self):

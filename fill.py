@@ -1582,6 +1582,17 @@ def _scryfall_jpg_fallbacks(url: str) -> list[str]:
     ]
 
 
+def _scryfall_proxy_fallback(url: str) -> str | None:
+    """Last resort when EVERY Scryfall format 404s — some edges negatively-cache
+    a 404 for all of a card's formats at once, and no cards.scryfall.io URL
+    variant can escape it. images.weserv.nl pulls the original image from
+    Scryfall's origin via a different edge. Only public card images transit it,
+    and only after the direct attempts have all failed."""
+    if not url.startswith("https://cards.scryfall.io/"):
+        return None
+    return "https://images.weserv.nl/?url=" + requests.utils.quote(url[len("https://") :], safe="")
+
+
 def fetch_image(url: str, session: requests.Session) -> Image.Image:
     """Fetch a card image from disk (override) or HTTPS (Scryfall / Archidekt
     custom). Other schemes are rejected — an adversarial deck JSON could
@@ -1593,15 +1604,18 @@ def fetch_image(url: str, session: requests.Session) -> Image.Image:
         raise RuntimeError(f"Refusing image URL with disallowed scheme: {url!r}")
     if url.startswith("file://"):
         return Image.open(url[7:]).convert("RGB")
-    r = session.get(url, headers=UA, timeout=60)
-    # A 404 on a Scryfall PNG is usually a negatively-cached CDN miss, not a
-    # genuinely missing image — retry the JPG variants (different cache keys).
-    if r.status_code == 404:
-        for alt in _scryfall_jpg_fallbacks(url):
-            alt_r = session.get(alt, headers=UA, timeout=60)
-            if alt_r.status_code != 404:
-                r = alt_r
-                break
+    # A 404 on a Scryfall image is usually a negatively-cached CDN miss, not a
+    # genuinely missing image — try the JPG variants (different cache keys),
+    # then an image proxy (different edge), before giving up.
+    candidates = [url, *_scryfall_jpg_fallbacks(url)]
+    proxied = _scryfall_proxy_fallback(url)
+    if proxied:
+        candidates.append(proxied)
+    r = session.get(candidates[0], headers=UA, timeout=60)
+    for alt in candidates[1:]:
+        if r.status_code != 404:
+            break
+        r = session.get(alt, headers=UA, timeout=60)
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
