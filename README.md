@@ -236,6 +236,11 @@ upload.py <images_dir>
   corsproxy fallback for mtgdecks in case that ever changes). The
   Archidekt / Moxfield JSON APIs are undocumented but have proven
   stable. The footer of the web app discloses the proxy relationship.
+- Card images come straight from Scryfall's CDN. When the CDN returns a
+  404 (usually a negatively-cached miss on one format), both the CLI and
+  frontend retry the `large` / `normal` JPG variants, then fall back to
+  the [images.weserv.nl](https://images.weserv.nl/) proxy (a different
+  edge) before giving up on a card.
 - Scryfall calls are globally rate-limited to ~10/s (their published cap)
   via a thread-shared lock in the CLI; the frontend uses the same 80–100ms
   gate.

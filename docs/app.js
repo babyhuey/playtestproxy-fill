@@ -291,12 +291,25 @@ function scryfallJpgFallbacks(url) {
   ];
 }
 
+function scryfallProxyFallback(url) {
+  // Last resort when EVERY Scryfall format 404s — some edges negatively-cache
+  // a 404 for all of a card's formats at once, and no cards.scryfall.io URL
+  // variant can escape it. Re-fetch the original image through the
+  // images.weserv.nl proxy, which pulls from Scryfall's origin via a different
+  // edge (CORS-enabled). Only public card images ever transit it, and only
+  // after the direct attempts have all failed.
+  if (!/^https:\/\/cards\.scryfall\.io\//.test(url)) return null;
+  return `https://images.weserv.nl/?url=${encodeURIComponent(url.replace(/^https:\/\//, ""))}`;
+}
+
 async function fetchBlob(url) {
   // Scryfall CDN returns CORS * (verified 2026-04), so direct fetch works.
   // A 404 on a Scryfall PNG is usually a negatively-cached CDN miss, not a
   // genuinely missing image — fall back to the JPG variants (different cache
-  // keys) before giving up. Non-404 errors retry the original via withRetry.
-  const candidates = [url, ...scryfallJpgFallbacks(url)];
+  // keys), then to an image proxy (different edge), before giving up. Non-404
+  // errors retry the original via withRetry.
+  const proxied = scryfallProxyFallback(url);
+  const candidates = [url, ...scryfallJpgFallbacks(url), ...(proxied ? [proxied] : [])];
   return withRetry(async () => {
     let last = "404 Not Found";
     for (const u of candidates) {
