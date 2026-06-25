@@ -1824,19 +1824,26 @@ class TestFetchImageSchemeAllowlist:
             fill.fetch_image(url, fill.requests.Session())
 
 
-class TestScryfallJpgFallback:
+class TestScryfallImageFallback:
     PNG = "https://cards.scryfall.io/png/front/d/d/ddc88ce9.png?1767952612"
+    LARGE = "https://cards.scryfall.io/large/front/d/d/ddc88ce9.jpg?1767952612"
 
     def test_fallbacks_for_png(self):
-        assert fill._scryfall_jpg_fallbacks(self.PNG) == [
+        # PNG (highest quality) → both lower JPG formats.
+        assert fill._scryfall_image_fallbacks(self.PNG) == [
             "https://cards.scryfall.io/large/front/d/d/ddc88ce9.jpg?1767952612",
+            "https://cards.scryfall.io/normal/front/d/d/ddc88ce9.jpg?1767952612",
+        ]
+
+    def test_fallbacks_from_large_stay_no_larger(self):
+        # When `large` was chosen, never fall *up* to png — only down to normal.
+        assert fill._scryfall_image_fallbacks(self.LARGE) == [
             "https://cards.scryfall.io/normal/front/d/d/ddc88ce9.jpg?1767952612",
         ]
 
     def test_no_fallback_for_non_scryfall(self):
         # Custom-art URLs (Archidekt customImageUrl) must be left untouched.
-        assert fill._scryfall_jpg_fallbacks("https://i.imgur.com/abc.png") == []
-        assert fill._scryfall_jpg_fallbacks("https://cards.scryfall.io/large/x.jpg") == []
+        assert fill._scryfall_image_fallbacks("https://i.imgur.com/abc.png") == []
 
     @responses.activate
     def test_png_404_falls_back_to_large_jpg(self):
@@ -1891,6 +1898,25 @@ class TestScryfallJpgFallback:
         )
         out = fill.fetch_image(self.PNG, fill.requests.Session())
         assert out.size == (4, 6)
+
+    def test_image_urls_honor_quality(self, monkeypatch):
+        payload = {
+            "image_uris": {
+                "png": "https://cards.scryfall.io/png/x.png?1",
+                "large": "https://cards.scryfall.io/large/x.jpg?1",
+            }
+        }
+        monkeypatch.setattr(fill, "scryfall_card_payload", lambda uid, session: payload)
+        assert fill.scryfall_image_urls("x", None) == (
+            "https://cards.scryfall.io/png/x.png?1",
+            None,
+        )
+        assert fill.scryfall_image_urls("x", None, "large") == (
+            "https://cards.scryfall.io/large/x.jpg?1",
+            None,
+        )
+        # An unavailable format degrades gracefully to png rather than KeyError.
+        assert fill.scryfall_image_urls("x", None, "small")[0].endswith("/png/x.png?1")
 
 
 class TestScrubSource:
