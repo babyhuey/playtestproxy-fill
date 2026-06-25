@@ -1002,15 +1002,21 @@ function buildJobsArchidekt(deck, opts) {
       .filter((c) => c.includedInDeck === false)
       .map((c) => c.name)
   );
+  const skipSide = !opts || opts.skipSide !== false;
   const jobs = [];
   for (const entry of deck.cards || []) {
     const cats = entry.categories || [];
     const primary = cats[0] || null;
     // Archidekt's `includedInDeck=false` categories are an explicit out-of-deck
-    // signal (sideboard / maybeboard / scratchpad). Always exclude them — the
-    // CLI does, and gating on opts.skipSide silently leaked sideboards into
-    // browser builds when the user unchecked "Skip sideboard".
+    // signal (maybeboard / scratchpad). Always exclude them — the CLI does, and
+    // gating on opts.skipSide silently leaked them into browser builds when the
+    // user unchecked "Skip sideboard".
     if (primary && excludedPrimary.has(primary)) continue;
+    // includedInDeck is NOT enough: Archidekt's built-in "Sideboard" category
+    // ships with includedInDeck=true, so it never lands in excludedPrimary.
+    // Skip cards whose primary is *named* Sideboard / Maybeboard only when the
+    // "Skip Sideboard / Maybeboard" box is checked.
+    if (skipSide && primary && /^(sideboard|maybeboard)$/i.test(primary)) continue;
     const card = entry.card || {};
     const oracle = card.oracleCard || {};
     const customUrl =

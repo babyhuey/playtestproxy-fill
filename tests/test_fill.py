@@ -537,6 +537,43 @@ def test_fetch_archidekt_skips_only_excluded_primary(archidekt_payload):
 
 
 @responses.activate
+def test_fetch_archidekt_skips_sideboard_marked_included():
+    # Archidekt's built-in "Sideboard" category ships with includedInDeck=True,
+    # so includedInDeck alone never flags it. The CLI must still skip cards whose
+    # primary category is named Sideboard / Maybeboard. (Real deck 23812677.)
+    payload = {
+        "name": "Sideboard Included Deck",
+        "categories": [
+            {"name": "Commander", "includedInDeck": True},
+            {"name": "Sideboard", "includedInDeck": True},
+            {"name": "Land", "includedInDeck": True},
+        ],
+        "cards": [
+            {
+                "categories": ["Commander"],
+                "quantity": 1,
+                "card": {"uid": "a", "oracleCard": {"name": "Rendmaw, Creaking Nest"}},
+            },
+            {
+                # primary = Sideboard (includedInDeck=True) — must be SKIPPED.
+                "categories": ["Sideboard", "SIDEBOARD"],
+                "quantity": 1,
+                "card": {"uid": "b", "oracleCard": {"name": "Beast Within"}},
+            },
+        ],
+    }
+    responses.add(
+        responses.GET,
+        "https://archidekt.com/api/decks/456/",
+        json=payload,
+        status=200,
+    )
+    jobs = fill._fetch_archidekt("456")
+    names = sorted(j.name for j in jobs)
+    assert names == ["Rendmaw, Creaking Nest"]
+
+
+@responses.activate
 def test_fetch_archidekt_4xx_raises_systemexit():
     responses.add(
         responses.GET,
