@@ -27,6 +27,7 @@ The frontend covers the same options as the CLI:
   Scryfall's `all_parts` metadata sometimes omits (slower, opt-in)
 - Token quantity — print one of each (default), or scale by deck-card minter
   count and optional doubler multiplier (Conservative / Standard / Aggressive)
+- Image quality — PNG (best, default) or Large JPG (~10× smaller and faster)
 - Custom default back (file upload or URL paste)
 
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
@@ -40,19 +41,21 @@ tcgplaytest order.
 
 ## CLI setup
 
+Dependencies are managed with [Poetry](https://python-poetry.org/):
+
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium    # only needed for upload.py
+pipx install poetry                       # or: pip install --user poetry
+poetry install --only main                # runtime deps only
+poetry run playwright install chromium    # only needed for upload.py
 ```
 
-For development (tests, lint, pre-commit hooks) use `dev-requirements.txt`
-instead — see [CONTRIBUTING.md](CONTRIBUTING.md).
+For development (tests, lint, pre-commit hooks) run `poetry install` (all
+groups) — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Step 1 — Generate images
 
 ```bash
-.venv/bin/python fill.py <deck_url_or_id> -o out --pair-backs
+poetry run python fill.py <deck_url_or_id> -o out --pair-backs
 ```
 
 Recognised inputs:
@@ -186,7 +189,7 @@ draft lives in that tab's storage until checkout.
 ### Automated
 
 ```bash
-.venv/bin/python upload.py out/ --user-data ./browser_profile
+poetry run python upload.py out/ --user-data ./browser_profile
 ```
 
 Drives the whole flow above. Detects `out/fronts/` + `out/backs/` and
@@ -201,6 +204,8 @@ fill.py [<deck_url_or_id>]
   --decklist PATH         Plain-text decklist (or '-' for stdin) instead of a URL
   --overrides DIR         Override-images dir (default: overrides)
   --workers N             Parallel image downloads (default: 6)
+  --image-quality FORMAT  Scryfall image format: 'png' (best, ~1.4 MB/card;
+                          default) or 'large' (JPG, ~10x smaller and faster)
   --skip-basic-lands      Drop basic lands from the output
   --pair-backs            Emit out/fronts/ + out/backs/ for Sequential Backs
   --default-back PATH     Custom default back for non-DFC cards (with --pair-backs)

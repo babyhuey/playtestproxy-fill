@@ -4,25 +4,29 @@ Most users will only ever need the [web frontend](https://babyhuey.github.io/pla
 
 ## Setup
 
+Dependencies are managed with [Poetry](https://python-poetry.org/):
+
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r dev-requirements.txt
-.venv/bin/playwright install chromium    # for upload.py + the frontend cache test
-.venv/bin/pre-commit install
+pipx install poetry                       # or: pip install --user poetry
+poetry install                            # runtime + dev deps
+poetry run playwright install chromium    # for upload.py + the frontend cache test
+poetry run pre-commit install
 ```
 
 `pre-commit install` wires ruff, a couple of file-hygiene hooks, and `pytest` so they run on every commit and your PR doesn't bounce on a lint nit or a unit-test regression. The pytest hook auto-skips the Playwright frontend cache test on machines that don't have `playwright` installed, so a fresh clone still passes — install Chromium (above) if you want the full local coverage CI runs.
 
 ## Running things locally
 
+Prefix commands with `poetry run` (or drop into the env once with `poetry shell`):
+
 | Command | What it does |
 |---|---|
-| `pytest` | Run the test suite (offline, mocked HTTP). |
-| `pytest --cov` | With coverage output. |
-| `ruff check fill.py upload.py tests` | Lint. |
-| `ruff format fill.py upload.py tests` | Auto-format. |
-| `python -m http.server --directory docs 8000` | Serve the frontend locally. |
-| `python fill.py <deck>` | Run the CLI against a real deck. |
+| `poetry run pytest` | Run the test suite (offline, mocked HTTP). |
+| `poetry run pytest --cov` | With coverage output. |
+| `poetry run ruff check fill.py upload.py tests` | Lint. |
+| `poetry run ruff format fill.py upload.py tests` | Auto-format. |
+| `poetry run python -m http.server --directory docs 8000` | Serve the frontend locally. |
+| `poetry run python fill.py <deck>` | Run the CLI against a real deck. |
 
 ## CI
 
