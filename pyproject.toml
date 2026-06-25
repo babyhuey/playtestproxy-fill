@@ -1,3 +1,29 @@
+[project]
+name = "playtestproxy-fill"
+version = "0.1.0"
+description = "Archidekt → TCGPlaytest print-ready card image pipeline (CLI + static web frontend)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+  "requests>=2.34.2",
+  "Pillow>=12.2.0",
+  "playwright>=1.60.0",
+]
+
+[tool.poetry]
+# Application repo (CLI + static frontend), not a published package — so
+# `package-mode = false`: Poetry manages the dependency env but never tries to
+# build or install fill.py / upload.py as an importable package.
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=9.1.1"
+pytest-cov = ">=7.1.0"
+responses = ">=0.26.1"
+ruff = ">=0.15.18"
+pre-commit = ">=4.6.0"
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

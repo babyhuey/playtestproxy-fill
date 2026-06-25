@@ -4,7 +4,7 @@
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    # Keep this rev close to the ruff CI installs (dev-requirements.txt).
+    # Keep this rev close to the ruff CI installs (pyproject.toml dev group).
     # Dependabot's pre-commit ecosystem will bump this automatically.
     rev: v0.15.18
     hooks:
@@ -29,8 +29,8 @@ repos:
       # plugin blows up at collection time if `playwright` itself isn't
       # importable, so we disable the plugin and skip the Playwright test
       # file on machines without it — fresh clone still passes. Devs who
-      # `pip install -r dev-requirements.txt && playwright install` get
-      # full coverage locally including the frontend cache test.
+      # `poetry install && poetry run playwright install` get full coverage
+      # locally including the frontend cache test.
       - id: pytest
         name: pytest
         entry: >-
