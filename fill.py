@@ -211,6 +211,10 @@ def _fetch_archidekt(deck_id: str) -> list[CardJob]:
     # category name → includedInDeck. A card with primary "Teenage Mutant Ninja
     # Turtles" but also tagged "Maybeboard" is in the deck; only cards whose
     # primary category is excluded are skipped.
+    #
+    # includedInDeck alone is NOT enough: Archidekt's built-in "Sideboard"
+    # category ships with includedInDeck=True, so sideboards would leak in.
+    # We also skip any primary category *named* Sideboard / Maybeboard.
     excluded_primary = {
         c["name"] for c in (data.get("categories") or []) if c.get("includedInDeck") is False
     }
@@ -218,7 +222,9 @@ def _fetch_archidekt(deck_id: str) -> list[CardJob]:
     for entry in data.get("cards", []):
         cats = entry.get("categories") or []
         primary = cats[0] if cats else None
-        if primary in excluded_primary:
+        if primary in excluded_primary or (
+            primary and primary.lower() in {"sideboard", "maybeboard"}
+        ):
             continue
         card = entry.get("card") or {}
         oracle = card.get("oracleCard") or {}
