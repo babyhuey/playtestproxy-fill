@@ -1824,6 +1824,38 @@ class TestFetchImageSchemeAllowlist:
             fill.fetch_image(url, fill.requests.Session())
 
 
+class TestScryfallJpgFallback:
+    PNG = "https://cards.scryfall.io/png/front/d/d/ddc88ce9.png?1767952612"
+
+    def test_fallbacks_for_png(self):
+        assert fill._scryfall_jpg_fallbacks(self.PNG) == [
+            "https://cards.scryfall.io/large/front/d/d/ddc88ce9.jpg?1767952612",
+            "https://cards.scryfall.io/normal/front/d/d/ddc88ce9.jpg?1767952612",
+        ]
+
+    def test_no_fallback_for_non_scryfall(self):
+        # Custom-art URLs (Archidekt customImageUrl) must be left untouched.
+        assert fill._scryfall_jpg_fallbacks("https://i.imgur.com/abc.png") == []
+        assert fill._scryfall_jpg_fallbacks("https://cards.scryfall.io/large/x.jpg") == []
+
+    @responses.activate
+    def test_png_404_falls_back_to_large_jpg(self):
+        # A negatively-cached 404 on the PNG must transparently fall back to the
+        # large JPG (a different CDN cache key) instead of failing the card.
+        buf = BytesIO()
+        Image.new("RGB", (4, 6)).save(buf, "PNG")
+        responses.add(responses.GET, self.PNG, status=404)
+        responses.add(
+            responses.GET,
+            "https://cards.scryfall.io/large/front/d/d/ddc88ce9.jpg?1767952612",
+            body=buf.getvalue(),
+            status=200,
+            content_type="image/jpeg",
+        )
+        out = fill.fetch_image(self.PNG, fill.requests.Session())
+        assert out.size == (4, 6)
+
+
 class TestScrubSource:
     def test_keeps_https_url(self):
         assert (

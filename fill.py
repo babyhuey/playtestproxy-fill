@@ -1561,6 +1561,27 @@ def _scrub_source(url: str | None) -> str | None:
     return url
 
 
+_SCRYFALL_PNG_RE = re.compile(r"^https://cards\.scryfall\.io/png/(?P<path>.+)\.png(?P<q>\?.*)?$")
+
+
+def _scryfall_jpg_fallbacks(url: str) -> list[str]:
+    """Alternate cache keys for a Scryfall PNG image URL.
+
+    Scryfall's CDN occasionally serves a *cached* 404 (Cloudflare negative
+    cache, ~1yr TTL) for one exact image URL while the same card's other
+    formats are fine — the poisoned entry is keyed by the exact path. The
+    `large` / `normal` JPGs live at different paths (different cache keys),
+    so retrying them sidesteps a poisoned PNG entry."""
+    m = _SCRYFALL_PNG_RE.match(url)
+    if not m:
+        return []
+    path, q = m.group("path"), m.group("q") or ""
+    return [
+        f"https://cards.scryfall.io/large/{path}.jpg{q}",
+        f"https://cards.scryfall.io/normal/{path}.jpg{q}",
+    ]
+
+
 def fetch_image(url: str, session: requests.Session) -> Image.Image:
     """Fetch a card image from disk (override) or HTTPS (Scryfall / Archidekt
     custom). Other schemes are rejected — an adversarial deck JSON could
@@ -1573,6 +1594,14 @@ def fetch_image(url: str, session: requests.Session) -> Image.Image:
     if url.startswith("file://"):
         return Image.open(url[7:]).convert("RGB")
     r = session.get(url, headers=UA, timeout=60)
+    # A 404 on a Scryfall PNG is usually a negatively-cached CDN miss, not a
+    # genuinely missing image — retry the JPG variants (different cache keys).
+    if r.status_code == 404:
+        for alt in _scryfall_jpg_fallbacks(url):
+            alt_r = session.get(alt, headers=UA, timeout=60)
+            if alt_r.status_code != 404:
+                r = alt_r
+                break
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
