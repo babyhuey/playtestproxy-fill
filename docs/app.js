@@ -273,22 +273,25 @@ async function fetchJson(url) {
   });
 }
 
-const SCRYFALL_PNG_RE = /^https:\/\/cards\.scryfall\.io\/png\/(.+)\.png(\?.*)?$/;
+const SCRYFALL_IMG_RE =
+  /^https:\/\/cards\.scryfall\.io\/(png|large|normal)\/(.+)\.(?:png|jpg)(\?.*)?$/;
+const SCRYFALL_FORMATS = ["png", "large", "normal"]; // quality, highest first
 
-function scryfallJpgFallbacks(url) {
+function scryfallImageFallbacks(url) {
   // Scryfall's CDN occasionally serves a *cached* 404 (Cloudflare negative
   // cache, ~1yr TTL) for one exact image URL while the same card's other
   // formats are fine — the poisoned entry is keyed by the exact path. The
-  // `large` / `normal` JPGs live at different paths (different cache keys),
-  // so retrying them sidesteps a poisoned PNG entry.
-  const m = SCRYFALL_PNG_RE.exec(url);
+  // lower-quality formats live at different paths (different cache keys), and
+  // are never larger than what was requested, so retrying them sidesteps a
+  // poisoned entry.
+  const m = SCRYFALL_IMG_RE.exec(url);
   if (!m) return [];
-  const path = m[1];
-  const q = m[2] || "";
-  return [
-    `https://cards.scryfall.io/large/${path}.jpg${q}`,
-    `https://cards.scryfall.io/normal/${path}.jpg${q}`,
-  ];
+  const fmt = m[1];
+  const path = m[2];
+  const q = m[3] || "";
+  return SCRYFALL_FORMATS.slice(SCRYFALL_FORMATS.indexOf(fmt) + 1).map(
+    (f) => `https://cards.scryfall.io/${f}/${path}.${f === "png" ? "png" : "jpg"}${q}`
+  );
 }
 
 function scryfallProxyFallback(url) {
@@ -309,7 +312,7 @@ async function fetchBlob(url) {
   // keys), then to an image proxy (different edge), before giving up. Non-404
   // errors retry the original via withRetry.
   const proxied = scryfallProxyFallback(url);
-  const candidates = [url, ...scryfallJpgFallbacks(url), ...(proxied ? [proxied] : [])];
+  const candidates = [url, ...scryfallImageFallbacks(url), ...(proxied ? [proxied] : [])];
   return withRetry(async () => {
     let last = "404 Not Found";
     for (const u of candidates) {
@@ -1174,35 +1177,37 @@ function scryfallCard(uid) {
   return promise;
 }
 
-async function _resolveSingle(job) {
+async function _resolveSingle(job, quality = "png") {
   // Returns { front, back } using only this job's own card data — DFC-aware.
+  // `quality` picks the Scryfall format: "png" (best) or "large" (~10x smaller).
+  const pick = (uris) => uris[quality] || uris.png;
   if (job.customUrl) return { front: job.customUrl, back: null };
   if (!job.uid) throw new Error("no Scryfall UID and no custom image");
   const data = await scryfallCard(job.uid);
-  if (data.image_uris) return { front: data.image_uris.png, back: null };
+  if (data.image_uris) return { front: pick(data.image_uris), back: null };
   const faces = data.card_faces || [];
   if (faces.length && faces.every((f) => f.image_uris)) {
     if (SINGLE_PIECE_LAYOUTS.has(data.layout || "")) {
-      return { front: faces[0].image_uris.png, back: null };
+      return { front: pick(faces[0].image_uris), back: null };
     }
-    return { front: faces[0].image_uris.png, back: faces[1].image_uris.png };
+    return { front: pick(faces[0].image_uris), back: pick(faces[1].image_uris) };
   }
   if (faces.length && faces[0].image_uris) {
-    return { front: faces[0].image_uris.png, back: null };
+    return { front: pick(faces[0].image_uris), back: null };
   }
   throw new Error(`no image_uris for ${data.name || job.uid}`);
 }
 
-async function resolveUrls(job) {
+async function resolveUrls(job, quality = "png") {
   // Returns { front, back }. `back` is null unless this is a DFC OR the
   // job carries a `pairBackUid` (set by pairTokens() to print two tokens
   // back-to-back). The paired back is the OTHER token's front face — and
   // some "tokens" (e.g. werewolf transform tokens) are themselves DFCs
   // whose image lives on card_faces[0], not top-level image_uris. Reuse
   // _resolveSingle so we get the same DFC handling as a normal job.
-  const own = await _resolveSingle(job);
+  const own = await _resolveSingle(job, quality);
   if (job.pairBackUid) {
-    const other = await _resolveSingle({ uid: job.pairBackUid, customUrl: null });
+    const other = await _resolveSingle({ uid: job.pairBackUid, customUrl: null }, quality);
     return { front: own.front, back: other.front };
   }
   return own;
@@ -1530,7 +1535,7 @@ async function processJob(state, job, opts, zip, gallery) {
   // state.slot is mutated to assign sequential slot numbers across all jobs
   // so fronts/<NNN>.png and backs/<NNN>.png stay aligned for tcgplaytest's
   // Sequential Backs feature.
-  const { front, back } = await resolveUrls(job);
+  const { front, back } = await resolveUrls(job, opts.imageQuality);
 
   const frontBlob = await fetchBlob(front);
   const backBlob = back ? await fetchBlob(back) : null;
@@ -1961,6 +1966,7 @@ async function run() {
       pairTokens: $("opt-pair-tokens").checked,
       tokensThorough: $("opt-tokens-thorough").checked,
       tokenQty: $("opt-token-qty").value || "one",
+      imageQuality: $("opt-image-quality").value || "png",
     };
     zip = new JSZip();
     state = {
