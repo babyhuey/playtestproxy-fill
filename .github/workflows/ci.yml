@@ -16,43 +16,46 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install Poetry
+        # pipx is preinstalled on ubuntu-latest; this puts `poetry` on PATH so
+        # setup-python's `cache: poetry` can find the lock file below.
+        run: pipx install poetry
+
       - uses: actions/setup-python@v6
         with:
           python-version: "3.14"
-          cache: pip
+          cache: poetry
 
-      - name: Install dev + runtime deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r dev-requirements.txt
+      - name: Install deps
+        run: poetry install
 
       - name: Cache Playwright browsers
-        # ~300MB of Chromium binaries; pip's cache doesn't cover them.
-        # Key on dev-requirements.txt so a Playwright bump invalidates.
+        # ~300MB of Chromium binaries; the dependency cache doesn't cover them.
+        # Key on poetry.lock so a Playwright bump invalidates.
         id: playwright-cache
         uses: actions/cache@v5
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('dev-requirements.txt') }}
+          key: playwright-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
 
       - name: Install Chromium for Playwright tests
         # `--with-deps` runs apt-get for system libs; ubuntu-latest already
         # has most of them so this is a few seconds even on a cache hit.
         # On miss it downloads ~300MB which the cache step catches next time.
-        run: playwright install --with-deps chromium
+        run: poetry run playwright install --with-deps chromium
 
       - name: Lint
-        run: ruff check fill.py upload.py tests
+        run: poetry run ruff check fill.py upload.py tests
 
       - name: Format check
-        run: ruff format --check fill.py upload.py tests
+        run: poetry run ruff format --check fill.py upload.py tests
 
       - name: Import smoke test
         # Cheap pre-test guard for syntax / missing imports.
-        run: python -c "import fill, upload"
+        run: poetry run python -c "import fill, upload"
 
       - name: Tests + coverage
-        run: pytest --cov --cov-report=term-missing --cov-report=xml
+        run: poetry run pytest --cov --cov-report=term-missing --cov-report=xml
 
       - name: Upload coverage artifact
         if: always()
