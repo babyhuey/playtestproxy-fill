@@ -132,7 +132,7 @@ Sideboard
 </main>
 
 <footer>
-  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall (cards + decks) and the bundled image are fetched directly.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall (cards + decks) and the bundled image are fetched directly; a card image that Scryfall's CDN fails to serve falls back through the <a href="https://images.weserv.nl/" target="_blank" rel="noopener">images.weserv.nl</a> proxy.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 
