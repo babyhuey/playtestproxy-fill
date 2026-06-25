@@ -972,20 +972,27 @@ def scryfall_card_payload(uid: str, session: requests.Session) -> dict:
     return d
 
 
-def scryfall_image_urls(uid: str, session: requests.Session) -> tuple[str, str | None]:
-    """Return (front_png_url, back_png_url_or_None). For transform / MDFC cards
-    this carries both faces so the caller can pair them per-slot."""
+def scryfall_image_urls(
+    uid: str, session: requests.Session, quality: str = "png"
+) -> tuple[str, str | None]:
+    """Return (front_url, back_url_or_None). For transform / MDFC cards this
+    carries both faces so the caller can pair them per-slot. `quality` picks the
+    Scryfall format: "png" (best) or "large" (JPG, ~10x smaller)."""
+
+    def pick(uris: dict) -> str:
+        return uris.get(quality) or uris["png"]
+
     d = scryfall_card_payload(uid, session)
     layout = d.get("layout", "")
     if "image_uris" in d:
-        return d["image_uris"]["png"], None
+        return pick(d["image_uris"]), None
     faces = d.get("card_faces") or []
     if faces and all("image_uris" in f for f in faces):
         if layout in SINGLE_PIECE_LAYOUTS:
-            return faces[0]["image_uris"]["png"], None
-        return faces[0]["image_uris"]["png"], faces[1]["image_uris"]["png"]
+            return pick(faces[0]["image_uris"]), None
+        return pick(faces[0]["image_uris"]), pick(faces[1]["image_uris"])
     if faces and "image_uris" in faces[0]:
-        return faces[0]["image_uris"]["png"], None
+        return pick(faces[0]["image_uris"]), None
     raise RuntimeError(f"No image_uris for {uid} ({d.get('name')})")
 
 
@@ -1498,7 +1505,7 @@ def scryfall_token_refs(uid: str, session: requests.Session) -> list[tuple[str, 
 
 
 def resolve_urls(
-    job: CardJob, override_dir: Path, session: requests.Session
+    job: CardJob, override_dir: Path, session: requests.Session, quality: str = "png"
 ) -> tuple[str, str | None]:
     """Return (front_url, back_url_or_None). Override files take precedence.
     Override convention: `<slug>.png` for the front, `<slug>.back.png` for the
@@ -1523,7 +1530,7 @@ def resolve_urls(
     scry_front: str | None = None
     scry_back: str | None = None
     if need_scryfall_front or need_scryfall_back:
-        scry_front, scry_back = scryfall_image_urls(job.scryfall_uid, session)
+        scry_front, scry_back = scryfall_image_urls(job.scryfall_uid, session, quality)
 
     if front_override.exists():
         front = f"file://{front_override.resolve()}"
@@ -1539,7 +1546,7 @@ def resolve_urls(
     elif job.pair_back_uid:
         # Tokens are usually single-faced, so the second tuple element from
         # scryfall_image_urls is irrelevant for the common case.
-        back, _ = scryfall_image_urls(job.pair_back_uid, session)
+        back, _ = scryfall_image_urls(job.pair_back_uid, session, quality)
     elif need_scryfall_back:
         back = scry_back
     else:
@@ -1561,24 +1568,27 @@ def _scrub_source(url: str | None) -> str | None:
     return url
 
 
-_SCRYFALL_PNG_RE = re.compile(r"^https://cards\.scryfall\.io/png/(?P<path>.+)\.png(?P<q>\?.*)?$")
+_SCRYFALL_IMG_RE = re.compile(
+    r"^https://cards\.scryfall\.io/(?P<fmt>png|large|normal)/(?P<path>.+)\.(?:png|jpg)(?P<q>\?.*)?$"
+)
+_SCRYFALL_FORMATS = ("png", "large", "normal")  # quality, highest first
 
 
-def _scryfall_jpg_fallbacks(url: str) -> list[str]:
-    """Alternate cache keys for a Scryfall PNG image URL.
+def _scryfall_image_fallbacks(url: str) -> list[str]:
+    """Lower-quality formats of the same Scryfall card image.
 
     Scryfall's CDN occasionally serves a *cached* 404 (Cloudflare negative
     cache, ~1yr TTL) for one exact image URL while the same card's other
-    formats are fine — the poisoned entry is keyed by the exact path. The
-    `large` / `normal` JPGs live at different paths (different cache keys),
-    so retrying them sidesteps a poisoned PNG entry."""
-    m = _SCRYFALL_PNG_RE.match(url)
+    formats are fine — the poisoned entry is keyed by the exact path. Lower
+    formats live at different paths (different cache keys), and are never larger
+    than what was requested, so retrying them sidesteps a poisoned entry."""
+    m = _SCRYFALL_IMG_RE.match(url)
     if not m:
         return []
-    path, q = m.group("path"), m.group("q") or ""
+    fmt, path, q = m.group("fmt"), m.group("path"), m.group("q") or ""
+    lower = _SCRYFALL_FORMATS[_SCRYFALL_FORMATS.index(fmt) + 1 :]
     return [
-        f"https://cards.scryfall.io/large/{path}.jpg{q}",
-        f"https://cards.scryfall.io/normal/{path}.jpg{q}",
+        f"https://cards.scryfall.io/{f}/{path}.{'png' if f == 'png' else 'jpg'}{q}" for f in lower
     ]
 
 
@@ -1605,9 +1615,9 @@ def fetch_image(url: str, session: requests.Session) -> Image.Image:
     if url.startswith("file://"):
         return Image.open(url[7:]).convert("RGB")
     # A 404 on a Scryfall image is usually a negatively-cached CDN miss, not a
-    # genuinely missing image — try the JPG variants (different cache keys),
-    # then an image proxy (different edge), before giving up.
-    candidates = [url, *_scryfall_jpg_fallbacks(url)]
+    # genuinely missing image — try the lower-quality variants (different cache
+    # keys), then an image proxy (different edge), before giving up.
+    candidates = [url, *_scryfall_image_fallbacks(url)]
     proxied = _scryfall_proxy_fallback(url)
     if proxied:
         candidates.append(proxied)
@@ -1706,6 +1716,13 @@ def main() -> int:
         "deck cards minting this token, cap 4. 'standard' = same, doubled "
         "if any doubler (Doubling Season etc.) is in the deck, cap 8. "
         "'aggressive' = 4x for two or more doublers, cap 12.",
+    )
+    ap.add_argument(
+        "--image-quality",
+        choices=("png", "large"),
+        default="png",
+        help="Scryfall image format: 'png' (best quality, ~1.4 MB/card; default) "
+        "or 'large' (JPG, ~10x smaller and faster to download).",
     )
     args = ap.parse_args()
 
@@ -1808,7 +1825,7 @@ def main() -> int:
 
     def process(idx: int, job: CardJob):
         try:
-            front_url, back_url = resolve_urls(job, overrides, session)
+            front_url, back_url = resolve_urls(job, overrides, session, args.image_quality)
             front_img = fetch_image(front_url, session)
             back_img = fetch_image(back_url, session) if back_url else None
             return idx, job, front_img, back_img, front_url, back_url, None

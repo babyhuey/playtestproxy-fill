@@ -46,6 +46,19 @@ jobs:
           }
           EOF
 
+      - name: Cache-bust app.js / style.css
+        # Bare href="style.css" / src="app.js" let a browser keep serving the
+        # cached copy after a deploy (users get stale JS until the CDN TTL
+        # lapses). Stamp the short commit SHA as a query so every deploy busts
+        # the cache. Only the published artifact is rewritten — the repo source
+        # keeps clean, queryless refs.
+        run: |
+          v="${GITHUB_SHA::7}"
+          sed -i \
+            -e "s|href=\"style.css\"|href=\"style.css?v=$v\"|" \
+            -e "s|src=\"app.js\"|src=\"app.js?v=$v\"|" \
+            docs/index.html
+
       - uses: actions/configure-pages@v6
 
       - uses: actions/upload-pages-artifact@v5

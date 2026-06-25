@@ -48,7 +48,7 @@
 
     <div id="mode-url-pane">
       <label for="deck-input">Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC, or mtgdecks.net</label>
-      <input id="deck-input" type="text" placeholder="archidekt.com/decks/…  ·  moxfield.com/decks/…  ·  scryfall.com/@user/decks/…  ·  deckbox.org/sets/…  ·  tappedout.net/mtg-decks/…  ·  edhrec.com/deckpreview/…  ·  mtgdecks.net/<format>/…" autocomplete="off">
+      <input id="deck-input" type="text" placeholder="paste a deck URL or ID — e.g. archidekt.com/decks/12345" autocomplete="off">
     </div>
 
     <div id="mode-text-pane" hidden>
@@ -77,6 +77,12 @@ Sideboard
             <option value="conservative">Conservative — minter count, cap 4</option>
             <option value="standard">Standard — minter count + doublers, cap 8</option>
             <option value="aggressive">Aggressive — minter count + 4× doublers, cap 12</option>
+          </select>
+        </label>
+        <label class="check">Image quality:
+          <select id="opt-image-quality">
+            <option value="png">PNG — best quality, large files (default)</option>
+            <option value="large">Large JPG — ~10× smaller &amp; faster</option>
           </select>
         </label>
       </div>
