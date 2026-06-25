@@ -273,12 +273,39 @@ async function fetchJson(url) {
   });
 }
 
+const SCRYFALL_PNG_RE = /^https:\/\/cards\.scryfall\.io\/png\/(.+)\.png(\?.*)?$/;
+
+function scryfallJpgFallbacks(url) {
+  // Scryfall's CDN occasionally serves a *cached* 404 (Cloudflare negative
+  // cache, ~1yr TTL) for one exact image URL while the same card's other
+  // formats are fine — the poisoned entry is keyed by the exact path. The
+  // `large` / `normal` JPGs live at different paths (different cache keys),
+  // so retrying them sidesteps a poisoned PNG entry.
+  const m = SCRYFALL_PNG_RE.exec(url);
+  if (!m) return [];
+  const path = m[1];
+  const q = m[2] || "";
+  return [
+    `https://cards.scryfall.io/large/${path}.jpg${q}`,
+    `https://cards.scryfall.io/normal/${path}.jpg${q}`,
+  ];
+}
+
 async function fetchBlob(url) {
+  // Scryfall CDN returns CORS * (verified 2026-04), so direct fetch works.
+  // A 404 on a Scryfall PNG is usually a negatively-cached CDN miss, not a
+  // genuinely missing image — fall back to the JPG variants (different cache
+  // keys) before giving up. Non-404 errors retry the original via withRetry.
+  const candidates = [url, ...scryfallJpgFallbacks(url)];
   return withRetry(async () => {
-    // Scryfall CDN returns CORS * (verified 2026-04), so direct fetch works.
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`image ${r.status} ${r.statusText}`);
-    return r.blob();
+    let last = "404 Not Found";
+    for (const u of candidates) {
+      const r = await fetch(u);
+      if (r.ok) return r.blob();
+      last = `${r.status} ${r.statusText}`;
+      if (r.status !== 404) break;
+    }
+    throw new Error(`image ${last}`);
   });
 }
 
