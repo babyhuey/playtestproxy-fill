@@ -46,8 +46,19 @@ SAVE_DRAFT_BUTTON = re.compile(r"Save Draft", re.I)
 COOKIE_ACCEPT = "Accept"
 
 
+def _slot_sort_key(p: Path) -> tuple[int, int, str]:
+    """Order files by their numeric slot prefix (`012_name.png`) so
+    `1000_` sorts after `999_` — lexical order would misalign Sequential
+    Backs on 1000+ card runs. Unprefixed files sort after, by name."""
+    m = re.match(r"(\d+)_", p.name)
+    return (0, int(m.group(1)), p.name) if m else (1, 0, p.name)
+
+
 def collect_files(d: Path) -> list[Path]:
-    files = sorted(p for p in d.iterdir() if p.suffix.lower() in EXTS and p.is_file())
+    files = sorted(
+        (p for p in d.iterdir() if p.suffix.lower() in EXTS and p.is_file()),
+        key=_slot_sort_key,
+    )
     if not files:
         raise SystemExit(f"No PNG/JPG files in {d}")
     return files
@@ -88,7 +99,8 @@ async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 1
 
 async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
     """On the Customize Back step, push back images into the Sequential Backs
-    file input. Returns True on success."""
+    file input. Returns True on confirmed success; False when a step couldn't
+    be verified (missing input, bleed modal never appeared, ...)."""
     try:
         await page.get_by_role("button", name=NEXT_BACK_BUTTON).click(timeout=5000)
     except Exception as e:
@@ -123,6 +135,7 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
     await target.set_input_files([str(p) for p in back_files])
     # Wait for whichever bleed-modal variant appears (front/back step text
     # differs).
+    modal_clicked = False
     for _ in range(60):
         visible = await page.evaluate(
             "(titles) => titles.some(t => document.body.innerText.includes(t))",
@@ -132,10 +145,21 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
             try:
                 await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(timeout=3000)
                 print(f"  selected: {BLEED_OPTION_PRE_BLED} (backs)")
+                modal_clicked = True
                 break
             except Exception:
                 pass
         await asyncio.sleep(1)
+    if not modal_clicked:
+        # The 60s window expiring without a modal used to fall through and
+        # report success anyway. It may be benign (the site can remember the
+        # front step's bleed choice) — but we can't confirm the backs were
+        # accepted, so say so loudly and let the caller flag the run.
+        print(
+            "  WARNING: bleed modal never appeared for backs — cannot confirm "
+            f"the {BLEED_OPTION_PRE_BLED!r} setting was applied. Verify the "
+            "backs in the browser before ordering."
+        )
     for _ in range(180):
         if not await _processing_visible(page):
             break
@@ -148,7 +172,7 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
         except Exception:
             pass
     await asyncio.sleep(2)
-    return True
+    return modal_clicked
 
 
 async def run(
@@ -196,16 +220,16 @@ async def run(
             pass
 
         # The Fronts uploader: a styled dropzone with a hidden <input type=file
-        # accept="image/*" multiple>. Set files directly.
-        inputs = await page.query_selector_all('input[type="file"]')
-        front_input = None
-        for el in inputs:
-            accept = (await el.get_attribute("accept")) or ""
-            if "image" in accept.lower():
-                front_input = el
-                break
-        if front_input is None:
-            raise SystemExit("Could not find image file input")
+        # accept="image/*" multiple>. Set files directly. Re-queried per chunk
+        # below — the element handle can go stale when the page re-renders
+        # between batch uploads.
+        async def find_front_input():
+            inputs = await page.query_selector_all('input[type="file"]')
+            for el in inputs:
+                accept = (await el.get_attribute("accept")) or ""
+                if "image" in accept.lower():
+                    return el
+            return None
 
         # The site processes uploads in-browser (Canvas2D readback). Very large
         # batches can stall it. Upload in chunks if requested.
@@ -251,6 +275,9 @@ async def run(
         running_total = 0
         for ci, chunk in enumerate(chunks, 1):
             print(f"[{ci}/{len(chunks)}] uploading {len(chunk)} files...")
+            front_input = await find_front_input()
+            if front_input is None:
+                raise SystemExit("Could not find image file input")
             await front_input.set_input_files([str(p) for p in chunk])
             running_total += len(chunk)
             count = await wait_for_processing_done(page, running_total)
@@ -293,7 +320,11 @@ async def run(
                 "upload before continuing."
             )
         elif backs_dir and back_files:
-            await upload_sequential_backs(page, back_files)
+            if not await upload_sequential_backs(page, back_files):
+                print(
+                    "WARNING: sequential backs could not be confirmed — verify "
+                    "them in the browser before ordering."
+                )
 
         if save_draft and final == len(files):
             try:

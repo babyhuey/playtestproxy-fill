@@ -41,17 +41,17 @@
 
 <main>
   <section class="card">
-    <div class="mode-toggle" role="tablist">
-      <button id="mode-url" class="mode-btn active" role="tab" aria-selected="true">Deck URL / ID</button>
-      <button id="mode-text" class="mode-btn" role="tab" aria-selected="false">Paste decklist</button>
+    <div class="mode-toggle" role="tablist" aria-label="Deck input mode">
+      <button id="mode-url" class="mode-btn active" role="tab" aria-selected="true" aria-controls="mode-url-pane">Deck URL / ID</button>
+      <button id="mode-text" class="mode-btn" role="tab" aria-selected="false" aria-controls="mode-text-pane" tabindex="-1">Paste decklist</button>
     </div>
 
-    <div id="mode-url-pane">
+    <div id="mode-url-pane" role="tabpanel" aria-labelledby="mode-url">
       <label for="deck-input">Archidekt, Moxfield, Scryfall, Deckbox, TappedOut, EDHREC, or mtgdecks.net</label>
       <input id="deck-input" type="text" placeholder="paste a deck URL or ID — e.g. archidekt.com/decks/12345" autocomplete="off">
     </div>
 
-    <div id="mode-text-pane" hidden>
+    <div id="mode-text-pane" role="tabpanel" aria-labelledby="mode-text" hidden>
       <label for="decklist-input">Decklist — one card per line, or a CSV export</label>
       <textarea id="decklist-input" rows="8" placeholder="1 Sol Ring
 4 Lightning Bolt (M21) 162
@@ -64,6 +64,7 @@ Sideboard
 
     <details class="opts">
       <summary>Options</summary>
+      <p id="opts-locked-note" class="hint small" hidden>Options are locked while adding to this order — the whole batch uses the first deck's settings.</p>
       <div class="opts-grid">
         <label class="check"><input id="opt-skip-side" type="checkbox" checked> Skip Sideboard / Maybeboard</label>
         <label class="check"><input id="opt-skip-basics" type="checkbox"> Skip basic lands</label>
@@ -100,8 +101,8 @@ Sideboard
     </details>
 
     <button id="go" class="primary">Fetch &amp; build</button>
-    <div id="status" class="status"></div>
-    <progress id="progress" max="1" value="0" hidden></progress>
+    <div id="status" class="status" aria-live="polite"></div>
+    <progress id="progress" max="1" value="0" aria-label="Build progress" hidden></progress>
 
     <div id="result" class="result" hidden>
       <div class="result-row">
