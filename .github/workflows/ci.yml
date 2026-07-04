@@ -33,7 +33,7 @@ jobs:
         # ~300MB of Chromium binaries; the dependency cache doesn't cover them.
         # Key on poetry.lock so a Playwright bump invalidates.
         id: playwright-cache
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
