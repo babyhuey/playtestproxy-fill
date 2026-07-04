@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import sys
 import time
 from io import BytesIO
 from pathlib import Path
@@ -11,6 +13,7 @@ import responses
 from PIL import Image
 
 import fill
+import upload
 
 # --- Pure helpers --------------------------------------------------------
 
@@ -586,6 +589,40 @@ def test_fetch_archidekt_4xx_raises_systemexit():
 
 
 @responses.activate
+def test_fetch_archidekt_zero_quantity_skipped():
+    """A missing quantity defaults to 1 copy, but an explicit 0 (or negative)
+    means the card isn't in the deck — it must not coerce to 1."""
+    payload = {
+        "name": "Qty Deck",
+        "categories": [],
+        "cards": [
+            {
+                "categories": [],
+                "quantity": 0,
+                "card": {"uid": "z", "oracleCard": {"name": "Zeroed Out"}},
+            },
+            {
+                "categories": [],
+                "card": {"uid": "m", "oracleCard": {"name": "Missing Qty"}},
+            },
+            {
+                "categories": [],
+                "quantity": 2,
+                "card": {"uid": "t", "oracleCard": {"name": "Two Copies"}},
+            },
+        ],
+    }
+    responses.add(
+        responses.GET,
+        "https://archidekt.com/api/decks/789/",
+        json=payload,
+        status=200,
+    )
+    jobs = fill._fetch_archidekt("789")
+    assert [(j.name, j.qty) for j in jobs] == [("Missing Qty", 1), ("Two Copies", 2)]
+
+
+@responses.activate
 def test_fetch_moxfield_walks_deck_boards_and_sorts():
     payload = {
         "name": "Test Mox",
@@ -887,45 +924,6 @@ def test_fetch_mtgdecks_404_surfaces_clean_error():
         fill._fetch_mtgdecks("Standard/missing-deck-33333")
 
 
-@responses.activate
-def test_scryfall_lookup_set_and_collector_first():
-    """When set+collector are known, hit the more specific endpoint first
-    and skip the named fallback."""
-    responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/m21/162",
-        json={"id": "uid-set-cn"},
-        status=200,
-    )
-    uid = fill._scryfall_lookup_named("Lightning Bolt", "m21", "162", fill.requests.Session())
-    assert uid == "uid-set-cn"
-
-
-@responses.activate
-def test_scryfall_lookup_falls_back_when_set_unknown():
-    """Set+collector misses; named-with-set 404s; named-only finally hits."""
-    responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/zzz/999",
-        json={"details": "no such card"},
-        status=404,
-    )
-    responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/named",
-        json={"details": "no such printing"},
-        status=404,
-    )
-    responses.add(
-        responses.GET,
-        "https://api.scryfall.com/cards/named",
-        json={"id": "uid-fallback"},
-        status=200,
-    )
-    uid = fill._scryfall_lookup_named("Sol Ring", "zzz", "999", fill.requests.Session())
-    assert uid == "uid-fallback"
-
-
 def test_make_default_back_missing_file_raises(monkeypatch, tmp_path):
     """If the bundled default_back.png is missing, give a clear error."""
     monkeypatch.setattr(fill, "DEFAULT_BACK_FILE", tmp_path / "absent.png")
@@ -995,6 +993,107 @@ def test_jobs_from_decklist_falls_back_to_name_when_set_cn_misses():
     assert len(jobs) == 1
     assert jobs[0].name == "Sol Ring"
     assert jobs[0].scryfall_uid == "sr-uid"
+
+
+@responses.activate
+def test_jobs_from_decklist_same_name_distinct_printings():
+    """Two pinned printings of the same name must resolve to distinct UIDs —
+    /cards/collection results are paired back to the identifiers positionally,
+    not indexed by card name (which would collapse both onto the first)."""
+    text = "1 Island (sld) 101\n1 Island (ust) 212\n"
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "sld-island", "name": "Island"},
+                {"id": "ust-island", "name": "Island"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(text)
+    assert [j.scryfall_uid for j in jobs] == ["sld-island", "ust-island"]
+
+
+@responses.activate
+def test_jobs_from_decklist_canonicalized_name_with_set_cn_pin_resolves():
+    """A set/cn-pinned line whose typed name differs from Scryfall's canonical
+    form (plain apostrophe / no diacritic) resolves via its own result slot
+    instead of being falsely reported unresolved by the name lookup."""
+    text = "1 Lim-Dul's Vault (all) 84\n"
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "ldv-uid", "name": "Lim-Dûl's Vault"}],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(text)
+    assert len(jobs) == 1
+    assert jobs[0].scryfall_uid == "ldv-uid"
+    # Resolved in the first pass — no name-only fallback batch fired.
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_jobs_from_decklist_name_line_does_not_hijack_set_pin():
+    """A name-only line appearing before a set-pinned line of the same name
+    must not steal the pin — each entry gets its own result slot's UID."""
+    text = "1 Island\n1 Island (ust) 212\n"
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {"id": "basic-island", "name": "Island"},
+                {"id": "ust-island", "name": "Island"},
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(text)
+    assert [j.scryfall_uid for j in jobs] == ["basic-island", "ust-island"]
+
+
+@responses.activate
+def test_jobs_from_decklist_not_found_skips_correct_slot():
+    """`not_found` identifiers are skipped in-order when pairing results, so
+    an entry after a miss still gets its own result — not its neighbour's."""
+    text = "1 Sol Ring (zzz) 999\n1 Arcane Signet\n"
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "as-uid", "name": "Arcane Signet"}],
+            "not_found": [{"set": "zzz", "collector_number": "999"}],
+        },
+        status=200,
+    )
+    # Fallback batch: Sol Ring retried by bare name.
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "sr-uid", "name": "Sol Ring"}],
+            "not_found": [],
+        },
+        status=200,
+    )
+    jobs = fill._jobs_from_decklist(text)
+    assert [(j.name, j.scryfall_uid) for j in jobs] == [
+        ("Sol Ring", "sr-uid"),
+        ("Arcane Signet", "as-uid"),
+    ]
 
 
 @responses.activate
@@ -1104,8 +1203,13 @@ def test_jobs_from_decklist_warns_on_unresolved(capsys):
         status=200,
     )
     jobs = fill._jobs_from_decklist(text)
-    assert len(jobs) == 1
+    assert len(jobs) == 2
     assert jobs[0].name == "Real Card"
+    assert jobs[0].scryfall_uid == "uid-1"
+    # Unresolved entries stay in the job list with no UID so the image
+    # pipeline records them as failures and the run exits non-zero.
+    assert jobs[1].name == "Bogus Made Up Card"
+    assert jobs[1].scryfall_uid is None
     out = capsys.readouterr().out
     assert "could not be resolved" in out
     assert "Bogus Made Up Card" in out
@@ -1126,6 +1230,71 @@ def test_scryfall_card_payload_caches():
     b = fill.scryfall_card_payload("uid-cache", s)
     assert a is b
     assert len(responses.calls) == 1  # only one HTTP request
+
+
+@responses.activate
+def test_scryfall_card_payload_retries_on_429_with_retry_after(monkeypatch):
+    """The per-card payload fetch shares the collection endpoint's transient
+    handling: a 429 waits out Retry-After and retries instead of crashing
+    the worker thread."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(fill.time, "sleep", lambda s: sleeps.append(s))
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-429",
+        json={"details": "Too Many Requests"},
+        status=429,
+        headers={"Retry-After": "2"},
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-429",
+        json={"id": "uid-429", "name": "Retried"},
+        status=200,
+    )
+    d = fill.scryfall_card_payload("uid-429", fill.requests.Session())
+    assert d["id"] == "uid-429"
+    assert 2.0 in sleeps
+
+
+@responses.activate
+def test_scryfall_card_payload_retries_transient_5xx(monkeypatch):
+    monkeypatch.setattr(fill.time, "sleep", lambda s: None)
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-5xx",
+        json={"details": "upstream hiccup"},
+        status=503,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-5xx",
+        json={"id": "uid-5xx", "name": "Recovered"},
+        status=200,
+    )
+    d = fill.scryfall_card_payload("uid-5xx", fill.requests.Session())
+    assert d["id"] == "uid-5xx"
+
+
+@responses.activate
+def test_scryfall_card_payload_retries_connection_error(monkeypatch):
+    monkeypatch.setattr(fill.time, "sleep", lambda s: None)
+    fill._scryfall_payload_cache.clear()
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-conn",
+        body=fill.requests.ConnectionError("connection reset"),
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-conn",
+        json={"id": "uid-conn", "name": "Recovered"},
+        status=200,
+    )
+    d = fill.scryfall_card_payload("uid-conn", fill.requests.Session())
+    assert d["id"] == "uid-conn"
 
 
 @responses.activate
@@ -1265,8 +1434,9 @@ def test_discover_tokens_end_to_end():
     assert new_jobs[0].scryfall_uid == "treasure-uid"
     assert len(failures) == 1
     assert "CardC" in failures[0]
-    # No HTTP call for the Custom job: only card-a, card-b, card-c got hit.
-    assert len(responses.calls) == 3
+    # No HTTP call for the Custom job: card-a and card-b once each, plus
+    # card-c's three attempts (persistent 5xx is retried before failing).
+    assert len(responses.calls) == 5
 
 
 @responses.activate
@@ -2818,6 +2988,47 @@ def test_fetch_image_downloads_url():
     assert out.size == (8, 16)
 
 
+@responses.activate
+def test_fetch_image_retries_transient_5xx(monkeypatch):
+    """One 503 must not fail the card — the URL is retried with a brief
+    backoff. Non-Scryfall URL so no format-fallback ladder is in play."""
+    monkeypatch.setattr(fill.time, "sleep", lambda s: None)
+    buf = BytesIO()
+    Image.new("RGB", (4, 6)).save(buf, "PNG")
+    responses.add(responses.GET, "https://i.example.com/card.png", status=503)
+    responses.add(
+        responses.GET,
+        "https://i.example.com/card.png",
+        body=buf.getvalue(),
+        status=200,
+        content_type="image/png",
+    )
+    out = fill.fetch_image("https://i.example.com/card.png", fill.requests.Session())
+    assert out.size == (4, 6)
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_fetch_image_retries_connection_error(monkeypatch):
+    monkeypatch.setattr(fill.time, "sleep", lambda s: None)
+    buf = BytesIO()
+    Image.new("RGB", (4, 6)).save(buf, "PNG")
+    responses.add(
+        responses.GET,
+        "https://i.example.com/card.png",
+        body=fill.requests.ConnectionError("connection reset"),
+    )
+    responses.add(
+        responses.GET,
+        "https://i.example.com/card.png",
+        body=buf.getvalue(),
+        status=200,
+        content_type="image/png",
+    )
+    out = fill.fetch_image("https://i.example.com/card.png", fill.requests.Session())
+    assert out.size == (4, 6)
+
+
 # --- fetch_deck dispatcher ----------------------------------------------
 
 
@@ -2837,3 +3048,225 @@ def test_fetch_deck_dispatches_to_archidekt(monkeypatch):
 def test_fetch_deck_dispatches_cloudflare_helpfully(monkeypatch):
     with pytest.raises(SystemExit, match="Cloudflare"):
         fill.fetch_deck("https://deckstats.net/decks/1/2")
+
+
+# --- decklist file decoding -----------------------------------------------
+
+
+class TestReadDecklistText:
+    def test_utf8(self, tmp_path):
+        p = tmp_path / "deck.txt"
+        p.write_text("1 Lim-Dûl's Vault\n", encoding="utf-8")
+        assert fill._read_decklist_text(p) == "1 Lim-Dûl's Vault\n"
+
+    def test_cp1252_fallback(self, tmp_path):
+        # Windows exports ship smart quotes / accented chars as cp1252 bytes,
+        # which are invalid UTF-8 — the reader must fall back, not traceback.
+        p = tmp_path / "deck.txt"
+        p.write_bytes('1 "Ach! Hans, Run!"\n1 Lim-Dûl’s Vault\n'.encode("cp1252"))
+        text = fill._read_decklist_text(p)
+        assert "Lim-Dûl’s Vault" in text
+
+    def test_undecodable_raises_clean_error(self, tmp_path):
+        # 0x81 / 0x8d are invalid UTF-8 starts AND undefined in cp1252.
+        p = tmp_path / "deck.bin"
+        p.write_bytes(b"\x81\x8d\x8f")
+        with pytest.raises(SystemExit, match="Could not decode"):
+            fill._read_decklist_text(p)
+
+
+# --- PNG write dedupe ------------------------------------------------------
+
+
+def test_save_png_once_encodes_once_then_copies(tmp_path, monkeypatch):
+    """The expensive optimize=True encode runs once per unique image object;
+    further copies are byte-copies of the first file."""
+    img = Image.new("RGB", (4, 6), (200, 0, 0))
+    other = Image.new("RGB", (4, 6), (0, 0, 200))
+    encodes: list[Path] = []
+    original_save = Image.Image.save
+
+    def counting_save(self, fp, *a, **k):
+        encodes.append(fp)
+        return original_save(self, fp, *a, **k)
+
+    monkeypatch.setattr(Image.Image, "save", counting_save)
+    written: dict[int, Path] = {}
+    fill._save_png_once(img, tmp_path / "a.png", written)
+    fill._save_png_once(img, tmp_path / "b.png", written)
+    fill._save_png_once(other, tmp_path / "c.png", written)
+    assert encodes == [tmp_path / "a.png", tmp_path / "c.png"]
+    assert (tmp_path / "a.png").read_bytes() == (tmp_path / "b.png").read_bytes()
+    assert (tmp_path / "c.png").read_bytes() != (tmp_path / "a.png").read_bytes()
+
+
+# --- main() end-to-end -----------------------------------------------------
+
+
+def _png_bytes() -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", (4, 6)).save(buf, "PNG")
+    return buf.getvalue()
+
+
+@responses.activate
+def test_main_unresolved_decklist_card_fails_run(tmp_path, monkeypatch):
+    """An unresolved decklist card must land in manifest.json's failures list
+    and make the run exit 2 — not just print a warning and exit 0."""
+    decklist = tmp_path / "deck.txt"
+    decklist.write_text("1 Real Card\n1 Bogus Made Up Card\n", encoding="utf-8")
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [{"id": "uid-real", "name": "Real Card"}],
+            "not_found": [{"name": "Bogus Made Up Card"}],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/uid-real",
+        json={
+            "id": "uid-real",
+            "name": "Real Card",
+            "image_uris": {"png": "https://cards.scryfall.io/png/front/a/b/uid-real.png"},
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://cards.scryfall.io/png/front/a/b/uid-real.png",
+        body=_png_bytes(),
+        status=200,
+        content_type="image/png",
+    )
+    fill._scryfall_payload_cache.clear()
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "fill.py",
+            "--decklist",
+            str(decklist),
+            "-o",
+            str(out_dir),
+            "--overrides",
+            str(tmp_path / "ov"),
+        ],
+    )
+    assert fill.main() == 2
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert [c["name"] for c in manifest["cards"]] == ["Real Card"]
+    assert len(manifest["failures"]) == 1
+    assert manifest["failures"][0][0] == "Bogus Made Up Card"
+
+
+@responses.activate
+def test_main_without_pair_backs_skips_back_download(tmp_path, monkeypatch):
+    """Without --pair-backs the DFC back face must not be downloaded — it
+    would be discarded. Only the front image URL is registered here, so any
+    back fetch would fail the card and flip the exit code."""
+    decklist = tmp_path / "deck.txt"
+    decklist.write_text("1 Delver of Secrets\n", encoding="utf-8")
+    responses.add(
+        responses.POST,
+        "https://api.scryfall.com/cards/collection",
+        json={
+            "object": "list",
+            "data": [
+                {
+                    "id": "dfc-uid",
+                    "name": "Delver of Secrets // Insectile Aberration",
+                    "card_faces": [
+                        {"name": "Delver of Secrets"},
+                        {"name": "Insectile Aberration"},
+                    ],
+                }
+            ],
+            "not_found": [],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://api.scryfall.com/cards/dfc-uid",
+        json={
+            "id": "dfc-uid",
+            "name": "Delver of Secrets // Insectile Aberration",
+            "layout": "transform",
+            "card_faces": [
+                {
+                    "name": "Delver of Secrets",
+                    "image_uris": {"png": "https://cards.scryfall.io/png/front/d/d/dfc.png"},
+                },
+                {
+                    "name": "Insectile Aberration",
+                    "image_uris": {"png": "https://cards.scryfall.io/png/back/d/d/dfc.png"},
+                },
+            ],
+        },
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        "https://cards.scryfall.io/png/front/d/d/dfc.png",
+        body=_png_bytes(),
+        status=200,
+        content_type="image/png",
+    )
+    fill._scryfall_payload_cache.clear()
+    out_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "fill.py",
+            "--decklist",
+            str(decklist),
+            "-o",
+            str(out_dir),
+            "--overrides",
+            str(tmp_path / "ov"),
+        ],
+    )
+    assert fill.main() == 0
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    assert manifest["cards"][0]["back_source"] is None
+    assert manifest["cards"][0]["has_back"] is False
+
+
+def test_main_default_back_missing_exits_cleanly(tmp_path, monkeypatch):
+    """A nonexistent --default-back path must exit with a clear message, not
+    a raw FileNotFoundError traceback from PIL."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "fill.py",
+            "123",
+            "-o",
+            str(tmp_path / "out"),
+            "--overrides",
+            str(tmp_path / "ov"),
+            "--pair-backs",
+            "--default-back",
+            str(tmp_path / "missing.png"),
+        ],
+    )
+    with pytest.raises(SystemExit, match="default-back file not found"):
+        fill.main()
+
+
+# --- upload.py helpers -----------------------------------------------------
+
+
+def test_collect_files_sorts_by_numeric_slot_prefix(tmp_path):
+    """Lexical sort puts 1000_ before 999_, misaligning Sequential Backs on
+    big runs — files must sort by their numeric slot prefix."""
+    for name in ("999_z.png", "1000_a.png", "001_c.png", "extra.png"):
+        (tmp_path / name).write_bytes(b"x")
+    files = upload.collect_files(tmp_path)
+    assert [p.name for p in files] == ["001_c.png", "999_z.png", "1000_a.png", "extra.png"]

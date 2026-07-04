@@ -21,6 +21,7 @@ import html
 import io
 import json
 import re
+import shutil
 import sys
 import threading
 import time
@@ -226,6 +227,13 @@ def _fetch_archidekt(deck_id: str) -> list[CardJob]:
             primary and primary.lower() in {"sideboard", "maybeboard"}
         ):
             continue
+        # Missing quantity defaults to 1, but an explicit 0 (or negative)
+        # means "none in deck" — mirror the CSV parser's qty<=0 skip rather
+        # than coercing 0 to 1 copy.
+        raw_qty = entry.get("quantity")
+        qty = 1 if raw_qty is None else int(raw_qty)
+        if qty <= 0:
+            continue
         card = entry.get("card") or {}
         oracle = card.get("oracleCard") or {}
         # Custom card detection: Archidekt customs typically have `customImageUrl` or
@@ -242,7 +250,7 @@ def _fetch_archidekt(deck_id: str) -> list[CardJob]:
         jobs.append(
             CardJob(
                 name=oracle.get("name") or card.get("displayName") or f"card-{card.get('id')}",
-                qty=int(entry.get("quantity") or 1),
+                qty=qty,
                 scryfall_uid=uid if uid and not custom_url else None,
                 custom_image_url=custom_url,
                 set_code=ed.get("editioncode"),
@@ -554,46 +562,6 @@ def _parse_decklist(text: str) -> list[tuple[int, str, str | None, str | None]]:
     return out
 
 
-def _scryfall_lookup_named(
-    name: str, set_code: str | None, collector: str | None, session: requests.Session
-) -> str | None:
-    """Resolve a card name to a Scryfall UID. Set+collector first (most
-    specific), then exact-name lookup as fallback."""
-    if set_code and collector:
-        _scryfall_wait()
-        r = session.get(
-            f"https://api.scryfall.com/cards/{set_code}/{collector}",
-            headers=UA,
-            timeout=20,
-        )
-        if r.ok:
-            return r.json().get("id")
-    _scryfall_wait()
-    params = {"exact": name}
-    if set_code:
-        params["set"] = set_code
-    r = session.get(
-        "https://api.scryfall.com/cards/named",
-        headers=UA,
-        params=params,
-        timeout=20,
-    )
-    if r.ok:
-        return r.json().get("id")
-    if r.status_code == 404 and set_code:
-        # The deck pinned a set we don't have; retry by name only.
-        _scryfall_wait()
-        r = session.get(
-            "https://api.scryfall.com/cards/named",
-            headers=UA,
-            params={"exact": name},
-            timeout=20,
-        )
-        if r.ok:
-            return r.json().get("id")
-    return None
-
-
 # Scryfall caps /cards/collection at 75 identifiers per request. The endpoint
 # is rate-limited at 2 req/sec (500ms gap) like /cards/named, so a 480-card
 # deck resolves in ~7 batched calls instead of 480 per-card lookups.
@@ -627,6 +595,62 @@ def _index_scryfall_cards(cards: list[dict], target: dict[str, str]) -> None:
             target.setdefault(key, uid)
 
 
+def _scryfall_identifier_key(identifier: dict) -> tuple[str, str, str]:
+    """Hashable, case-insensitive key for a /cards/collection identifier.
+    Used to match the `not_found` echoes (which repeat the identifier
+    verbatim) back against the identifiers we sent."""
+    if "set" in identifier:
+        return (
+            "set",
+            (identifier.get("set") or "").lower(),
+            str(identifier.get("collector_number") or "").lower(),
+        )
+    return ("name", (identifier.get("name") or "").lower(), "")
+
+
+def _index_scryfall_by_inputs(
+    identifiers: list[dict],
+    parsed: list[tuple[int, str, str | None, str | None]],
+    matches: list[dict],
+    not_found: list[dict],
+    uid_by_lower_name: dict[str, str],
+    uid_by_set_cn: dict[tuple[str, str], str],
+) -> None:
+    """Pair each /cards/collection match back with the identifier that
+    produced it. Scryfall returns `data` in request order with the
+    `not_found` entries removed, so walking both lists in lockstep —
+    skipping identifiers echoed in `not_found` — recovers the mapping.
+    Mirrors `indexScryfallByInputs` in docs/app.js.
+
+    Populates two indices:
+      - uid_by_set_cn, keyed by (set, collector_number): two entries that
+        share a card name but pin different printings resolve to distinct
+        UIDs instead of both collapsing onto the first result.
+      - uid_by_lower_name, keyed by the user's *typed* name: fixes silent
+        misses when Scryfall canonicalizes the name differently from how
+        it was typed (diacritics, curly apostrophes)."""
+    remaining: dict[tuple[str, str, str], int] = {}
+    for ident in not_found:
+        key = _scryfall_identifier_key(ident)
+        remaining[key] = remaining.get(key, 0) + 1
+    mi = 0
+    for ident, (_, name, _set_code, _collector) in zip(identifiers, parsed, strict=True):
+        key = _scryfall_identifier_key(ident)
+        if remaining.get(key, 0) > 0:
+            remaining[key] -= 1
+            continue
+        if mi >= len(matches):
+            break  # defensive: fewer matches than identifiers minus not_found
+        uid = matches[mi].get("id")
+        mi += 1
+        if not uid:
+            continue
+        if "set" in ident:
+            uid_by_set_cn.setdefault((key[1], key[2]), uid)
+        else:
+            uid_by_lower_name.setdefault(name.lower(), uid)
+
+
 # Scryfall's docs: a 429 imposes a 30-second IP lockout. 32s puts the next
 # attempt safely outside that window when the response omits Retry-After.
 _SCRYFALL_429_FALLBACK_SECONDS = 32.0
@@ -656,26 +680,25 @@ def _parse_retry_after(header: str | None) -> float | None:
         return None
 
 
-def _scryfall_collection_lookup(
-    identifiers: list[dict],
-    session: requests.Session,
-    attempts: int = 3,
-) -> tuple[list[dict], list[dict]]:
-    """POST a batch of identifiers (≤ 75) to /cards/collection. Returns
-    (matches, not_found). Owns its own 100ms `_scryfall_wait` gate, and
-    catches 429 by honouring the response's `Retry-After` header (or
-    `_SCRYFALL_429_FALLBACK_SECONDS` when absent) — Scryfall's 30s lockout
-    eats short exponential backoffs, so we wait the full window before the
-    next attempt. Mirrors `scryfallCollection` in docs/app.js."""
-    last_error: requests.HTTPError | None = None
+def _scryfall_request_with_retry(do_request, attempts: int = 3) -> requests.Response:
+    """Run `do_request()` (one Scryfall API call) behind the 100ms
+    `_scryfall_wait` gate, retrying transient failures. A 429 honours the
+    response's `Retry-After` header (or `_SCRYFALL_429_FALLBACK_SECONDS`
+    when absent) — Scryfall's 30s lockout eats short exponential backoffs,
+    so we wait the full window before the next attempt. 5xx and connection
+    errors / timeouts get a short exponential backoff. Anything else (or
+    exhausted attempts) raises. Mirrors `scryfallCollection` in docs/app.js."""
+    last_error: requests.RequestException | None = None
     for attempt in range(attempts):
         _scryfall_wait()
-        r = session.post(
-            "https://api.scryfall.com/cards/collection",
-            headers={**UA, "Content-Type": "application/json"},
-            json={"identifiers": identifiers},
-            timeout=30,
-        )
+        try:
+            r = do_request()
+        except (requests.ConnectionError, requests.Timeout) as err:
+            last_error = err
+            if attempt < attempts - 1:
+                time.sleep(0.5 * (2**attempt))
+                continue
+            raise
         if r.status_code == 429 and attempt < attempts - 1:
             delay = _parse_retry_after(r.headers.get("Retry-After"))
             if delay is None:
@@ -691,12 +714,32 @@ def _scryfall_collection_lookup(
                 time.sleep(0.5 * (2**attempt))
                 continue
             raise
-        payload = r.json()
-        return payload.get("data") or [], payload.get("not_found") or []
+        return r
     # Loop exited without returning — re-raise the most recent error so the
     # caller sees the original HTTP failure rather than a silent empty result.
     assert last_error is not None
     raise last_error
+
+
+def _scryfall_collection_lookup(
+    identifiers: list[dict],
+    session: requests.Session,
+    attempts: int = 3,
+) -> tuple[list[dict], list[dict]]:
+    """POST a batch of identifiers (≤ 75) to /cards/collection. Returns
+    (matches, not_found). Transient-failure handling (429 Retry-After,
+    5xx / connection-error backoff) lives in `_scryfall_request_with_retry`."""
+    r = _scryfall_request_with_retry(
+        lambda: session.post(
+            "https://api.scryfall.com/cards/collection",
+            headers={**UA, "Content-Type": "application/json"},
+            json={"identifiers": identifiers},
+            timeout=30,
+        ),
+        attempts=attempts,
+    )
+    payload = r.json()
+    return payload.get("data") or [], payload.get("not_found") or []
 
 
 def _jobs_from_decklist(text: str) -> list[CardJob]:
@@ -715,31 +758,52 @@ def _jobs_from_decklist(text: str) -> list[CardJob]:
         {"set": s, "collector_number": c} if s and c else {"name": n} for _, n, s, c in parsed
     ]
     uid_by_lower_name: dict[str, str] = {}
+    uid_by_set_cn: dict[tuple[str, str], str] = {}
     for i in range(0, len(identifiers), _SCRYFALL_COLLECTION_BATCH_SIZE):
         if i > 0:
             time.sleep(_SCRYFALL_COLLECTION_INTERVAL)
         chunk = identifiers[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]
-        matches, _ = _scryfall_collection_lookup(chunk, session)
+        chunk_parsed = parsed[i : i + len(chunk)]
+        matches, not_found = _scryfall_collection_lookup(chunk, session)
         _index_scryfall_cards(matches, uid_by_lower_name)
+        _index_scryfall_by_inputs(
+            chunk, chunk_parsed, matches, not_found, uid_by_lower_name, uid_by_set_cn
+        )
 
     # Second pass for the (set, cn) entries that didn't resolve — retry as
-    # bare name. Matches the existing 404-with-set fallback in
-    # `_scryfall_lookup_named`. Sleep on every iteration (including the
-    # first) so the transition from the last main-pass batch is also paced.
-    fallback = [(n,) for _, n, s, c in parsed if (s or c) and n.lower() not in uid_by_lower_name]
+    # bare name (typical: a set/collector hint that's wrong for the named
+    # card). Sleep on every iteration (including the first) so the
+    # transition from the last main-pass batch is also paced.
+    fallback = [
+        entry
+        for entry in parsed
+        if entry[2]
+        and entry[3]
+        and (entry[2].lower(), entry[3].lower()) not in uid_by_set_cn
+        and entry[1].lower() not in uid_by_lower_name
+    ]
     for i in range(0, len(fallback), _SCRYFALL_COLLECTION_BATCH_SIZE):
         time.sleep(_SCRYFALL_COLLECTION_INTERVAL)
-        chunk = [{"name": t[0]} for t in fallback[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]]
-        matches, _ = _scryfall_collection_lookup(chunk, session)
+        chunk_parsed = fallback[i : i + _SCRYFALL_COLLECTION_BATCH_SIZE]
+        chunk = [{"name": entry[1]} for entry in chunk_parsed]
+        matches, not_found = _scryfall_collection_lookup(chunk, session)
         _index_scryfall_cards(matches, uid_by_lower_name)
+        _index_scryfall_by_inputs(
+            chunk, chunk_parsed, matches, not_found, uid_by_lower_name, uid_by_set_cn
+        )
 
     jobs: list[CardJob] = []
     unresolved: list[str] = []
     for qty, name, set_code, collector in parsed:
-        uid = uid_by_lower_name.get(name.lower())
+        # set+cn beats name: two entries sharing a name but pinning
+        # different printings resolve to distinct UIDs.
+        uid = None
+        if set_code and collector:
+            uid = uid_by_set_cn.get((set_code.lower(), collector.lower()))
+        if not uid:
+            uid = uid_by_lower_name.get(name.lower())
         if not uid:
             unresolved.append(name)
-            continue
         jobs.append(
             CardJob(
                 name=name,
@@ -751,6 +815,10 @@ def _jobs_from_decklist(text: str) -> list[CardJob]:
             )
         )
     if unresolved:
+        # Unresolved entries keep a CardJob with scryfall_uid=None: they
+        # fail in the image pipeline ("No image source"), land in
+        # manifest.json's failures list, and make the run exit non-zero —
+        # a decklist typo must not silently shrink the printed deck.
         print(f"WARNING: {len(unresolved)} cards could not be resolved on Scryfall:")
         for n in unresolved:
             print(f"  - {n}")
@@ -964,9 +1032,7 @@ def scryfall_card_payload(uid: str, session: requests.Session) -> dict:
     cached = _scryfall_payload_cache.get(uid)
     if cached is not None:
         return cached
-    _scryfall_wait()
-    r = session.get(SCRYFALL_CARD.format(uid), timeout=30)
-    r.raise_for_status()
+    r = _scryfall_request_with_retry(lambda: session.get(SCRYFALL_CARD.format(uid), timeout=30))
     d = r.json()
     _scryfall_payload_cache[uid] = d
     return d
@@ -1603,6 +1669,27 @@ def _scryfall_proxy_fallback(url: str) -> str | None:
     return "https://images.weserv.nl/?url=" + requests.utils.quote(url[len("https://") :], safe="")
 
 
+_IMAGE_FETCH_ATTEMPTS = 3
+
+
+def _get_image_with_retry(url: str, session: requests.Session) -> requests.Response:
+    """GET one image URL, retrying transient failures (connection errors,
+    timeouts, 429, 5xx) with a brief backoff. 404s and other 4xx return
+    immediately — `fetch_image`'s fallback ladder owns those."""
+    for attempt in range(_IMAGE_FETCH_ATTEMPTS - 1):
+        try:
+            r = session.get(url, headers=UA, timeout=60)
+        except (requests.ConnectionError, requests.Timeout):
+            time.sleep(0.5 * (2**attempt))
+            continue
+        if r.status_code == 429 or 500 <= r.status_code < 600:
+            time.sleep(0.5 * (2**attempt))
+            continue
+        return r
+    # Final attempt: no more retries — surface whatever happens to the caller.
+    return session.get(url, headers=UA, timeout=60)
+
+
 def fetch_image(url: str, session: requests.Session) -> Image.Image:
     """Fetch a card image from disk (override) or HTTPS (Scryfall / Archidekt
     custom). Other schemes are rejected — an adversarial deck JSON could
@@ -1621,13 +1708,39 @@ def fetch_image(url: str, session: requests.Session) -> Image.Image:
     proxied = _scryfall_proxy_fallback(url)
     if proxied:
         candidates.append(proxied)
-    r = session.get(candidates[0], headers=UA, timeout=60)
+    r = _get_image_with_retry(candidates[0], session)
     for alt in candidates[1:]:
         if r.status_code != 404:
             break
-        r = session.get(alt, headers=UA, timeout=60)
+        r = _get_image_with_retry(alt, session)
     r.raise_for_status()
     return Image.open(io.BytesIO(r.content)).convert("RGB")
+
+
+def _save_png_once(img: Image.Image, path: Path, written: dict[int, Path]) -> None:
+    """Write `img` to `path` as PNG. The first write of each unique image
+    object pays the (expensive, optimize=True) encode; later writes byte-copy
+    the first file. `written` maps id(img) → first written path and is shared
+    across the run, so per-copy duplicates and the shared default back all
+    reuse a single encode."""
+    first = written.get(id(img))
+    if first is None:
+        img.save(path, "PNG", optimize=True)
+        written[id(img)] = path
+    else:
+        shutil.copyfile(first, path)
+
+
+def _read_decklist_text(path: Path) -> str:
+    """Read a decklist file as UTF-8, falling back to cp1252 for Windows
+    exports with smart quotes. Both failing means it isn't a text file."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            return path.read_text(encoding="cp1252")
+        except UnicodeDecodeError as e:
+            raise SystemExit(f"Could not decode {path} as UTF-8 or cp1252: {e}") from e
 
 
 DEFAULT_BACK_FILE = Path(__file__).parent / "assets" / "default_back.png"
@@ -1740,7 +1853,10 @@ def main() -> int:
     default_back_img: Image.Image | None = None
     if args.pair_backs:
         if args.default_back:
-            default_back_img = Image.open(args.default_back).convert("RGB")
+            default_back_path = Path(args.default_back)
+            if not default_back_path.is_file():
+                raise SystemExit(f"--default-back file not found: {default_back_path}")
+            default_back_img = Image.open(default_back_path).convert("RGB")
         else:
             default_back_img = make_default_back()
 
@@ -1748,7 +1864,7 @@ def main() -> int:
         if args.decklist == "-":
             text = sys.stdin.read()
         else:
-            text = Path(args.decklist).read_text(encoding="utf-8")
+            text = _read_decklist_text(Path(args.decklist))
         print(f"Parsing decklist ({len(text.splitlines())} lines)...")
         jobs = _jobs_from_decklist(text)
     elif args.deck:
@@ -1826,6 +1942,10 @@ def main() -> int:
     def process(idx: int, job: CardJob):
         try:
             front_url, back_url = resolve_urls(job, overrides, session, args.image_quality)
+            if backs_dir is None:
+                # Backs are only written with --pair-backs; skip the
+                # (~1.4 MB per DFC) download when it would be discarded.
+                back_url = None
             front_img = fetch_image(front_url, session)
             back_img = fetch_image(back_url, session) if back_url else None
             return idx, job, front_img, back_img, front_url, back_url, None
@@ -1835,6 +1955,9 @@ def main() -> int:
     # Each card-copy gets its own slot number; slot indices match between
     # fronts/ and backs/ so tcgplaytest's Sequential Backs aligns correctly.
     slot = 0
+    # id(image) → first written path, so repeat copies (and the shared
+    # default back) byte-copy instead of re-running the PNG encoder.
+    written_pngs: dict[int, Path] = {}
     results = []
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(process, i, j): (i, j) for i, j in enumerate(jobs)}
@@ -1856,12 +1979,12 @@ def main() -> int:
             slot += 1
             base = f"{slot:03d}_{slug_name}"
             front_path = fronts_dir / f"{base}.png"
-            front_img.save(front_path, "PNG", optimize=True)
+            _save_png_once(front_img, front_path, written_pngs)
             files.append(str(front_path.relative_to(out_dir)))
             if backs_dir is not None:
                 this_back = back_img if back_img is not None else default_back_img
                 back_path = backs_dir / f"{base}.png"
-                this_back.save(back_path, "PNG", optimize=True)
+                _save_png_once(this_back, back_path, written_pngs)
                 files.append(str(back_path.relative_to(out_dir)))
         # `file://` sources include the absolute local override path, which
         # leaks the user's home directory if they share the manifest. Scrub

@@ -24,7 +24,12 @@ const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
 const SCRYFALL_DECK_EXPORT = (id) => `https://api.scryfall.com/decks/${id}/export/text`;
 const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg`;
-const CORS_PROXY = (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`;
+// corsproxy.io's documented API is `?url=<encoded>`. Verified 2026-07-04
+// from a real browser (deployed GitHub Pages origin AND localhost) against
+// the Archidekt API: both this form and the legacy bare `?<encoded>` form
+// returned the deck JSON. curl gets 403 from both — the proxy blocks
+// non-browser clients, so re-verification must happen in a browser.
+const CORS_PROXY = (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
 const SCRYFALL_NAMED = "https://api.scryfall.com/cards/named";
 const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn}`;
@@ -100,7 +105,6 @@ const els = {
   input: $("deck-input"),
   skipSide: $("opt-skip-side"),
   skipBasics: $("opt-skip-basics"),
-  dfc: $("opt-dfc"),
   go: $("go"),
   status: $("status"),
   progress: $("progress"),
@@ -334,7 +338,16 @@ async function fetchJsonScryfall(url) {
   return withRetry(async () => {
     const r = await fetch(url, { headers: { Accept: "application/json" } });
     if (r.ok) return parseJsonStrict(r);
-    if (r.status >= 400 && r.status < 500 && r.status !== 429) {
+    if (r.status === 429) {
+      // RateLimitError makes withRetry wait out Scryfall's 30s lockout
+      // instead of burning its retries at 400/800ms inside the window.
+      const ra = parseRetryAfter(r.headers.get("Retry-After"));
+      throw new RateLimitError(
+        `Scryfall 429 Too Many Requests`,
+        ra ?? SCRYFALL_429_FALLBACK_MS,
+      );
+    }
+    if (r.status >= 400 && r.status < 500) {
       throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
     }
     throw new Error(`Scryfall ${r.status} ${r.statusText}`);
@@ -561,37 +574,6 @@ function parseDecklist(text, opts = {}) {
   return out;
 }
 
-async function scryfallLookupNamed(name, setCode, cn) {
-  // Scryfall has open CORS, so direct fetch is fine.
-  // Wrapped in withRetry so a 429 / 5xx / network blip doesn't silently mark
-  // the card as unresolved. Only a final 404 (card genuinely not found) or
-  // an explicit fatal 4xx returns null/throws — transient errors retry.
-  const tryGet = async (url) => {
-    const r = await fetch(url);
-    if (r.ok) return { id: (await r.json()).id, status: 200 };
-    if (r.status === 404) return { id: null, status: 404 };
-    if (r.status === 429 || r.status >= 500) {
-      throw new Error(`Scryfall ${r.status} ${r.statusText}`);
-    }
-    throw new FatalFetchError(`Scryfall ${r.status} ${r.statusText}`);
-  };
-  return withRetry(async () => {
-    if (setCode && cn) {
-      const r = await tryGet(SCRYFALL_BY_SET(setCode, cn));
-      if (r.id) return r.id;
-    }
-    const params = new URLSearchParams({ exact: name });
-    if (setCode) params.set("set", setCode);
-    const named = await tryGet(`${SCRYFALL_NAMED}?${params}`);
-    if (named.id) return named.id;
-    if (named.status === 404 && setCode) {
-      const fallback = await tryGet(`${SCRYFALL_NAMED}?exact=${encodeURIComponent(name)}`);
-      if (fallback.id) return fallback.id;
-    }
-    return null;
-  });
-}
-
 async function scryfallCollection(identifiers) {
   // POST /cards/collection — bulk lookup, up to 75 identifiers per call.
   // Wrapped in withRetry so transient errors and 429 lockouts back off.
@@ -762,6 +744,15 @@ async function buildJobsFromDecklist(text, opts, onProgress) {
   if (parsed.length > MAX_DECKLIST_ENTRIES) {
     throw new Error(
       `Decklist has ${parsed.length} entries — capped at ${MAX_DECKLIST_ENTRIES} ` +
+      "to avoid running for hours and OOM-ing the tab. Split into smaller decks."
+    );
+  }
+  // Cap total copies too — a single "2000000 Sol Ring" line is one entry but
+  // would OOM the tab in processJob's per-copy loop just the same.
+  const totalCopies = parsed.reduce((a, p) => a + p.qty, 0);
+  if (totalCopies > MAX_DECKLIST_ENTRIES) {
+    throw new Error(
+      `Decklist asks for ${totalCopies} total copies — capped at ${MAX_DECKLIST_ENTRIES} ` +
       "to avoid running for hours and OOM-ing the tab. Split into smaller decks."
     );
   }
@@ -1327,25 +1318,34 @@ async function resolveTokenPhrase(phrase, named) {
   //                           minting the same token.
   const query = tokenPhraseToQuery(phrase, named);
   if (query == null) return { uid: null, error: null };
-  await new Promise((r) => setTimeout(r, 80));
+  // /cards/search is a /cards/* endpoint — 2 req/sec, same as collection —
+  // so pace at the same 550ms interval (see SCRYFALL_NAMED_INTERVAL_MS).
+  await new Promise((r) => setTimeout(r, SCRYFALL_NAMED_INTERVAL_MS));
   const url = `${SCRYFALL_SEARCH}?${new URLSearchParams({
     q: query,
     unique: "cards",
     order: "released",
   })}`;
-  let r;
-  try {
-    r = await fetch(url);
-  } catch (e) {
-    return { uid: null, error: `Scryfall search failed for "${phrase}": ${e.message}` };
-  }
-  if (r.status === 404) return { uid: null, error: null };  // genuine miss
-  if (!r.ok) return { uid: null, error: `Scryfall search returned ${r.status} for "${phrase}"` };
   let data;
   try {
-    data = await r.json();
+    // withRetry + RateLimitError: a 429 waits out Scryfall's lockout and
+    // retries instead of becoming a terminal per-phrase failure.
+    data = await withRetry(async () => {
+      const r = await fetch(url);
+      if (r.status === 404) return { data: [] };  // genuine miss
+      if (r.status === 429) {
+        const ra = parseRetryAfter(r.headers.get("Retry-After"));
+        throw new RateLimitError(
+          `Scryfall 429 Too Many Requests`,
+          ra ?? SCRYFALL_429_FALLBACK_MS,
+        );
+      }
+      if (r.status >= 500) throw new Error(`Scryfall search returned ${r.status}`);
+      if (!r.ok) throw new FatalFetchError(`Scryfall search returned ${r.status}`);
+      return r.json();
+    });
   } catch (e) {
-    return { uid: null, error: `Scryfall search returned malformed JSON for "${phrase}": ${e.message}` };
+    return { uid: null, error: `Scryfall search failed for "${phrase}": ${e.message}` };
   }
   const cards = data.data || [];
   if (!cards.length) return { uid: null, error: null };
@@ -1533,7 +1533,7 @@ function expandTokenQty(tokens) {
 
 async function processJob(state, job, opts, zip, gallery) {
   // state.slot is mutated to assign sequential slot numbers across all jobs
-  // so fronts/<NNN>.png and backs/<NNN>.png stay aligned for tcgplaytest's
+  // so fronts/<NNN>.* and backs/<NNN>.* stay aligned for tcgplaytest's
   // Sequential Backs feature.
   const { front, back } = await resolveUrls(job, opts.imageQuality);
 
@@ -1541,27 +1541,34 @@ async function processJob(state, job, opts, zip, gallery) {
   const backBlob = back ? await fetchBlob(back) : null;
 
   const slugName = slug(job.name);
+  // "large" quality serves Scryfall's JPG rendition — name those entries
+  // .jpg so the bytes match the extension. The bundled/custom default back
+  // stays .png; mixed extensions in one zip are fine because tcgplaytest
+  // pairs sequential backs by order, not by name.
+  const ext = opts.imageQuality === "large" ? "jpg" : "png";
   const written = [];
   for (let copy = 1; copy <= job.qty; copy++) {
     state.slot += 1;
     const slotStr = String(state.slot).padStart(3, "0");
     const base = `${slotStr}_${slugName}`;
     if (opts.pairBacks) {
-      zip.file(`fronts/${base}.png`, frontBlob);
-      written.push(`fronts/${base}.png`);
-      const useBack = backBlob || state.defaultBack;
-      zip.file(`backs/${base}.png`, useBack);
-      written.push(`backs/${base}.png`);
+      zip.file(`fronts/${base}.${ext}`, frontBlob);
+      written.push(`fronts/${base}.${ext}`);
+      // DFC face-2 images follow the selected quality; the default back is
+      // always the PNG asset.
+      const backName = backBlob ? `backs/${base}.${ext}` : `backs/${base}.png`;
+      zip.file(backName, backBlob || state.defaultBack);
+      written.push(backName);
     } else {
       // No pairing mode: emit fronts only at root. DFC backs become their
       // own separate cards (next to their fronts, suffixed _back) so the
       // user prints both faces as physical cards.
-      zip.file(`${base}.png`, frontBlob);
-      written.push(`${base}.png`);
+      zip.file(`${base}.${ext}`, frontBlob);
+      written.push(`${base}.${ext}`);
       if (back) {
         const backBase = `${slotStr}_${slug(job.name + "_back")}`;
-        zip.file(`${backBase}.png`, backBlob);
-        written.push(`${backBase}.png`);
+        zip.file(`${backBase}.${ext}`, backBlob);
+        written.push(`${backBase}.${ext}`);
       }
     }
   }
@@ -1572,12 +1579,24 @@ async function processJob(state, job, opts, zip, gallery) {
   return written;
 }
 
+// Object URLs backing the gallery thumbnails. blob: URLs pin their blobs
+// until explicitly revoked, so a fresh run must revoke these alongside
+// clearing the gallery DOM or every past build's images stay in memory.
+const galleryObjectUrls = [];
+
+function clearGallery() {
+  for (const u of galleryObjectUrls) URL.revokeObjectURL(u);
+  galleryObjectUrls.length = 0;
+  els.gallery.replaceChildren();
+}
+
 function addThumb(gallery, blob, label) {
   const wrap = document.createElement("div");
   wrap.className = "thumb";
   const img = document.createElement("img");
   img.alt = label;
   img.src = URL.createObjectURL(blob);
+  galleryObjectUrls.push(img.src);
   const lab = document.createElement("div");
   lab.className = "label";
   lab.textContent = label;
@@ -1764,6 +1783,36 @@ async function rebuildZipBlob() {
   lastZipBlob = await retryCtx.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }
 
+function writeManifest(zip) {
+  // Overwrite manifest.json with the current merged view (zip.file replaces).
+  // Reads retryCtx + liveFailures, so callers must commit those first.
+  // Called after every build pass AND after a retry pass — otherwise cards
+  // recovered by retry stay listed as failures in the downloaded zip.
+  zip.file(
+    "manifest.json",
+    JSON.stringify(
+      {
+        source: retryCtx.deckLabel,
+        unique_cards: retryCtx.jobs.length,
+        total_copies: retryCtx.jobs.reduce((a, j) => a + j.qty, 0),
+        options: retryCtx.opts,
+        failures: liveFailures,
+      },
+      null,
+      2,
+    ),
+  );
+}
+
+function zipImageCount(zip) {
+  // zip.files includes JSZip's implicit directory entries (fronts/, backs/)
+  // — count only real files, minus manifest.json, so the headline reflects
+  // the number of card images.
+  return Object.keys(zip.files).filter(
+    (k) => !zip.files[k].dir && k !== "manifest.json",
+  ).length;
+}
+
 function renderFailures(failures) {
   els.failuresList.replaceChildren();
   if (!failures.length) {
@@ -1804,6 +1853,10 @@ async function retryFailures() {
   }
   liveFailures = [...passthrough, ...remaining];
   renderFailures(liveFailures);
+  // Recovered cards changed the manifest's failure list and grew state.slot
+  // — rewrite the manifest before re-zipping and refresh the cost estimate
+  // and deck stats so the UI matches the new zip contents.
+  writeManifest(retryCtx.zip);
   try {
     await rebuildZipBlob();
   } catch (e) {
@@ -1813,8 +1866,10 @@ async function retryFailures() {
   }
   const goodCount = retryCtx.jobsLen - liveFailures.filter((f) => f.job).length;
   els.resultSummary.textContent = `Built ${goodCount}/${retryCtx.jobsLen} cards (${
-    Object.keys(retryCtx.zip.files).length - 1
+    zipImageCount(retryCtx.zip)
   } files in ZIP)`;
+  renderCostEstimate(retryCtx.state.slot);
+  await renderDeckStats(retryCtx.jobs);
   setStatus(
     remaining.length
       ? `Retried — ${remaining.length} still failing.`
@@ -1944,7 +1999,7 @@ async function run() {
   } else {
     els.result.hidden = true;
     els.failures.hidden = true;
-    els.gallery.replaceChildren();
+    clearGallery();
     els.failuresList.replaceChildren();
     els.retryBtn.hidden = true;
     els.addAnotherBtn.hidden = true;
@@ -1969,6 +2024,10 @@ async function run() {
       imageQuality: $("opt-image-quality").value || "png",
     };
     zip = new JSZip();
+    // A pasted custom-back URL can take seconds to fetch (possibly via the
+    // CORS proxy) — say so before the await instead of sitting on a blank
+    // status that looks like a hang.
+    if (opts.pairBacks) setStatus("Fetching card back image...");
     state = {
       slot: 0,
       defaultBack: opts.pairBacks ? await makeDefaultBackBlob() : null,
@@ -1994,7 +2053,10 @@ async function run() {
     return;
   }
   // loadJobs succeeded — now safe to consume the flag and reset the label.
+  // Options unlock again: the next build either appends (re-locking on the
+  // "Add another deck" click) or starts a fresh batch with the new values.
   appendMode = false;
+  setOptionsLocked(false);
   els.go.textContent = "Fetch & build";
   if (opts.skipBasics) {
     const before = jobs.reduce((a, j) => a + j.qty, 0);
@@ -2090,27 +2152,11 @@ async function run() {
   }
   const mergedDeckLabel = append ? `${retryCtx.deckLabel} + ${deckLabel}` : deckLabel;
 
-  // Overwrite the manifest with the merged view (zip.file replaces).
-  zip.file(
-    "manifest.json",
-    JSON.stringify(
-      {
-        source: mergedDeckLabel,
-        unique_cards: allJobs.length,
-        total_copies: allJobs.reduce((a, j) => a + j.qty, 0),
-        options: opts,
-        failures: [...liveFailures, ...passFailures],
-      },
-      null,
-      2,
-    ),
-  );
-
   // Commit retryCtx and the failure list BEFORE attempting zip gen. The
   // per-card files are already inside `zip` from the build loop above, so
   // retryCtx.jobs needs to reflect them; otherwise a zip-gen failure would
   // leave retryCtx pointing at a zip whose contents the dedupe code
-  // doesn't know about.
+  // doesn't know about. writeManifest reads this committed state.
   liveFailures = [...liveFailures, ...passFailures];
   retryCtx.state = state;
   retryCtx.zip = zip;
@@ -2118,6 +2164,8 @@ async function run() {
   retryCtx.jobs = allJobs;
   retryCtx.jobsLen = allJobs.length;
   retryCtx.deckLabel = mergedDeckLabel;
+
+  writeManifest(zip);
 
   setStatus("Zipping...");
   try {
@@ -2137,7 +2185,7 @@ async function run() {
     ? ` — ${liveFailures.length} failure${liveFailures.length === 1 ? "" : "s"} below`
     : "";
   els.resultSummary.textContent =
-    `Built ${builtJobs}/${allJobs.length} cards (${Object.keys(zip.files).length - 1} files in ZIP)${failTail}`;
+    `Built ${builtJobs}/${allJobs.length} cards (${zipImageCount(zip)} files in ZIP)${failTail}`;
   els.result.hidden = false;
   els.addAnotherBtn.hidden = false;
 
@@ -2169,11 +2217,26 @@ els.retryBtn.addEventListener("click", () => {
   retryFailures().catch((e) => setStatus(`Retry failed: ${e.message}`, "error"));
 });
 
+// Every option control. Disabled while append mode is armed: "Add to order"
+// reuses retryCtx.opts from the first pass, so leaving the checkboxes
+// interactive would let the UI silently lie about what the next pass does.
+const OPTION_CONTROL_IDS = [
+  "opt-skip-side", "opt-skip-basics", "opt-pair-backs", "opt-tokens",
+  "opt-pair-tokens", "opt-tokens-thorough", "opt-token-qty",
+  "opt-image-quality", "opt-back-file", "opt-back-url",
+];
+
+function setOptionsLocked(locked) {
+  for (const id of OPTION_CONTROL_IDS) $(id).disabled = locked;
+  $("opts-locked-note").hidden = !locked;
+}
+
 els.addAnotherBtn.addEventListener("click", () => {
   // Arm append mode and bring the user back to the input. Build options
   // (pair-backs / tokens / skip-basics) are locked from the first pass —
   // the original `opts` lives on retryCtx and is reused on the next click.
   appendMode = true;
+  setOptionsLocked(true);
   els.go.textContent = "Add to order";
   els.input.value = "";
   $("decklist-input").value = "";
@@ -2242,11 +2305,25 @@ function setMode(mode) {
   $("mode-text").classList.toggle("active", !urlActive);
   $("mode-url").setAttribute("aria-selected", String(urlActive));
   $("mode-text").setAttribute("aria-selected", String(!urlActive));
+  // Roving tabindex — the ARIA tabs pattern keeps exactly one tab in the
+  // Tab order; Left/Right arrows (below) move between them.
+  $("mode-url").tabIndex = urlActive ? 0 : -1;
+  $("mode-text").tabIndex = urlActive ? -1 : 0;
   $("mode-url-pane").hidden = !urlActive;
   $("mode-text-pane").hidden = urlActive;
 }
 $("mode-url").addEventListener("click", () => setMode("url"));
 $("mode-text").addEventListener("click", () => setMode("text"));
+// Arrow-key navigation per the ARIA tabs pattern. With only two tabs,
+// either arrow selects-and-focuses the other one (wrap-around).
+for (const [id, otherMode] of [["mode-url", "text"], ["mode-text", "url"]]) {
+  $(id).addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    setMode(otherMode);
+    $(`mode-${otherMode}`).focus();
+  });
+}
 
 // --- Version footer ----------------------------------------------------
 // version.json is written by the Pages workflow at deploy time.
