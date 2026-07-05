@@ -88,10 +88,14 @@ input[type="text"]:focus, input[type="number"]:focus {
   gap: 12px 16px;
   padding: 0 0 14px;
 }
-.opts-grid label.check { display: flex; align-items: center; gap: 8px; color: var(--text); margin: 0; }
+/* min-width: 0 lets grid/flex children shrink below their intrinsic width —
+   without it the <select>s force the cell wider than the card and bleed
+   past its border (worst on narrow viewports). */
+.opts-grid label.check { display: flex; align-items: center; gap: 8px; color: var(--text); margin: 0; min-width: 0; }
 .opts-grid label.check input { width: auto; }
+.opts-grid label.check select { flex: 1; min-width: 0; }
 .opts-grid label { color: var(--muted); }
-.opts-grid input[type="number"] { margin-top: 4px; }
+.min-price { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text); }
 #opt-min-price { width: 5em; }
 
 .back-source {
@@ -106,7 +110,10 @@ input[type="text"]:focus, input[type="number"]:focus {
 }
 .back-source-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* minmax(0, …): a plain 1fr track can't shrink below the nowrap filename's
+     intrinsic width, which pushes the whole row past the card edge on
+     narrow viewports. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
 }
 .back-source-row input[type="text"] { margin: 0; }
@@ -115,6 +122,7 @@ input[type="text"]:focus, input[type="number"]:focus {
   align-items: center;
   gap: 8px;
   margin: 0;
+  min-width: 0;
   cursor: pointer;
 }
 .upload-label input[type="file"] {
@@ -135,6 +143,7 @@ input[type="text"]:focus, input[type="number"]:focus {
 .back-file-name {
   font-size: 0.8rem;
   color: var(--muted);
+  min-width: 0; /* flex items refuse to shrink past content without this — the ellipsis never engages */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -338,6 +347,8 @@ button.secondary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 footer {
   text-align: center;
+  max-width: 760px; /* match main — an unconstrained disclosure line runs 1200px+ on wide screens */
+  margin: 0 auto;
   padding: 24px 16px 32px;
   color: var(--muted);
   font-size: 0.8rem;
