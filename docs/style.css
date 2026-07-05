@@ -158,6 +158,13 @@ button.primary {
 button.primary:hover { background: var(--accent-hover); }
 button.primary:disabled { background: #3b4470; color: #6a719a; cursor: not-allowed; }
 
+.build-actions {
+  display: flex;
+  gap: 8px;
+}
+.build-actions .primary { margin-top: 14px; flex: 1; }
+.build-actions .secondary { margin-top: 14px; flex: 0 0 auto; }
+
 .status {
   margin-top: 12px;
   font-size: 0.9rem;
@@ -230,6 +237,14 @@ button.secondary:disabled { opacity: 0.5; cursor: not-allowed; }
   background: #0e1530;
   border: 1px solid var(--border);
   border-radius: 8px;
+}
+/* One per queued build job — a placeholder so thumbnails can be inserted in
+   deck order even though the concurrency pool completes them out of order.
+   `display: contents` makes it invisible to the grid: its `.thumb` children
+   (added by addThumb once the job finishes) become the direct grid items,
+   so the layout is identical to appending straight into .gallery. */
+.gallery .thumb-slot {
+  display: contents;
 }
 .gallery img {
   width: 100%;
@@ -370,4 +385,5 @@ a:hover { color: var(--accent-hover); }
   .result-row { flex-direction: column; align-items: stretch; }
   .result-row button { width: 100%; }
   .result-actions { flex-direction: column; }
+  .build-actions .secondary { flex: 1; }
 }

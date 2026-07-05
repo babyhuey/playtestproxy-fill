@@ -51,6 +51,21 @@ const SCRYFALL_SINGLE_INTERVAL_MS = 110;
 const SCRYFALL_429_FALLBACK_MS = 32_000;
 const SCRYFALL_SEARCH = "https://api.scryfall.com/cards/search";
 
+// Concurrent build workers (see BUILD_CONCURRENCY) all resolve card data
+// through scryfallCard(). A per-caller sleep before each fetch paces that
+// ONE caller, but does nothing to pace the aggregate request rate once
+// several workers overlap — five workers each sleeping 80ms independently
+// can still fire five requests in the same 80ms window. This promise-chain
+// gate serializes actual Scryfall requests across every caller so the
+// combined rate stays at one request per SCRYFALL_SINGLE_INTERVAL_MS
+// regardless of concurrency.
+let _apiGate = Promise.resolve();
+function scryfallApiSlot() {
+  const slot = _apiGate.then(() => new Promise((r) => setTimeout(r, SCRYFALL_SINGLE_INTERVAL_MS)));
+  _apiGate = slot.catch(() => {});
+  return slot;
+}
+
 const ARCHIDEKT_RE = /archidekt\.com\/decks\/(\d+)/i;
 const MOXFIELD_RE = /moxfield\.com\/decks\/([A-Za-z0-9_-]{12,})/i;
 const TAPPEDOUT_RE = /tappedout\.net\/mtg-decks\/([A-Za-z0-9_-]+)/i;
@@ -106,6 +121,7 @@ const els = {
   skipSide: $("opt-skip-side"),
   skipBasics: $("opt-skip-basics"),
   go: $("go"),
+  cancelBtn: $("cancel-btn"),
   status: $("status"),
   progress: $("progress"),
   result: $("result"),
@@ -126,6 +142,21 @@ let appendMode = false;
 
 let lastZipBlob = null;
 let lastZipName = "deck.zip";
+
+// Set to a fresh AbortController at the start of every run()/retryFailures()
+// pass. fetchBlob / fetchJsonScryfall / fetchJson pass its signal to fetch(),
+// and withRetry checks/races it directly (see sleepAbortable) — a single
+// module-level controller means every in-flight request across the whole
+// concurrent build pool shares one on/off switch for Cancel.
+let buildAbort = null;
+
+function showCancelButton() {
+  els.cancelBtn.hidden = false;
+  els.cancelBtn.disabled = false;
+}
+function hideCancelButton() {
+  els.cancelBtn.hidden = true;
+}
 
 function detectSource(input) {
   // Returns { source, args: [...] } or null. Mirrors fill.py:detect_source.
@@ -193,23 +224,50 @@ function setProgress(done, total) {
   els.progress.value = done;
 }
 
+function sleepAbortable(ms) {
+  // Same as a plain setTimeout-based sleep, but races the wait against
+  // buildAbort's signal — used for withRetry's backoff/RateLimitError waits
+  // so a Cancel click during a multi-second 429 lockout doesn't have to sit
+  // through the whole delay before the pass notices it was cancelled.
+  return new Promise((resolve, reject) => {
+    const signal = buildAbort?.signal;
+    if (signal?.aborted) {
+      reject(new DOMException("cancelled", "AbortError"));
+      return;
+    }
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        reject(new DOMException("cancelled", "AbortError"));
+      },
+      { once: true },
+    );
+  });
+}
+
 async function withRetry(fn, attempts = 3, baseDelay = 400) {
   // 400ms base, exponential — defending against transient corsproxy /
   // Scryfall hiccups, not against logic bugs. 4xx is final and bypasses retry.
   // 429 throws a RateLimitError carrying the server's Retry-After (or our
   // 32s fallback) and overrides the exponential delay — Scryfall's 30s
   // lockout would eat both of the short retries otherwise.
+  // Cancellation: checked before every attempt, and AbortError bypasses
+  // retry the same way FatalFetchError does — a cancelled build shouldn't
+  // burn its retry budget on a request that's already dead.
   let lastErr;
   for (let i = 0; i < attempts; i++) {
+    if (buildAbort?.signal.aborted) throw new DOMException("cancelled", "AbortError");
     try {
       return await fn();
     } catch (e) {
-      if (e instanceof FatalFetchError) throw e;
+      if (e instanceof FatalFetchError || e.name === "AbortError") throw e;
       lastErr = e;
       if (i === attempts - 1) break;
       const delay =
         e instanceof RateLimitError ? e.delayMs : baseDelay * 2 ** i;
-      await new Promise((r) => setTimeout(r, delay));
+      await sleepAbortable(delay);
     }
   }
   throw lastErr;
@@ -251,7 +309,7 @@ async function fetchJson(url) {
   return withRetry(async () => {
     let direct;
     try {
-      direct = await fetch(url, { headers: { Accept: "application/json" } });
+      direct = await fetch(url, { headers: { Accept: "application/json" }, signal: buildAbort?.signal });
     } catch {
       // Network/CORS failure — direct doesn't even produce a response.
       direct = null;
@@ -263,7 +321,7 @@ async function fetchJson(url) {
       }
       // 5xx → fall through to proxy as a transient retry.
     }
-    const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" } });
+    const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" }, signal: buildAbort?.signal });
     if (!r.ok) {
       // The proxy faithfully forwards upstream status, so 4xx here is also
       // authoritative (deck not found / private). Surface it as fatal so
@@ -320,7 +378,7 @@ async function fetchBlob(url) {
   return withRetry(async () => {
     let last = "404 Not Found";
     for (const u of candidates) {
-      const r = await fetch(u);
+      const r = await fetch(u, { signal: buildAbort?.signal });
       if (r.ok) return r.blob();
       last = `${r.status} ${r.statusText}`;
       if (r.status !== 404) break;
@@ -336,7 +394,7 @@ async function fetchJsonScryfall(url) {
   // any Scryfall outage. Retry direct instead; if Scryfall is down, the proxy
   // would just forward the same upstream error anyway.
   return withRetry(async () => {
-    const r = await fetch(url, { headers: { Accept: "application/json" } });
+    const r = await fetch(url, { headers: { Accept: "application/json" }, signal: buildAbort?.signal });
     if (r.ok) return parseJsonStrict(r);
     if (r.status === 429) {
       // RateLimitError makes withRetry wait out Scryfall's 30s lockout
@@ -1154,7 +1212,9 @@ function scryfallCard(uid) {
     if (stored && Date.now() - stored.fetchedAt < SCRYFALL_TTL_MS) {
       return stored.data;
     }
-    await new Promise((r) => setTimeout(r, 80));  // Scryfall rate-limit politeness
+    // Shared gate — concurrent build workers must pace through one queue,
+    // not sleep independently (see scryfallApiSlot() for why).
+    await scryfallApiSlot();
     const data = await fetchJsonScryfall(SCRYFALL(uid));
     // Best-effort persist; awaiting is cheap because IDB writes are async-batched.
     idbSet(uid, { data, fetchedAt: Date.now() });
@@ -1531,6 +1591,26 @@ function expandTokenQty(tokens) {
   return out;
 }
 
+// Cards build several at a time instead of one-at-a-time. This is safe
+// because the only shared mutable state processJob touches — the Scryfall
+// request pacing and state.slot — is already concurrency-safe: scryfallCard
+// routes every request through the single scryfallApiSlot() gate, and
+// state.slot is incremented in a synchronous loop with no `await`s, so each
+// job's slot range is claimed atomically no matter how many jobs finish out
+// of order.
+const BUILD_CONCURRENCY = 5;
+
+async function runPool(items, limit, worker) {
+  let next = 0;
+  const lanes = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      await worker(items[i], i);
+    }
+  });
+  await Promise.all(lanes);
+}
+
 async function processJob(state, job, opts, zip, gallery) {
   // state.slot is mutated to assign sequential slot numbers across all jobs
   // so fronts/<NNN>.* and backs/<NNN>.* stay aligned for tcgplaytest's
@@ -1839,16 +1919,36 @@ let liveFailures = [];
 async function retryFailures() {
   if (!retryCtx.state || !retryCtx.zip) return;
   els.retryBtn.disabled = true;
+  buildAbort = new AbortController();
+  showCancelButton();
   const remaining = [];
   const retryable = liveFailures.filter((f) => f.job);
   const passthrough = liveFailures.filter((f) => !f.job);
   for (let i = 0; i < retryable.length; i++) {
     const f = retryable[i];
+    if (buildAbort.signal.aborted) {
+      // Cancelled mid-retry — leave the rest as retryable failures instead
+      // of spending a processJob call per item just to hit the same abort.
+      remaining.push({ name: f.job.name, error: "cancelled — use Retry failed cards to resume", job: f.job });
+      continue;
+    }
     setStatus(`Retrying ${i + 1}/${retryable.length}: ${f.job.name}...`);
+    // Fresh placeholder per retried card, appended at the gallery end —
+    // retries always land in new slots, so there's no deck-order position
+    // to preserve the way the initial build's per-job containers do.
+    const container = document.createElement("div");
+    container.className = "thumb-slot";
+    els.gallery.appendChild(container);
     try {
-      await processJob(retryCtx.state, f.job, retryCtx.opts, retryCtx.zip, els.gallery);
+      await processJob(retryCtx.state, f.job, retryCtx.opts, retryCtx.zip, container);
     } catch (e) {
-      remaining.push({ name: f.job.name, error: e.message, job: f.job });
+      const cancelled = e.name === "AbortError" || buildAbort.signal.aborted;
+      remaining.push({
+        name: f.job.name,
+        error: cancelled ? "cancelled — use Retry failed cards to resume" : e.message,
+        job: f.job,
+      });
+      container.remove();
     }
   }
   liveFailures = [...passthrough, ...remaining];
@@ -1862,6 +1962,7 @@ async function retryFailures() {
   } catch (e) {
     setStatus(`ZIP generation failed: ${e.message}`, "error");
     els.retryBtn.disabled = false;
+    hideCancelButton();
     return;
   }
   const goodCount = retryCtx.jobsLen - liveFailures.filter((f) => f.job).length;
@@ -1870,13 +1971,17 @@ async function retryFailures() {
   } files in ZIP)`;
   renderCostEstimate(retryCtx.state.slot);
   await renderDeckStats(retryCtx.jobs);
+  const wasCancelled = buildAbort.signal.aborted;
   setStatus(
-    remaining.length
+    wasCancelled
+      ? `Cancelled — ${remaining.length} still failing. Retry failed cards resumes the rest.`
+      : remaining.length
       ? `Retried — ${remaining.length} still failing.`
       : "Retried — all recovered. Re-download the ZIP.",
-    remaining.length ? "error" : "ok",
+    wasCancelled ? "" : remaining.length ? "error" : "ok",
   );
   els.retryBtn.disabled = false;
+  hideCancelButton();
 }
 
 async function loadJobs(opts) {
@@ -1983,6 +2088,8 @@ async function loadJobs(opts) {
 
 async function run() {
   els.go.disabled = true;
+  buildAbort = new AbortController();
+  showCancelButton();
   const append = appendMode && retryCtx.zip != null;
   // Don't consume `appendMode` yet — if loadJobs throws, the user should
   // still be in append mode so a corrected URL doesn't silently wipe the
@@ -2048,8 +2155,12 @@ async function run() {
     deckLabel = loaded.deckLabel;
     initialUnresolved = loaded.unresolved || [];
   } catch (e) {
-    setStatus(e.message, "error");
+    // Cancelling during deck-fetch/decklist-resolution (before the build
+    // pool even starts) has nothing retryable to show — no jobs, no zip —
+    // so it's a plain neutral stop rather than the pool's soft-stop path.
+    setStatus(e.name === "AbortError" ? "Cancelled." : e.message, e.name === "AbortError" ? "" : "error");
     els.go.disabled = false;
+    hideCancelButton();
     return;
   }
   // loadJobs succeeded — now safe to consume the flag and reset the label.
@@ -2066,81 +2177,131 @@ async function run() {
   }
 
   if (opts.includeTokens) {
-    setStatus(
-      opts.tokensThorough
-        ? "Discovering tokens (thorough scan, slower)..."
-        : "Discovering tokens / emblems...",
-    );
-    // Run discovery against the merged main deck so tokens already
-    // included from the first pass don't get printed again on the second.
-    const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
-    const { tokens, failures: tokenFailures, minters, doublerCount } = await discoverTokens(
-      baseJobsForDiscovery,
-      { thorough: opts.tokensThorough },
-    );
-    // Filter to tokens we haven't already added in a prior pass. Include
-    // both `uid` and any `pairBackUid` so a paired-token back from pass 1
-    // doesn't get re-emitted as a standalone token in pass 2.
-    const existingTokenUids = new Set();
-    for (const j of retryCtx.jobs || []) {
-      if (!j.isToken) continue;
-      if (j.uid) existingTokenUids.add(j.uid);
-      if (j.pairBackUid) existingTokenUids.add(j.pairBackUid);
-    }
-    const fresh = tokens.filter((t) => !existingTokenUids.has(t.uid));
-    if (fresh.length) {
-      // Smart-qty: scale each token's qty by minter count (and optional
-      // doubler multiplier) before pairing. Mutates `fresh` in place.
-      applyTokenQty(fresh, minters, doublerCount, opts.tokenQty);
-      const totalCopies = fresh.reduce((a, j) => a + j.qty, 0);
-      if (opts.pairTokens && !opts.pairBacks) {
-        passFailures.push({
-          name: "Token pairing skipped",
-          error: "Pair tokens needs Pair backs enabled — falling back to single-sided.",
-        });
+    try {
+      setStatus(
+        opts.tokensThorough
+          ? "Discovering tokens (thorough scan, slower)..."
+          : "Discovering tokens / emblems...",
+      );
+      // Run discovery against the merged main deck so tokens already
+      // included from the first pass don't get printed again on the second.
+      const baseJobsForDiscovery = append ? [...retryCtx.jobs, ...jobs] : jobs;
+      const { tokens, failures: tokenFailures, minters, doublerCount } = await discoverTokens(
+        baseJobsForDiscovery,
+        { thorough: opts.tokensThorough },
+      );
+      // Filter to tokens we haven't already added in a prior pass. Include
+      // both `uid` and any `pairBackUid` so a paired-token back from pass 1
+      // doesn't get re-emitted as a standalone token in pass 2.
+      const existingTokenUids = new Set();
+      for (const j of retryCtx.jobs || []) {
+        if (!j.isToken) continue;
+        if (j.uid) existingTokenUids.add(j.uid);
+        if (j.pairBackUid) existingTokenUids.add(j.pairBackUid);
       }
-      if (opts.pairTokens && opts.pairBacks) {
-        // Expand qty>1 jobs into singles before pairing so each copy gets
-        // its own pair slot. Mirrors fill.py:_apply_token_jobs.
-        const expanded = expandTokenQty(fresh);
-        if (expanded.length >= 2) {
-          const paired = pairTokens(expanded);
-          jobs = [...jobs, ...paired];
+      const fresh = tokens.filter((t) => !existingTokenUids.has(t.uid));
+      if (fresh.length) {
+        // Smart-qty: scale each token's qty by minter count (and optional
+        // doubler multiplier) before pairing. Mutates `fresh` in place.
+        applyTokenQty(fresh, minters, doublerCount, opts.tokenQty);
+        const totalCopies = fresh.reduce((a, j) => a + j.qty, 0);
+        if (opts.pairTokens && !opts.pairBacks) {
+          passFailures.push({
+            name: "Token pairing skipped",
+            error: "Pair tokens needs Pair backs enabled — falling back to single-sided.",
+          });
+        }
+        if (opts.pairTokens && opts.pairBacks) {
+          // Expand qty>1 jobs into singles before pairing so each copy gets
+          // its own pair slot. Mirrors fill.py:_apply_token_jobs.
+          const expanded = expandTokenQty(fresh);
+          if (expanded.length >= 2) {
+            const paired = pairTokens(expanded);
+            jobs = [...jobs, ...paired];
+            deckLabel =
+              `${deckLabel} (+ ${fresh.length} unique tokens` +
+              (totalCopies !== fresh.length ? `, ${totalCopies} copies` : "") +
+              ` → ${paired.length} cards)`;
+          } else {
+            jobs = [...jobs, ...expanded];
+            deckLabel = `${deckLabel} (+ ${fresh.length} tokens)`;
+          }
+        } else {
+          jobs = [...jobs, ...fresh];
           deckLabel =
             `${deckLabel} (+ ${fresh.length} unique tokens` +
             (totalCopies !== fresh.length ? `, ${totalCopies} copies` : "") +
-            ` → ${paired.length} cards)`;
-        } else {
-          jobs = [...jobs, ...expanded];
-          deckLabel = `${deckLabel} (+ ${fresh.length} tokens)`;
+            ")";
         }
-      } else {
-        jobs = [...jobs, ...fresh];
-        deckLabel =
-          `${deckLabel} (+ ${fresh.length} unique tokens` +
-          (totalCopies !== fresh.length ? `, ${totalCopies} copies` : "") +
-          ")";
       }
+      newTokenFailures = tokenFailures;
+    } catch (e) {
+      if (e.name !== "AbortError") throw e;
+      // Cancelled during token discovery. No jobs from this pass have been
+      // committed to retryCtx yet, and tokens found so far aren't tracked
+      // anywhere retryable — known limitation, accepted: a cancelled pass's
+      // token discovery isn't resumable via Retry, only its main-deck build
+      // is (once it reaches the pool below).
+      setStatus("Cancelled.", "");
+      els.go.disabled = false;
+      hideCancelButton();
+      return;
     }
-    newTokenFailures = tokenFailures;
   }
 
   setStatus(`${deckLabel} — ${jobs.length} unique cards. Building...`);
   setProgress(0, jobs.length);
 
+  // Thumbnails now finish in COMPLETION order under the concurrency pool
+  // below, not deck order, so each job gets a placeholder container up
+  // front, appended to the gallery in deck order — addThumb (called from
+  // inside processJob) fills a container in whenever that job finishes.
+  // `.thumb-slot` is `display: contents` (see style.css) so it's an
+  // invisible grouping node; its `.thumb` children remain the gallery
+  // grid's direct items, keeping the layout identical to a plain append.
+  const jobContainers = jobs.map(() => {
+    const c = document.createElement("div");
+    c.className = "thumb-slot";
+    els.gallery.appendChild(c);
+    return c;
+  });
+
+  // NOTE on slot numbers: state.slot (mutated inside processJob) is now
+  // claimed in COMPLETION order rather than deck order, since jobs finish
+  // concurrently. That's fine — processJob's per-job slot loop has no
+  // `await`s, so each job's slot range is written atomically, keeping
+  // fronts/<NNN> and backs/<NNN> paired correctly regardless of which job's
+  // numbers land where. tcgplaytest's Sequential Backs feature only needs
+  // that per-slot front/back pairing, not deck-order numbering. Cancelling
+  // mid-pool can't leave "holes" either: a job either finishes and claims a
+  // contiguous slot range, or never claims one at all.
   let done = 0;
-  for (let i = 0; i < jobs.length; i++) {
-    try {
-      await processJob(state, jobs[i], opts, zip, els.gallery);
-    } catch (e) {
-      passFailures.push({ name: jobs[i].name, error: e.message, job: jobs[i] });
+  await runPool(jobs, BUILD_CONCURRENCY, async (job, i) => {
+    // Stop picking up new work once cancelled. A job already mid-flight is
+    // allowed to run to its next network call, which rejects on its own via
+    // the aborted signal (see fetchBlob / fetchJsonScryfall / withRetry).
+    if (buildAbort.signal.aborted) {
+      passFailures.push({ name: job.name, error: "cancelled — use Retry failed cards to resume", job });
+      jobContainers[i].remove();
+    } else {
+      try {
+        await processJob(state, job, opts, zip, jobContainers[i]);
+      } catch (e) {
+        const cancelled = e.name === "AbortError" || buildAbort.signal.aborted;
+        passFailures.push({
+          name: job.name,
+          error: cancelled ? "cancelled — use Retry failed cards to resume" : e.message,
+          job,
+        });
+        jobContainers[i].remove();
+      }
     }
     done++;
     setProgress(done, jobs.length);
     setStatus(
       `Building... ${done}/${jobs.length} cards${passFailures.length ? ` (${passFailures.length} failed)` : ""}`,
     );
-  }
+  });
 
   // Merge this pass into the running build.
   const allJobs = [...retryCtx.jobs, ...jobs];
@@ -2173,6 +2334,7 @@ async function run() {
   } catch (e) {
     setStatus(`ZIP generation failed: ${e.message}`, "error");
     els.go.disabled = false;
+    hideCancelButton();
     return;
   }
   lastZipName = `${slug(mergedDeckLabel)}_tcgplaytest.zip`;
@@ -2199,22 +2361,45 @@ async function run() {
   // Don't paint the success-green "ok" colour when the failures box has
   // entries — that contradicts the failure list right below.
   const hadFailures = liveFailures.length > 0;
-  const message = append
-    ? "Added. Click Download ZIP, or add another deck."
-    : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.";
-  setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
+  const wasCancelled = buildAbort.signal.aborted;
+  if (wasCancelled) {
+    // Soft-stop: no "ok" green (it didn't finish) and no "error" red (this
+    // isn't a failure) — the partial ZIP already downloads fine and Retry
+    // failed cards resumes exactly the cards the pool didn't get to.
+    setStatus(`Cancelled — built ${builtJobs}/${allJobs.length} cards. Retry failed cards resumes the rest.`, "");
+  } else {
+    const message = append
+      ? "Added. Click Download ZIP, or add another deck."
+      : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.";
+    setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
+  }
   els.go.disabled = false;
+  hideCancelButton();
 }
 
 els.go.addEventListener("click", () => {
   run().catch((e) => {
     setStatus(`Unexpected error: ${e.message}`, "error");
     els.go.disabled = false;
+    hideCancelButton();
   });
 });
 
 els.retryBtn.addEventListener("click", () => {
-  retryFailures().catch((e) => setStatus(`Retry failed: ${e.message}`, "error"));
+  retryFailures().catch((e) => {
+    setStatus(`Retry failed: ${e.message}`, "error");
+    els.retryBtn.disabled = false;
+    hideCancelButton();
+  });
+});
+
+els.cancelBtn.addEventListener("click", () => {
+  // Soft-stop: abort in-flight/queued requests via the shared signal and
+  // stop the pool from starting new jobs. Disable immediately so a second
+  // click can't fire while the pass is still winding down; run()/
+  // retryFailures() hide the button entirely once they've finished.
+  buildAbort?.abort();
+  els.cancelBtn.disabled = true;
 });
 
 // Every option control. Disabled while append mode is armed: "Add to order"

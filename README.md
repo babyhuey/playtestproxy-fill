@@ -33,6 +33,19 @@ The frontend covers the same options as the CLI:
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
 of the same deck are near-instant after the first run.
 
+Card images download up to 5 at a time instead of one at a time, which
+speeds up the network-bound download phase considerably on bigger decks —
+a 100-card PNG build that used to fetch every image serially now typically
+finishes in a fraction of the time. Scryfall's own metadata lookups still
+pace through one shared queue at their ~9 requests/sec limit regardless of
+how many images are downloading at once, so the rate cap is respected
+either way.
+
+A **Cancel** button appears next to Fetch & build while a build is
+running. Clicking it stops new cards from starting; cards already built
+stay in the ZIP, which downloads immediately, and the rest show up in the
+failures list — click **Retry failed cards** to pick up where you left off.
+
 After a deck builds, an **Add another deck** button appears next to
 Download ZIP — click it to paste a second deck URL and append its cards
 to the same order (continuous slot numbers, merged stats / cost
@@ -247,8 +260,10 @@ upload.py <images_dir>
   the [images.weserv.nl](https://images.weserv.nl/) proxy (a different
   edge) before giving up on a card.
 - Scryfall calls are globally rate-limited to ~10/s (their published cap)
-  via a thread-shared lock in the CLI; the frontend uses the same 80–100ms
-  gate.
+  via a thread-shared lock in the CLI; the frontend routes every card
+  lookup through one shared ~110ms gate, so the concurrent build pool
+  (several cards download at once — see above) still caps out around 9
+  requests/sec in aggregate, not per worker.
 - Scryfall card metadata is cached in IndexedDB (browser) and an
   in-memory dict (CLI) with a 7-day TTL — re-builds of decks whose cards
   you've seen recently skip the metadata phase entirely.
