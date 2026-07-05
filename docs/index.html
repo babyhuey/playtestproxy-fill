@@ -86,7 +86,10 @@ Sideboard
             <option value="large">Large JPG — ~10× smaller &amp; faster</option>
           </select>
         </label>
-        <label class="check">Only proxy cards worth $<input id="opt-min-price" type="number" min="0" step="0.25" placeholder="0" inputmode="decimal"> or more (Scryfall USD price for the exact printing; cards with no listed price are always kept; empty = print everything)</label>
+      </div>
+      <div class="back-source">
+        <label class="min-price" for="opt-min-price">Only proxy cards worth $<input id="opt-min-price" type="number" min="0" step="0.25" placeholder="0" inputmode="decimal"> or more</label>
+        <p class="hint small">Uses Scryfall's USD price for the exact printing; cards with no listed price are always kept. Leave empty to print everything.</p>
       </div>
       <div class="back-source">
         <div class="back-source-label">Default back for non-DFC cards (optional override)</div>
