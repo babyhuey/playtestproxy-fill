@@ -92,6 +92,7 @@ input[type="text"]:focus, input[type="number"]:focus {
 .opts-grid label.check input { width: auto; }
 .opts-grid label { color: var(--muted); }
 .opts-grid input[type="number"] { margin-top: 4px; }
+#opt-min-price { width: 5em; }
 
 .back-source {
   margin-top: 4px;
@@ -141,6 +142,22 @@ input[type="text"]:focus, input[type="number"]:focus {
 @media (max-width: 520px) {
   .back-source-row { grid-template-columns: 1fr; }
 }
+.collection-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.clear-btn {
+  padding: 6px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.clear-btn:hover { border-color: var(--accent); color: var(--text); }
 
 button.primary {
   margin-top: 14px;

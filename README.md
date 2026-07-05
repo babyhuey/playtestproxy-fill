@@ -29,6 +29,15 @@ The frontend covers the same options as the CLI:
   count and optional doubler multiplier (Conservative / Standard / Aggressive)
 - Image quality — PNG (best, default) or Large JPG (~10× smaller and faster)
 - Custom default back (file upload or URL paste)
+- Skip cards you own — upload a ManaBox export or any CSV with Name +
+  Quantity columns and owned copies are subtracted from the deck before
+  building (matched by card name; printing and foil are ignored)
+- Minimum price filter — only proxy cards worth at least $X (Scryfall USD
+  for the exact printing); cards with no listed price are always kept
+
+The `manifest.json` in the downloaded ZIP now also records `skipped_owned`
+and `skipped_cheap` — the cards/copies the two filters above dropped, so
+you have a record of what wasn't printed and why.
 
 It also caches Scryfall card data in IndexedDB for 7 days, so re-builds
 of the same deck are near-instant after the first run.
@@ -51,6 +60,15 @@ Download ZIP — click it to paste a second deck URL and append its cards
 to the same order (continuous slot numbers, merged stats / cost
 estimate, deduped tokens). Useful for batching multiple decks into one
 tcgplaytest order.
+
+After a successful build from the Deck URL/ID tab (a fresh build, not an
+appended one), a **Copy share link** button appears — it copies a URL
+encoding the deck and any non-default options (tokens, image quality,
+minimum price, custom back URL, etc.) so someone else can load the same
+settings with one click. Loading a share link never auto-builds — it
+just pre-fills the form and waits for Fetch & build. File uploads (custom
+back image, collection CSV) are local to your machine and can't be
+encoded in the link.
 
 ## CLI setup
 

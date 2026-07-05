@@ -134,6 +134,8 @@ const els = {
   addAnotherBtn: $("add-another"),
   costEstimate: $("cost-estimate"),
   deckStats: $("deck-stats"),
+  skipsSummary: $("skips-summary"),
+  shareLink: $("share-link"),
 };
 
 // Set when the user clicks "Add another deck": the next build call merges
@@ -142,6 +144,12 @@ let appendMode = false;
 
 let lastZipBlob = null;
 let lastZipName = "deck.zip";
+
+// The deck URL/id string used for the last successful FRESH URL-mode pass —
+// null whenever the last pass was an append or came from the decklist tab,
+// since a share link can only encode a single deck. Set in run(); read by
+// buildShareUrl() and the show/hide check near the end of run().
+let lastShareDeckInput = null;
 
 // Set to a fresh AbortController at the start of every run()/retryFailures()
 // pass. fetchBlob / fetchJsonScryfall / fetchJson pass its signal to fetch(),
@@ -569,6 +577,47 @@ function parseCsvDecklist(text, opts = {}) {
     out.push({ qty, name, set, cn });
   }
   return out;
+}
+
+// Parses a "collection" CSV (ManaBox export, or any CSV with Name +
+// Quantity columns) into a Map<lowercased name, {left: n}> — the shared
+// mutable counter lets the owned-copies subtraction in run() decrement one
+// object regardless of which of a DFC's two names a job matched on. A DFC
+// full name ("Front // Back") also gets a second key for just the front
+// face, since decklists/exports commonly refer to a DFC by only one side.
+function parseCollectionCsv(text) {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) throw new Error("Collection file is empty.");
+  const headers = splitCsvLine(lines[0]).map((h) => h.trim().toLowerCase());
+  const idx = (cands) => {
+    for (const c of cands) {
+      const i = headers.indexOf(c);
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
+  const nameIdx = idx([...CSV_NAME_HEADERS]);
+  const qtyIdx = idx([...CSV_QTY_HEADERS]);
+  if (nameIdx === -1) {
+    throw new Error("Collection CSV needs a Name column (e.g. a ManaBox export).");
+  }
+  const owned = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitCsvLine(lines[i]);
+    const name = (cells[nameIdx] || "").trim();
+    if (!name) continue;
+    const qty = qtyIdx === -1 ? 1 : Number((cells[qtyIdx] || "").trim()) || 1;
+    if (!Number.isFinite(qty) || qty <= 0) continue;
+    const key = name.toLowerCase();
+    const counter = owned.get(key) || { left: 0 };
+    counter.left += qty;
+    owned.set(key, counter);
+    if (key.includes(" // ")) {
+      const frontKey = key.split(" // ")[0].trim();
+      if (!owned.has(frontKey)) owned.set(frontKey, counter);
+    }
+  }
+  return owned;
 }
 
 function parseDecklist(text, opts = {}) {
@@ -1612,6 +1661,17 @@ async function runPool(items, limit, worker) {
 }
 
 async function processJob(state, job, opts, zip, gallery) {
+  // Minimum-price filter: skip cards below the threshold before any image
+  // fetch or slot assignment. Tokens are exempt — they aren't purchasable
+  // substitutes, so a uid price has no meaningful bearing on them. Custom-
+  // image cards are exempt too — they have no Scryfall uid/price at all.
+  if (opts.minPrice > 0 && !job.isToken && !job.customUrl && job.uid) {
+    const data = await scryfallCard(job.uid);
+    const price = parseFloat(data.prices?.usd ?? data.prices?.usd_foil ?? data.prices?.usd_etched);
+    if (Number.isFinite(price) && price < opts.minPrice) {
+      return { skippedCheap: true, price };
+    }
+  }
   // state.slot is mutated to assign sequential slot numbers across all jobs
   // so fronts/<NNN>.* and backs/<NNN>.* stay aligned for tcgplaytest's
   // Sequential Backs feature.
@@ -1853,6 +1913,12 @@ const retryCtx = {
   jobsLen: 0,
   deckLabel: "",
   jobs: [],
+  // Collection-CSV "owned copies" pool (Map<name, {left: n}>, see
+  // parseCollectionCsv) and the running skip logs — shared across append
+  // passes so a batched multi-deck order only subtracts each owned copy once.
+  owned: null,
+  skippedOwned: [],
+  skippedCheap: [],
 };
 
 async function rebuildZipBlob() {
@@ -1877,6 +1943,8 @@ function writeManifest(zip) {
         total_copies: retryCtx.jobs.reduce((a, j) => a + j.qty, 0),
         options: retryCtx.opts,
         failures: liveFailures,
+        skipped_owned: retryCtx.skippedOwned,
+        skipped_cheap: retryCtx.skippedCheap,
       },
       null,
       2,
@@ -1912,6 +1980,43 @@ function renderFailures(failures) {
   const retryable = failures.filter((f) => f.job).length;
   els.retryBtn.hidden = retryable === 0;
   els.retryBtn.textContent = `Retry ${retryable} failed card${retryable === 1 ? "" : "s"}`;
+}
+
+// Truncates a name list past ~6 entries so a big collection/price skip
+// doesn't turn the summary line into a wall of text.
+function truncateNames(names) {
+  const shown = names.slice(0, 6);
+  const extra = names.length - shown.length;
+  return shown.join(", ") + (extra > 0 ? `, +${extra} more` : "");
+}
+
+function renderSkipsSummary() {
+  const el = els.skipsSummary;
+  if (!el) return;
+  const owned = retryCtx.skippedOwned;
+  const cheap = retryCtx.skippedCheap;
+  if (!owned.length && !cheap.length) {
+    el.hidden = true;
+    return;
+  }
+  const parts = [];
+  if (owned.length) {
+    // Merge by name — the same card can be reduced across multiple jobs
+    // (e.g. a main-deck copy and a commander copy) or across append passes.
+    const byName = new Map();
+    for (const o of owned) byName.set(o.name, (byName.get(o.name) || 0) + o.copies);
+    const totalCopies = owned.reduce((a, o) => a + o.copies, 0);
+    const names = [...byName.entries()].map(([name, copies]) => `${name} ×${copies}`);
+    parts.push(`${totalCopies} copies you own (${truncateNames(names)})`);
+  }
+  if (cheap.length) {
+    const totalCopies = cheap.reduce((a, c) => a + c.qty, 0);
+    const names = cheap.map((c) => `${c.name} ($${Number.isFinite(c.price) ? c.price.toFixed(2) : "?"})`);
+    const threshold = Number(retryCtx.opts?.minPrice) || 0;
+    parts.push(`${totalCopies} card${totalCopies === 1 ? "" : "s"} under $${threshold.toFixed(2)} (${truncateNames(names)})`);
+  }
+  el.textContent = `Skipped ${parts.join(" and ")}.`;
+  el.hidden = false;
 }
 
 let liveFailures = [];
@@ -2112,11 +2217,15 @@ async function run() {
     els.addAnotherBtn.hidden = true;
     els.costEstimate.hidden = true;
     els.deckStats.hidden = true;
+    els.skipsSummary.hidden = true;
     liveFailures = [];
     retryCtx.state = null;
     retryCtx.zip = null;
     retryCtx.jobs = [];
     retryCtx.deckLabel = "";
+    retryCtx.owned = null;
+    retryCtx.skippedOwned = [];
+    retryCtx.skippedCheap = [];
     // SPA: reset the Scryfall payload cache on every fresh run so the Map
     // doesn't grow unbounded across multiple builds in the same tab.
     _scryfallCache.clear();
@@ -2129,6 +2238,7 @@ async function run() {
       tokensThorough: $("opt-tokens-thorough").checked,
       tokenQty: $("opt-token-qty").value || "one",
       imageQuality: $("opt-image-quality").value || "png",
+      minPrice: parseFloat($("opt-min-price").value) || 0,
     };
     zip = new JSZip();
     // A pasted custom-back URL can take seconds to fetch (possibly via the
@@ -2150,6 +2260,17 @@ async function run() {
   // Failures from this pass only — accumulated into liveFailures at the end.
   const passFailures = [];
   try {
+    // Collection-CSV parsing happens before any network work, on a fresh
+    // pass only — append passes reuse retryCtx.owned as-is so the same
+    // owned-copy pool is consumed across the whole batched order rather
+    // than once per deck.
+    if (!append) {
+      const collectionFile = $("opt-collection-file").files?.[0];
+      if (collectionFile) {
+        const text = await collectionFile.text();
+        retryCtx.owned = parseCollectionCsv(text);
+      }
+    }
     const loaded = await loadJobs(opts);
     jobs = loaded.jobs;
     deckLabel = loaded.deckLabel;
@@ -2166,9 +2287,41 @@ async function run() {
   // loadJobs succeeded — now safe to consume the flag and reset the label.
   // Options unlock again: the next build either appends (re-locking on the
   // "Add another deck" click) or starts a fresh batch with the new values.
+  // Share links only encode a single deck, so only a fresh URL-mode pass
+  // (not append, not the decklist tab) leaves a shareable deck string behind.
+  const urlMode = $("mode-text-pane").hidden;
+  lastShareDeckInput = !append && urlMode ? els.input.value.trim() : null;
   appendMode = false;
   setOptionsLocked(false);
   els.go.textContent = "Fetch & build";
+
+  // Collection subtraction: BEFORE skip-basics and token discovery, so
+  // basics stay subtractable and tokens (added further below) are never
+  // treated as owned. Matches by full card name, falling back to just the
+  // front face for DFCs — see parseCollectionCsv for the mirrored keying.
+  if (retryCtx.owned) {
+    let skippedTotal = 0;
+    const remaining = [];
+    for (const job of jobs) {
+      let counter = retryCtx.owned.get(job.name.toLowerCase());
+      if (!counter && job.name.includes(" // ")) {
+        counter = retryCtx.owned.get(job.name.toLowerCase().split(" // ")[0].trim());
+      }
+      if (counter && counter.left > 0) {
+        const take = Math.min(counter.left, job.qty);
+        if (take > 0) {
+          counter.left -= take;
+          job.qty -= take;
+          skippedTotal += take;
+          retryCtx.skippedOwned.push({ name: job.name, copies: take });
+        }
+      }
+      if (job.qty > 0) remaining.push(job);
+    }
+    jobs = remaining;
+    if (skippedTotal) deckLabel = `${deckLabel} (− ${skippedTotal} owned)`;
+  }
+
   if (opts.skipBasics) {
     const before = jobs.reduce((a, j) => a + j.qty, 0);
     jobs = jobs.filter((j) => !isBasicLand(j.name));
@@ -2285,7 +2438,12 @@ async function run() {
       jobContainers[i].remove();
     } else {
       try {
-        await processJob(state, job, opts, zip, jobContainers[i]);
+        const result = await processJob(state, job, opts, zip, jobContainers[i]);
+        if (result && result.skippedCheap) {
+          jobContainers[i].remove();
+          retryCtx.skippedCheap.push({ name: job.name, qty: job.qty, price: result.price });
+          job.skipped = true;
+        }
       } catch (e) {
         const cancelled = e.name === "AbortError" || buildAbort.signal.aborted;
         passFailures.push({
@@ -2302,6 +2460,10 @@ async function run() {
       `Building... ${done}/${jobs.length} cards${passFailures.length ? ` (${passFailures.length} failed)` : ""}`,
     );
   });
+
+  // Drop price-skipped jobs before merging so deck stats / total_copies /
+  // token dedupe reflect only what actually got printed.
+  jobs = jobs.filter((j) => !j.skipped);
 
   // Merge this pass into the running build.
   const allJobs = [...retryCtx.jobs, ...jobs];
@@ -2350,12 +2512,17 @@ async function run() {
     `Built ${builtJobs}/${allJobs.length} cards (${zipImageCount(zip)} files in ZIP)${failTail}`;
   els.result.hidden = false;
   els.addAnotherBtn.hidden = false;
+  // Share links only encode one deck — hide the button unless this pass
+  // left a shareable deck string behind (see the lastShareDeckInput note
+  // set right after loadJobs succeeded, above).
+  els.shareLink.hidden = !lastShareDeckInput;
 
   // state.slot is the number of physical cards we wrote — fronts only.
   // tcgplaytest charges per card, not per face, so a card with a custom
   // back still counts once. Non-US shipping varies and isn't surfaced.
   renderCostEstimate(state.slot);
   renderFailures(liveFailures);
+  renderSkipsSummary();
   await renderDeckStats(allJobs);
 
   // Don't paint the success-green "ok" colour when the failures box has
@@ -2409,6 +2576,7 @@ const OPTION_CONTROL_IDS = [
   "opt-skip-side", "opt-skip-basics", "opt-pair-backs", "opt-tokens",
   "opt-pair-tokens", "opt-tokens-thorough", "opt-token-qty",
   "opt-image-quality", "opt-back-file", "opt-back-url",
+  "opt-min-price", "opt-collection-file", "opt-collection-clear",
 ];
 
 function setOptionsLocked(locked) {
@@ -2426,6 +2594,9 @@ els.addAnotherBtn.addEventListener("click", () => {
   els.input.value = "";
   $("decklist-input").value = "";
   els.input.focus();
+  // A share link encodes exactly one deck — once a second deck is queued
+  // up, the last build's link no longer describes the whole batch.
+  els.shareLink.hidden = true;
   setStatus("Paste another deck URL or decklist, then click Add to order.");
 });
 
@@ -2438,6 +2609,17 @@ $("opt-back-file").addEventListener("change", (e) => {
   $("back-file-name").textContent = f
     ? f.name
     : '— bundled "You Wouldn\'t Proxy a Magic Card" —';
+});
+
+$("opt-collection-file").addEventListener("change", (e) => {
+  const f = e.target.files && e.target.files[0];
+  $("collection-file-name").textContent = f ? f.name : "— none —";
+  $("opt-collection-clear").hidden = !f;
+});
+$("opt-collection-clear").addEventListener("click", () => {
+  $("opt-collection-file").value = "";
+  $("collection-file-name").textContent = "— none —";
+  $("opt-collection-clear").hidden = true;
 });
 
 // Token-option dependencies. `opt-tokens-thorough` and `opt-pair-tokens` are
@@ -2509,6 +2691,104 @@ for (const [id, otherMode] of [["mode-url", "text"], ["mode-text", "url"]]) {
     $(`mode-${otherMode}`).focus();
   });
 }
+
+// --- Shareable build links -----------------------------------------------
+// Query params emitted by buildShareUrl() / read by the load-time parser
+// below. Only non-default values are emitted, so a share link stays short.
+// File uploads (custom back image, collection CSV) and pasted collection
+// CSVs are local-only and can't be encoded — only the pasted custom-back
+// URL variant is shareable.
+//   deck      - the pasted deck URL/id (URL-mode only)
+//   side=0    - "Skip Sideboard/Maybeboard" UNCHECKED (default: checked)
+//   basics=1  - "Skip basic lands" CHECKED (default: unchecked)
+//   backs=0   - "Pair backs" UNCHECKED (default: checked)
+//   tokens=1  - "Include tokens" CHECKED (default: unchecked)
+//   pt=0      - "Pair tokens" UNCHECKED (default: checked)
+//   th=1      - "Thorough token scan" CHECKED (default: unchecked)
+//   tq=<v>    - token quantity strategy, when not "one"
+//   q=large   - image quality, when not "png"
+//   minprice=<n> - minimum price filter, when > 0
+//   backurl=<url> - pasted custom-back URL (not the uploaded-file variant)
+function buildShareUrl() {
+  const p = new URLSearchParams();
+  p.set("deck", lastShareDeckInput);
+  if (!els.skipSide.checked) p.set("side", "0");
+  if (els.skipBasics.checked) p.set("basics", "1");
+  if (!$("opt-pair-backs").checked) p.set("backs", "0");
+  if ($("opt-tokens").checked) p.set("tokens", "1");
+  if (!$("opt-pair-tokens").checked) p.set("pt", "0");
+  if ($("opt-tokens-thorough").checked) p.set("th", "1");
+  if ($("opt-token-qty").value !== "one") p.set("tq", $("opt-token-qty").value);
+  if ($("opt-image-quality").value !== "png") p.set("q", $("opt-image-quality").value);
+  const minPrice = parseFloat($("opt-min-price").value);
+  if (minPrice > 0) p.set("minprice", String(minPrice));
+  const backUrl = $("opt-back-url").value.trim();
+  if (backUrl) p.set("backurl", backUrl);
+  return `${location.origin}${location.pathname}?${p.toString()}`;
+}
+
+els.shareLink.addEventListener("click", async () => {
+  const url = buildShareUrl();
+  const restoreText = els.shareLink.textContent;
+  const flash = () => {
+    els.shareLink.textContent = "Copied!";
+    setTimeout(() => { els.shareLink.textContent = restoreText; }, 1500);
+  };
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch {
+    // Clipboard API unavailable/denied — fall back to the classic
+    // hidden-textarea + execCommand("copy") trick.
+    const ta = document.createElement("textarea");
+    ta.value = url;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+    } catch {
+      // Best effort — nothing further we can do here.
+    }
+    document.body.removeChild(ta);
+  }
+  flash();
+});
+
+// On load: a `deck` param pre-fills the URL-mode input and switches to that
+// tab; recognized option params are applied to their controls, dispatching
+// `change` so dependency wiring (bindTokenChild etc.) reacts the same way a
+// real click would. Unknown params are ignored. No auto-build — a shared
+// link must never cause surprise network traffic.
+(() => {
+  const params = new URLSearchParams(location.search);
+  const deck = params.get("deck");
+  if (!deck) return;
+  setMode("url");
+  els.input.value = deck;
+  const setChecked = (id, value) => {
+    const el = $(id);
+    el.checked = value;
+    el.dispatchEvent(new Event("change"));
+  };
+  if (params.has("side")) setChecked("opt-skip-side", params.get("side") !== "0");
+  if (params.has("basics")) setChecked("opt-skip-basics", params.get("basics") === "1");
+  if (params.has("backs")) setChecked("opt-pair-backs", params.get("backs") !== "0");
+  if (params.has("tokens")) setChecked("opt-tokens", params.get("tokens") === "1");
+  if (params.has("pt")) setChecked("opt-pair-tokens", params.get("pt") !== "0");
+  if (params.has("th")) setChecked("opt-tokens-thorough", params.get("th") === "1");
+  if (params.has("tq")) {
+    $("opt-token-qty").value = params.get("tq");
+    $("opt-token-qty").dispatchEvent(new Event("change"));
+  }
+  if (params.has("q")) {
+    $("opt-image-quality").value = params.get("q");
+    $("opt-image-quality").dispatchEvent(new Event("change"));
+  }
+  if (params.has("minprice")) $("opt-min-price").value = params.get("minprice");
+  if (params.has("backurl")) $("opt-back-url").value = params.get("backurl");
+  setStatus("Loaded shared build settings — click Fetch & build.");
+})();
 
 // --- Version footer ----------------------------------------------------
 // version.json is written by the Pages workflow at deploy time.
