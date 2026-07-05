@@ -86,6 +86,7 @@ Sideboard
             <option value="large">Large JPG — ~10× smaller &amp; faster</option>
           </select>
         </label>
+        <label class="check">Only proxy cards worth $<input id="opt-min-price" type="number" min="0" step="0.25" placeholder="0" inputmode="decimal"> or more (Scryfall USD price for the exact printing; cards with no listed price are always kept; empty = print everything)</label>
       </div>
       <div class="back-source">
         <div class="back-source-label">Default back for non-DFC cards (optional override)</div>
@@ -97,6 +98,18 @@ Sideboard
           </label>
           <input id="opt-back-url" type="text" placeholder="…or paste an image URL">
         </div>
+      </div>
+      <div class="back-source">
+        <div class="back-source-label">Skip cards you own (optional)</div>
+        <div class="collection-row">
+          <label class="upload-label">
+            <input id="opt-collection-file" type="file" accept=".csv,text/csv">
+            <span class="upload-button">Upload CSV</span>
+            <span id="collection-file-name" class="back-file-name">— none —</span>
+          </label>
+          <button id="opt-collection-clear" type="button" class="clear-btn" hidden>Clear</button>
+        </div>
+        <p class="hint small">ManaBox export or any CSV with Name + Quantity columns. Owned copies are subtracted from the deck before building — matched by card name; printing and foil are ignored.</p>
       </div>
     </details>
 
@@ -112,9 +125,11 @@ Sideboard
         <span id="result-summary"></span>
         <div class="result-actions">
           <button id="add-another" class="secondary">Add another deck</button>
+          <button id="share-link" class="secondary" hidden>Copy share link</button>
           <button id="download-zip" class="primary">Download ZIP</button>
         </div>
       </div>
+      <p id="skips-summary" class="hint" hidden></p>
       <p id="cost-estimate" class="hint cost-estimate" hidden></p>
       <div id="deck-stats" class="deck-stats" hidden></div>
       <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1. Choose <strong>"No Bleed"</strong> — tcgplaytest applies the print-bleed expansion server-side. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong>. The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.)</p>
