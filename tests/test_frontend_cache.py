@@ -260,6 +260,123 @@ def test_custom_art_fetch_bypasses_http_cache():
         browser.close()
 
 
+@pytest.mark.frontend
+def test_deck_fetch_cache_bust_is_opt_in():
+    """corsproxy.io serves the deck JSON with `cache-control: max-age=3600,
+    s-maxage=3600`, so the browser AND corsproxy's shared edge can pin an
+    hour-stale deck. By default the app uses that cache (cheap; spares corsproxy
+    and the deck host). The "Force-refresh the deck" option appends a unique
+    `_cb` param that busts the cache at every layer for that one build — for
+    when the user just edited a printing/custom art upstream.
+
+    Asserts: default build carries NO `_cb`; a forced build carries one; two
+    forced builds use *different* busters (unique per build, not a constant).
+    """
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+
+    custom_url = "https://example.test/custom-art.png"
+    # A single custom-art card so the build needs no live Scryfall round-trip.
+    deck = {
+        "name": "Custom Test",
+        "categories": [],
+        "cards": [
+            {
+                "quantity": 1,
+                "categories": ["Commander"],
+                "card": {
+                    "uid": None,
+                    "customImageUrl": custom_url,
+                    "oracleCard": {"name": "Custom Card"},
+                    "id": 1,
+                },
+            }
+        ],
+    }
+
+    def deck_cb_values(log):
+        import urllib.parse as up
+
+        out = []
+        for e in log:
+            if "archidekt.com/api/decks" in e["url"]:
+                qs = up.parse_qs(up.urlparse(e["url"]).query)
+                out.append(qs.get("_cb", [None])[0])
+        return out
+
+    with _http_server() as port, sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = ctx.new_page()
+        page.add_init_script(
+            """
+            (() => {
+              const orig = window.fetch;
+              window.__fetchLog = [];
+              window.fetch = function (input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+                window.__fetchLog.push({ url, cache: (init && init.cache) || null });
+                return orig.apply(this, arguments);
+              };
+            })();
+            """
+        )
+        page.route(
+            "https://archidekt.com/api/decks/**",
+            lambda r: r.fulfill(
+                status=200,
+                body=json.dumps(deck),
+                headers={
+                    "content-type": "application/json",
+                    "access-control-allow-origin": "*",
+                },
+            ),
+        )
+        page.route(
+            custom_url,
+            lambda r: r.fulfill(
+                status=200,
+                body=_ONE_PX_PNG,
+                headers={
+                    "content-type": "image/png",
+                    "access-control-allow-origin": "*",
+                },
+            ),
+        )
+
+        def build_once(fresh):
+            page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+            page.fill("#deck-input", "archidekt.com/decks/999")
+            # The checkbox lives in a collapsed <details>; set it directly. The
+            # app reads `.checked` at build time, so no change event is needed.
+            page.evaluate(
+                "(v) => { document.getElementById('opt-fresh-deck').checked = v; }", fresh
+            )
+            page.click("#go")
+            page.wait_for_selector("#result:not([hidden])", timeout=60000)
+            return deck_cb_values(page.evaluate("() => window.__fetchLog"))
+
+        default_cb = build_once(False)
+        fresh1 = build_once(True)
+        fresh2 = build_once(True)
+
+        assert default_cb and all(v is None for v in default_cb), (
+            f"default build must NOT cache-bust, got {default_cb}"
+        )
+        assert fresh1 and fresh1[0] is not None, f"forced build must cache-bust, got {fresh1}"
+        assert fresh2 and fresh2[0] is not None, f"forced build must cache-bust, got {fresh2}"
+        assert fresh1[0] != fresh2[0], (
+            f"each forced build must use a unique buster, got {fresh1[0]} twice"
+        )
+
+        browser.close()
+
+
 # Sync API can't run inside an asyncio loop; this guard makes it visible if
 # someone runs the test under pytest-asyncio for unrelated reasons.
 @pytest.fixture(autouse=True, scope="module")
