@@ -30,6 +30,18 @@ const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg
 // returned the deck JSON. curl gets 403 from both — the proxy blocks
 // non-browser clients, so re-verification must happen in a browser.
 const CORS_PROXY = (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+
+function cacheBust(url) {
+  // Deck-builder APIs answer through corsproxy.io with
+  // `cache-control: public, max-age=3600, s-maxage=3600`, so both the browser
+  // AND corsproxy's shared edge cache would serve an hour-stale deck — hiding a
+  // printing swap or custom-art edit the user just made upstream (reproduces
+  // even in a private window, since the staleness lives in the shared cache).
+  // A unique query param is a fresh cache key at every layer, forcing a real
+  // refetch. Deck APIs ignore the unknown param.
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}_cb=${Date.now()}`;
+}
 const SCRYFALL = (uid) => `https://api.scryfall.com/cards/${uid}`;
 const SCRYFALL_NAMED = "https://api.scryfall.com/cards/named";
 const SCRYFALL_BY_SET = (set, cn) => `https://api.scryfall.com/cards/${set}/${cn}`;
@@ -2171,7 +2183,11 @@ async function loadJobs(opts) {
 
   const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
   setStatus(`Fetching deck from ${sourceLabel}...`);
-  const url = source === "archidekt" ? ARCHIDEKT(args[0]) : MOXFIELD(args[0]);
+  const base = source === "archidekt" ? ARCHIDEKT(args[0]) : MOXFIELD(args[0]);
+  // Default to the cached deck (cheap; spares corsproxy + the deck host). Only
+  // bypass the cache when the user ticked "Force-refresh" — i.e. they just
+  // edited the deck upstream and need the change to land now.
+  const url = opts.freshDeck ? cacheBust(base) : base;
   let deck;
   try {
     deck = await fetchJson(url);
@@ -2246,6 +2262,7 @@ async function run() {
       tokenQty: $("opt-token-qty").value || "one",
       imageQuality: $("opt-image-quality").value || "png",
       minPrice: parseFloat($("opt-min-price").value) || 0,
+      freshDeck: $("opt-fresh-deck").checked,
     };
     zip = new JSZip();
     // A pasted custom-back URL can take seconds to fetch (possibly via the
@@ -2580,7 +2597,7 @@ els.cancelBtn.addEventListener("click", () => {
 // reuses retryCtx.opts from the first pass, so leaving the checkboxes
 // interactive would let the UI silently lie about what the next pass does.
 const OPTION_CONTROL_IDS = [
-  "opt-skip-side", "opt-skip-basics", "opt-pair-backs", "opt-tokens",
+  "opt-skip-side", "opt-skip-basics", "opt-fresh-deck", "opt-pair-backs", "opt-tokens",
   "opt-pair-tokens", "opt-tokens-thorough", "opt-token-qty",
   "opt-image-quality", "opt-back-file", "opt-back-url",
   "opt-min-price", "opt-collection-file", "opt-collection-clear",
