@@ -375,7 +375,7 @@ function scryfallProxyFallback(url) {
   return `https://images.weserv.nl/?url=${encodeURIComponent(url.replace(/^https:\/\//, ""))}`;
 }
 
-async function fetchBlob(url) {
+async function fetchBlob(url, { noCache = false } = {}) {
   // Scryfall CDN returns CORS * (verified 2026-04), so direct fetch works.
   // A 404 on a Scryfall PNG is usually a negatively-cached CDN miss, not a
   // genuinely missing image — fall back to the JPG variants (different cache
@@ -383,10 +383,17 @@ async function fetchBlob(url) {
   // errors retry the original via withRetry.
   const proxied = scryfallProxyFallback(url);
   const candidates = [url, ...scryfallImageFallbacks(url), ...(proxied ? [proxied] : [])];
+  // Custom-art URLs (Archidekt) are stable, but their bytes change when the
+  // user re-uploads. "reload" skips the browser HTTP cache so an edit upstream
+  // is picked up on the next build; a query-string buster can't be used because
+  // some hosts serve custom art from signed URLs (an extra param → 403).
+  // Scryfall images are immutable, so they keep the default cache to make
+  // rebuilds fast.
+  const init = { signal: buildAbort?.signal, ...(noCache ? { cache: "reload" } : {}) };
   return withRetry(async () => {
     let last = "404 Not Found";
     for (const u of candidates) {
-      const r = await fetch(u, { signal: buildAbort?.signal });
+      const r = await fetch(u, init);
       if (r.ok) return r.blob();
       last = `${r.status} ${r.statusText}`;
       if (r.status !== 404) break;
@@ -1677,7 +1684,7 @@ async function processJob(state, job, opts, zip, gallery) {
   // Sequential Backs feature.
   const { front, back } = await resolveUrls(job, opts.imageQuality);
 
-  const frontBlob = await fetchBlob(front);
+  const frontBlob = await fetchBlob(front, { noCache: !!job.customUrl });
   const backBlob = back ? await fetchBlob(back) : null;
 
   const slugName = slug(job.name);

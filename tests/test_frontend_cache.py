@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import socket
 import subprocess
 import sys
@@ -145,6 +146,115 @@ def test_indexeddb_cache_avoids_repeat_uid_fetches():
         assert uid_calls == [], (
             f"second build should hit IDB cache and make zero UID-fetch calls, "
             f"but saw {len(uid_calls)}: {uid_calls[:3]}"
+        )
+
+        browser.close()
+
+
+# PNG bytes for a 1x1 transparent pixel — a valid image the build can decode.
+_ONE_PX_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c62f8cfc0f01f0005000100ff9a6c2f6c0000000049454e"
+    "44ae426082"
+)
+
+
+@pytest.mark.frontend
+def test_custom_art_fetch_bypasses_http_cache():
+    """Archidekt custom-art images can change at a stable URL when the user
+    re-uploads. The build must fetch them with `cache: "reload"` so the browser
+    HTTP cache doesn't pin the old bytes, while immutable Scryfall images keep
+    the default cache.
+
+    Playwright's route interception bypasses the browser HTTP cache, so we can't
+    observe a stale-vs-fresh hit directly. Instead we wrap `window.fetch` and
+    assert the cache mode the app *requests* per URL — the custom image forced
+    to reload, the deck JSON left on the default cache.
+    """
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+
+    custom_url = "https://example.test/custom-art.png"
+    deck = {
+        "name": "Custom Test",
+        "categories": [],
+        "cards": [
+            {
+                "quantity": 1,
+                "categories": ["Commander"],
+                "card": {
+                    "uid": None,
+                    "customImageUrl": custom_url,
+                    "oracleCard": {"name": "Custom Card"},
+                    "id": 1,
+                },
+            }
+        ],
+    }
+
+    with _http_server() as port, sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = ctx.new_page()
+        # Record every fetch's URL and requested cache mode. Playwright's request
+        # object doesn't expose the fetch `cache` init, so wrap fetch ourselves.
+        page.add_init_script(
+            """
+            (() => {
+              const orig = window.fetch;
+              window.__fetchLog = [];
+              window.fetch = function (input, init) {
+                const url = typeof input === 'string' ? input : (input && input.url) || String(input);
+                window.__fetchLog.push({ url, cache: (init && init.cache) || null });
+                return orig.apply(this, arguments);
+              };
+            })();
+            """
+        )
+        page.route(
+            "https://archidekt.com/api/decks/**",
+            lambda r: r.fulfill(
+                status=200,
+                body=json.dumps(deck),
+                headers={
+                    "content-type": "application/json",
+                    "access-control-allow-origin": "*",
+                },
+            ),
+        )
+        page.route(
+            custom_url,
+            lambda r: r.fulfill(
+                status=200,
+                body=_ONE_PX_PNG,
+                headers={
+                    "content-type": "image/png",
+                    "access-control-allow-origin": "*",
+                    "cache-control": "public, max-age=31536000, immutable",
+                },
+            ),
+        )
+
+        page.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
+        page.fill("#deck-input", "archidekt.com/decks/999")
+        page.click("#go")
+        page.wait_for_selector("#result:not([hidden])", timeout=60000)
+
+        log = page.evaluate("() => window.__fetchLog")
+        custom = [e for e in log if e["url"] == custom_url]
+        deck_calls = [e for e in log if "archidekt.com/api/decks" in e["url"]]
+
+        assert custom, "custom-art image was never fetched"
+        assert all(e["cache"] == "reload" for e in custom), (
+            f"custom art must bypass the HTTP cache (cache:'reload'), got {custom}"
+        )
+        assert deck_calls and all(e["cache"] != "reload" for e in deck_calls), (
+            f"deck JSON should not be force-reloaded, got {deck_calls}"
         )
 
         browser.close()
