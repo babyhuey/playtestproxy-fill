@@ -21,7 +21,7 @@ jobs:
         # setup-python's `cache: poetry` can find the lock file below.
         run: pipx install poetry
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
           cache: poetry
