@@ -10,12 +10,14 @@ in the same slot. Otherwise it just uploads fronts.
 
 Sequence (learned by inspecting the live site):
   1. Set files on the image input on Step 1 (Customize Front).
-  2. Click "No Bleed" on the bleed-prompt modal — tcgplaytest expands
-     bleed server-side from the unmodified Scryfall PNGs we ship.
-  3. Wait for "Applying Bleed Settings..." to clear; dismiss "Got It" toast.
-  4. If backs/ exists: click Next, find the Sequential Backs file input,
+  2. Wait for per-card processing to finish; dismiss the "Got It" toast.
+  3. If backs/ exists: click Next, find the Sequential Backs file input,
      set files, wait for processing.
-  5. Save Draft. Leave browser open with --user-data so it persists.
+  4. Save Draft. Leave browser open with --user-data so it persists.
+
+tcgplaytest used to interrupt step 1 with a modal asking whether the
+uploads already carried print bleed, which we answered "No Bleed". It now
+expands bleed itself and never asks, so there is no modal to handle.
 """
 
 from __future__ import annotations
@@ -32,14 +34,9 @@ DESIGN_URL = "https://www.tcgplaytest.com/?view=design"
 EXTS = {".png", ".jpg", ".jpeg"}
 
 # UI strings hardcoded by tcgplaytest. Hoisted here so a future site update
-# only needs one fix. The two bleed-modal titles cover the front and back
-# steps respectively (the back step capitalises differently).
-BLEED_MODAL_TITLES = (
-    "Do Your Images Have Print Bleed",
-    "Does Your Card Back Have Print Bleed",
-)
-BLEED_OPTION_PRE_BLED = "No Bleed"  # ship the raw Scryfall PNG; tcgplaytest expands
+# only needs one fix.
 PROCESSING_TEXTS = ("Applying Bleed Settings", "Processing card")  # plural varies
+SEQUENTIAL_BACKS_LABEL = "Sequential Backs"
 DISMISS_LABELS = ("Got It", "Got it!", "OK")
 NEXT_BACK_BUTTON = re.compile(r"Next.*Customize Back", re.I)
 SAVE_DRAFT_BUTTON = re.compile(r"Save Draft", re.I)
@@ -99,8 +96,8 @@ async def wait_for_processing_done(page: Page, expected: int, timeout_s: int = 1
 
 async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
     """On the Customize Back step, push back images into the Sequential Backs
-    file input. Returns True on confirmed success; False when a step couldn't
-    be verified (missing input, bleed modal never appeared, ...)."""
+    file input. Returns True once the input has accepted every file; False
+    when a step couldn't be verified (missing input, short file count)."""
     try:
         await page.get_by_role("button", name=NEXT_BACK_BUTTON).click(timeout=5000)
     except Exception as e:
@@ -108,58 +105,42 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
         return False
     await page.wait_for_timeout(2500)
 
-    # The back step has multiple file inputs. We want the "Sequential Backs"
-    # one specifically — labelled with "Upload Sequential Backs" / "(N cards)".
+    # Both file inputs on this step are accept="image/*" multiple, so the
+    # `multiple` attribute no longer tells them apart — and the single
+    # common-back input ("Upload Back") comes first, so picking by attribute
+    # sends every sequential back into the common-back slot and misaligns the
+    # whole order. Pick the input most tightly wrapped by the labelled
+    # "Sequential Backs" section instead.
     inputs = await page.query_selector_all('input[type="file"]')
-    target = None
-    for el in inputs:
-        accept = (await el.get_attribute("accept")) or ""
-        multiple = await el.get_attribute("multiple")
-        if "image" in accept.lower() and multiple is not None:
-            target = el  # the multi-image input is Sequential Backs
-            break
-    if target is None:
-        # fall back: the second image input on this step
-        image_inputs = []
-        for el in inputs:
-            a = (await el.get_attribute("accept")) or ""
-            if "image" in a.lower():
-                image_inputs.append(el)
-        if len(image_inputs) >= 2:
-            target = image_inputs[1]
-    if target is None:
-        print("  could not find Sequential Backs input")
+    idx = await page.evaluate(
+        """(label) => {
+          const els = [...document.querySelectorAll('input[type=file]')];
+          let best = -1, bestDepth = Infinity;
+          els.forEach((el, i) => {
+            let n = el.parentElement;
+            for (let d = 0; n && d < 8; n = n.parentElement, d++) {
+              if ((n.innerText || "").includes(label)) {
+                if (d < bestDepth) { bestDepth = d; best = i; }
+                break;
+              }
+            }
+          });
+          return best;
+        }""",
+        SEQUENTIAL_BACKS_LABEL,
+    )
+    if idx < 0 or idx >= len(inputs):
+        print(f"  could not find the {SEQUENTIAL_BACKS_LABEL!r} input")
         return False
+    target = inputs[idx]
 
     print(f"  uploading {len(back_files)} sequential backs...")
     await target.set_input_files([str(p) for p in back_files])
-    # Wait for whichever bleed-modal variant appears (front/back step text
-    # differs).
-    modal_clicked = False
-    for _ in range(60):
-        visible = await page.evaluate(
-            "(titles) => titles.some(t => document.body.innerText.includes(t))",
-            list(BLEED_MODAL_TITLES),
-        )
-        if visible:
-            try:
-                await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(timeout=3000)
-                print(f"  selected: {BLEED_OPTION_PRE_BLED} (backs)")
-                modal_clicked = True
-                break
-            except Exception:
-                pass
-        await asyncio.sleep(1)
-    if not modal_clicked:
-        # The 60s window expiring without a modal used to fall through and
-        # report success anyway. It may be benign (the site can remember the
-        # front step's bleed choice) — but we can't confirm the backs were
-        # accepted, so say so loudly and let the caller flag the run.
-        print(
-            "  WARNING: bleed modal never appeared for backs — cannot confirm "
-            f"the {BLEED_OPTION_PRE_BLED!r} setting was applied. Verify the "
-            "backs in the browser before ordering."
-        )
+    # The site gives no completion signal for backs (the card count only
+    # tracks fronts), so confirm against the input's own FileList.
+    accepted = await target.evaluate("(el) => el.files.length")
+    if accepted != len(back_files):
+        print(f"  WARNING: input accepted {accepted}/{len(back_files)} backs")
     for _ in range(180):
         if not await _processing_visible(page):
             break
@@ -172,7 +153,7 @@ async def upload_sequential_backs(page: Page, back_files: list[Path]) -> bool:
         except Exception:
             pass
     await asyncio.sleep(2)
-    return modal_clicked
+    return accepted == len(back_files)
 
 
 async def run(
@@ -240,38 +221,6 @@ async def run(
         else:
             chunks = [files]
 
-        # The bleed modal can appear at any point after set_input_files
-        # (sometimes immediately, sometimes after canvas2d processing
-        # finishes). Watch in parallel and click as soon as it shows.
-        clicked_modal = {"done": False}
-
-        async def modal_watcher() -> None:
-            for _ in range(120):  # up to ~2 min
-                if clicked_modal["done"]:
-                    return
-                try:
-                    visible = await page.evaluate(
-                        "(titles) => titles.some(t => document.body.innerText.includes(t))",
-                        list(BLEED_MODAL_TITLES),
-                    )
-                except Exception:
-                    # page.evaluate can raise if the page is mid-navigation
-                    # — treat as "not visible yet" and retry.
-                    visible = False
-                if visible:
-                    try:
-                        await page.get_by_text(BLEED_OPTION_PRE_BLED, exact=False).first.click(
-                            timeout=3000
-                        )
-                        clicked_modal["done"] = True
-                        print(f"  selected: {BLEED_OPTION_PRE_BLED} (tcgplaytest expands)")
-                        return
-                    except Exception as e:
-                        print(f"  modal click failed: {e}")
-                await asyncio.sleep(1)
-
-        watcher_task = asyncio.create_task(modal_watcher())
-
         running_total = 0
         for ci, chunk in enumerate(chunks, 1):
             print(f"[{ci}/{len(chunks)}] uploading {len(chunk)} files...")
@@ -283,20 +232,6 @@ async def run(
             count = await wait_for_processing_done(page, running_total)
             print(f"  count: {count}/{running_total}")
 
-        # The modal sometimes renders late (slow networks, lazy-rendered
-        # toast). Give the watcher a generous post-upload window.
-        for _ in range(45):
-            if clicked_modal["done"]:
-                break
-            await asyncio.sleep(1)
-        watcher_task.cancel()
-        try:
-            await watcher_task
-        except asyncio.CancelledError:
-            pass
-
-        # After the modal click the site runs the bleed-trim pipeline and
-        # then shows a "Bleed Trimmed Successfully" confirmation.
         for _ in range(120):
             if not await _processing_visible(page):
                 break

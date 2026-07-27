@@ -3,8 +3,7 @@
 //   locked to localhost:3000).
 // - Resolves each card's image via Scryfall (which has open CORS).
 // - Bundles the unmodified Scryfall PNGs into a ZIP for the user to drop
-//   into TCGPlaytest. tcgplaytest's "No Bleed" upload option handles the
-//   print-bleed expansion server-side.
+//   into TCGPlaytest, which expands the print bleed server-side.
 
 // Clickjacking defence. GitHub Pages can't set X-Frame-Options and meta-CSP
 // frame-ancestors is ignored by browsers; this is the only real fix for a
@@ -145,6 +144,8 @@ const els = {
   retryBtn: $("retry-failures"),
   addAnotherBtn: $("add-another"),
   costEstimate: $("cost-estimate"),
+  costEstimateText: $("cost-estimate-text"),
+  shipDest: $("opt-ship-dest"),
   deckStats: $("deck-stats"),
   skipsSummary: $("skips-summary"),
   shareLink: $("share-link"),
@@ -713,6 +714,9 @@ async function scryfallCollection(identifiers) {
         Accept: "application/json",
       },
       body: JSON.stringify({ identifiers }),
+      // Every other fetch in the build path honours this; without it a
+      // stalled Scryfall POST ignores Cancel and hangs the build outright.
+      signal: buildAbort?.signal,
     });
     if (r.ok) {
       const json = await r.json();
@@ -1766,58 +1770,112 @@ function addThumb(gallery, blob, label) {
 
 // --- Cost estimator -----------------------------------------------------
 // Pricing tiers transcribed from https://www.tcgplaytest.com/?view=pricing
-// (volume-based per-card cost + flat US-shipping bands). Frozen at the
-// time of writing — if tcgplaytest changes their rates this needs an update.
+// (volume-based per-card cost + flat shipping bands per destination).
+// Frozen at the time of writing — if tcgplaytest changes their rates this
+// needs an update.
 
 const CARD_PRICE_TIERS = [
   { upTo: 144, perCard: 0.35, label: "Starter" },       // 1–144
   { upTo: 499, perCard: 0.30, label: "Playtest Set" },  // 145–499
-  { upTo: Infinity, perCard: 0.26, label: "Bulk" },     // 500+ (inclusive per pricing page)
+  // The pricing page labels the middle tier "145 – 500" while also labelling
+  // this one "500+", so 500 is claimed by both. Settled in the buyer's favour.
+  { upTo: Infinity, perCard: 0.26, label: "Bulk" },
 ];
 
-const SHIPPING_US = [
-  { upTo: 100, cost: 6.95 },
-  { upTo: 250, cost: 8.95 },
-  { upTo: 500, cost: 12.95 },
-  { upTo: 1000, cost: 18.95 },
-  { upTo: 2000, cost: 29.95 },
-  { upTo: Infinity, cost: 49.95 },
-];
+const SHIPPING = {
+  us: {
+    label: "US",
+    bands: [
+      { upTo: 100, cost: 6.95 },
+      { upTo: 250, cost: 8.95 },
+      { upTo: 500, cost: 12.95 },
+      { upTo: 1000, cost: 18.95 },
+      { upTo: 2000, cost: 29.95 },
+      { upTo: Infinity, cost: 49.95 },
+    ],
+  },
+  ca: {
+    label: "Canada",
+    bands: [
+      { upTo: 100, cost: 12.95 },
+      { upTo: 250, cost: 16.95 },
+      { upTo: 500, cost: 24.95 },
+      { upTo: 1000, cost: 34.95 },
+      { upTo: 2000, cost: 54.95 },
+      { upTo: Infinity, cost: 89.95 },
+    ],
+  },
+  intl: {
+    label: "International",
+    bands: [
+      { upTo: 100, cost: 16.95 },
+      { upTo: 250, cost: 24.95 },
+      { upTo: 500, cost: 34.95 },
+      { upTo: 1000, cost: 54.95 },
+      { upTo: 2000, cost: 89.95 },
+      { upTo: Infinity, cost: 149.95 },
+    ],
+  },
+};
+
+// tcgplaytest promo code, redeemed on their Stripe checkout page. It comes
+// off the card subtotal only — shipping is still charged in full.
+const COUPON_CODE = "HUEY";
+const COUPON_RATE = 0.10;
 
 function pickTier(tiers, n) {
   return tiers.find((t) => n <= t.upTo);
 }
 
-function estimateCost(numCards) {
+function estimateCost(numCards, dest = "us") {
+  const region = SHIPPING[dest] || SHIPPING.us;
   const tier = pickTier(CARD_PRICE_TIERS, numCards);
   const cards = numCards * tier.perCard;
-  const shipping = pickTier(SHIPPING_US, numCards).cost;
-  return { numCards, cards, shipping, total: cards + shipping, tier: tier.label, perCard: tier.perCard };
+  const discount = cards * COUPON_RATE;
+  const shipping = pickTier(region.bands, numCards).cost;
+  return {
+    numCards,
+    cards,
+    discount,
+    shipping,
+    total: cards - discount + shipping,
+    tier: tier.label,
+    perCard: tier.perCard,
+    dest: SHIPPING[dest] ? dest : "us",
+    shipLabel: region.label,
+  };
 }
 
 function fmt(n) {
   return n.toLocaleString("en-US", { style: "currency", currency: "USD" });
 }
 
+// Remembered so the shipping-destination <select> can re-render the estimate
+// without rebuilding the deck.
+let lastCostCards = 0;
+
 function renderCostEstimate(numCards) {
   const el = els.costEstimate;
   if (!el) return;
+  lastCostCards = numCards;
   if (!numCards) { el.hidden = true; return; }
-  const e = estimateCost(numCards);
+  const e = estimateCost(numCards, els.shipDest ? els.shipDest.value : "us");
   // Build via DOM APIs so card-count / pricing data can never become an
   // injection vector even if a future change feeds untrusted input here.
-  el.replaceChildren();
-  el.append("Estimated TCGPlaytest cost: ");
+  const text = els.costEstimateText;
+  text.replaceChildren();
+  text.append("Estimated TCGPlaytest cost: ");
   const total = document.createElement("strong");
   total.textContent = fmt(e.total);
-  el.append(total, " ");
+  text.append(total, " ");
   const detail = document.createElement("span");
   detail.className = "small";
   detail.textContent =
     `${e.numCards} cards · ${fmt(e.perCard)}/card (${e.tier} tier) · ` +
-    `${fmt(e.cards)} cards + ${fmt(e.shipping)} US shipping. ` +
-    `Tax + non-US shipping not included.`;
-  el.append(detail);
+    `${fmt(e.cards)} cards − ${fmt(e.discount)} with code ${COUPON_CODE} + ` +
+    `${fmt(e.shipping)} ${e.shipLabel} shipping. Tax not included. ` +
+    `Enter ${COUPON_CODE} at tcgplaytest's checkout to get the discount.`;
+  text.append(detail);
   el.hidden = false;
 }
 
@@ -2687,6 +2745,8 @@ els.download.addEventListener("click", () => {
     URL.revokeObjectURL(a.href);
   }, 100);
 });
+
+els.shipDest.addEventListener("change", () => renderCostEstimate(lastCostCards));
 
 // --- Mode toggle (URL/ID vs paste decklist) -----------------------------
 
