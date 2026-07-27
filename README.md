@@ -61,6 +61,12 @@ to the same order (continuous slot numbers, merged stats / cost
 estimate, deduped tokens). Useful for batching multiple decks into one
 tcgplaytest order.
 
+The **cost estimate** under the results applies tcgplaytest's volume
+pricing to your card count, and assumes coupon code **HUEY** — 10% off
+the card subtotal, which you enter at their checkout. Shipping is charged
+in full on top; use the **Ship to** dropdown to switch between the US,
+Canada and international bands. Tax isn't included.
+
 After a successful build from the Deck URL/ID tab (a fresh build, not an
 appended one), a **Copy share link** button appears — it copies a URL
 encoding the deck and any non-default options (tokens, image quality,
@@ -147,7 +153,7 @@ What this does:
    at the cost of one extra search per unique descriptor (cached).
 5. Writes one PNG per card slot (the unmodified Scryfall image), plus
    `manifest.json`. tcgplaytest applies the print-bleed expansion on
-   their end after upload — pick **"No Bleed"** in their modal.
+   their end after upload — no setting to pick.
 
 ### Output layout
 
@@ -204,14 +210,13 @@ same purpose.
 Open <https://www.tcgplaytest.com/?view=design> and:
 
 1. Drag everything in `out/fronts/` (or `out/` if no pairing) into the
-   Fronts uploader.
-2. When the "Do Your Images Have Print Bleed?" modal appears, choose
-   **"No Bleed"** — tcgplaytest applies the print-bleed expansion
-   server-side.
-3. Click Next → Customize Back. If you used `--pair-backs`, drag
+   Fronts uploader. tcgplaytest expands the print bleed server-side and
+   no longer asks about it.
+2. Click Next → Customize Back. If you used `--pair-backs`, drag
    everything in `out/backs/` into the **Sequential Backs** uploader
-   (image N → slot N).
-4. Finish Preview → Add to Cart.
+   (image N → slot N) — not the single "Upload Back" box above it.
+3. Finish Preview → Add to Cart, and enter coupon code **HUEY** at
+   checkout for 10% off the card subtotal.
 
 The upload step has to happen in the same browser tab the editor was
 opened in — tcgplaytest's design page is fully client-side and the

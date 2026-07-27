@@ -7,8 +7,8 @@ Pipeline:
   1. Fetch deck JSON from Archidekt.
   2. For each card: resolve image URL (override > custom > Scryfall).
   3. Download and write the image as-is — Scryfall PNGs are already at
-     the right aspect ratio. The upload step selects tcgplaytest's
-     "No Bleed" option and they handle the print bleed on their end.
+     the right aspect ratio. tcgplaytest expands the print bleed on their
+     end after upload, so nothing here pre-pads.
   4. Write one image per copy. With --pair-backs the output splits into
      out/fronts/ and out/backs/ with matching slot numbers, ready for
      tcgplaytest's Sequential Backs uploader.

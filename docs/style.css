@@ -227,6 +227,13 @@ progress::-moz-progress-bar { background: var(--accent); }
   display: block;
   margin-top: 2px;
 }
+.ship-dest {
+  display: block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+.ship-dest select { margin-left: 6px; }
 .result-row {
   display: flex;
   align-items: center;
