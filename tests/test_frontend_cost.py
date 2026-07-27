@@ -84,7 +84,10 @@ def page():
 
     with _http_server() as port, sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        pg = browser.new_page()
+        ctx = browser.new_context()
+        # The coupon Copy button is asserted by reading the clipboard back.
+        ctx.grant_permissions(["clipboard-read", "clipboard-write"])
+        pg = ctx.new_page()
         pg.goto(f"http://127.0.0.1:{port}/", wait_until="domcontentloaded")
         yield pg
         browser.close()
@@ -159,6 +162,69 @@ def test_destination_select_rerenders_estimate(page):
     finally:
         # The page is shared module-wide; leave the control as we found it.
         page.select_option("#opt-ship-dest", "us")
+        page.evaluate("() => { renderCostEstimate(0); result.hidden = true; }")
+
+
+@pytest.mark.frontend
+def test_estimate_total_is_labelled_as_post_coupon(page):
+    """The headline number is the discounted price, so it must say so —
+    otherwise it reads as the price before the code is applied."""
+    try:
+        page.evaluate("() => { result.hidden = false; renderCostEstimate(100); }")
+        assert "cost with code HUEY" in page.inner_text("#cost-estimate-text")
+    finally:
+        page.evaluate("() => { renderCostEstimate(0); result.hidden = true; }")
+
+
+@pytest.mark.frontend
+def test_coupon_banner_shows_code_and_savings(page):
+    try:
+        page.evaluate("() => { result.hidden = false; renderCostEstimate(100); }")
+        assert page.is_visible("#coupon-banner")
+        assert page.inner_text("#coupon-code").strip() == "HUEY"
+        assert "$3.50" in page.inner_text("#coupon-banner")
+    finally:
+        page.evaluate("() => { renderCostEstimate(0); result.hidden = true; }")
+
+
+@pytest.mark.frontend
+def test_coupon_banner_savings_ignore_shipping(page):
+    """The discount is 10% of cards only, so switching destination must not
+    move it even though the total changes."""
+    try:
+        page.evaluate("() => { result.hidden = false; renderCostEstimate(100); }")
+        page.select_option("#opt-ship-dest", "intl")
+        assert "$3.50" in page.inner_text("#coupon-banner")
+        assert "$48.45" in page.inner_text("#cost-estimate-text")
+    finally:
+        page.select_option("#opt-ship-dest", "us")
+        page.evaluate("() => { renderCostEstimate(0); result.hidden = true; }")
+
+
+@pytest.mark.frontend
+@pytest.mark.parametrize("sel", ["#coupon-banner", "#cost-estimate", "#deck-stats"])
+def test_hidden_boxes_really_collapse(page, sel):
+    """`.hidden = true` must actually remove the box. These are flex/grid
+    elements, whose author `display:` rule outranks the UA sheet's rule for
+    [hidden] — without an explicit guard they linger as empty bordered boxes.
+    Asserted with the result panel open, or the ancestor hides them anyway
+    and the assertion proves nothing."""
+    try:
+        page.evaluate("() => { result.hidden = false; renderCostEstimate(0); }")
+        assert not page.is_visible(sel)
+        assert page.eval_on_selector(sel, "e => getComputedStyle(e).display") == "none"
+    finally:
+        page.evaluate("() => { result.hidden = true; }")
+
+
+@pytest.mark.frontend
+def test_coupon_copy_button_copies_the_code(page):
+    try:
+        page.evaluate("() => { result.hidden = false; renderCostEstimate(100); }")
+        page.click("#coupon-copy")
+        assert page.evaluate("() => navigator.clipboard.readText()") == "HUEY"
+        assert "Copied" in page.inner_text("#coupon-copy")
+    finally:
         page.evaluate("() => { renderCostEstimate(0); result.hidden = true; }")
 
 

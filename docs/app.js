@@ -146,6 +146,10 @@ const els = {
   costEstimate: $("cost-estimate"),
   costEstimateText: $("cost-estimate-text"),
   shipDest: $("opt-ship-dest"),
+  couponBanner: $("coupon-banner"),
+  couponCode: $("coupon-code"),
+  couponSave: $("coupon-save"),
+  couponCopy: $("coupon-copy"),
   deckStats: $("deck-stats"),
   skipsSummary: $("skips-summary"),
   shareLink: $("share-link"),
@@ -1858,13 +1862,15 @@ function renderCostEstimate(numCards) {
   const el = els.costEstimate;
   if (!el) return;
   lastCostCards = numCards;
-  if (!numCards) { el.hidden = true; return; }
+  if (!numCards) { el.hidden = true; els.couponBanner.hidden = true; return; }
   const e = estimateCost(numCards, els.shipDest ? els.shipDest.value : "us");
   // Build via DOM APIs so card-count / pricing data can never become an
   // injection vector even if a future change feeds untrusted input here.
   const text = els.costEstimateText;
   text.replaceChildren();
-  text.append("Estimated TCGPlaytest cost: ");
+  // The headline is the post-discount number, so it names the code — without
+  // that it reads as the undiscounted price.
+  text.append(`Estimated TCGPlaytest cost with code ${COUPON_CODE}: `);
   const total = document.createElement("strong");
   total.textContent = fmt(e.total);
   text.append(total, " ");
@@ -1872,11 +1878,13 @@ function renderCostEstimate(numCards) {
   detail.className = "small";
   detail.textContent =
     `${e.numCards} cards · ${fmt(e.perCard)}/card (${e.tier} tier) · ` +
-    `${fmt(e.cards)} cards − ${fmt(e.discount)} with code ${COUPON_CODE} + ` +
-    `${fmt(e.shipping)} ${e.shipLabel} shipping. Tax not included. ` +
-    `Enter ${COUPON_CODE} at tcgplaytest's checkout to get the discount.`;
+    `${fmt(e.cards)} cards − ${fmt(e.discount)} coupon + ` +
+    `${fmt(e.shipping)} ${e.shipLabel} shipping. Tax not included.`;
   text.append(detail);
   el.hidden = false;
+  els.couponCode.textContent = COUPON_CODE;
+  els.couponSave.textContent = `· saves you ${fmt(e.discount)}`;
+  els.couponBanner.hidden = false;
 }
 
 // --- Deck stats badge ---------------------------------------------------
@@ -2297,6 +2305,7 @@ async function run() {
     els.retryBtn.hidden = true;
     els.addAnotherBtn.hidden = true;
     els.costEstimate.hidden = true;
+    els.couponBanner.hidden = true;
     els.deckStats.hidden = true;
     els.skipsSummary.hidden = true;
     liveFailures = [];
@@ -2811,20 +2820,14 @@ function buildShareUrl() {
   return `${location.origin}${location.pathname}?${p.toString()}`;
 }
 
-els.shareLink.addEventListener("click", async () => {
-  const url = buildShareUrl();
-  const restoreText = els.shareLink.textContent;
-  const flash = () => {
-    els.shareLink.textContent = "Copied!";
-    setTimeout(() => { els.shareLink.textContent = restoreText; }, 1500);
-  };
+async function copyText(text) {
   try {
-    await navigator.clipboard.writeText(url);
+    await navigator.clipboard.writeText(text);
   } catch {
     // Clipboard API unavailable/denied — fall back to the classic
     // hidden-textarea + execCommand("copy") trick.
     const ta = document.createElement("textarea");
-    ta.value = url;
+    ta.value = text;
     ta.style.position = "fixed";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
@@ -2836,8 +2839,23 @@ els.shareLink.addEventListener("click", async () => {
     }
     document.body.removeChild(ta);
   }
-  flash();
-});
+}
+
+// Copy `text`, then flash confirmation on the button that triggered it.
+async function copyAndFlash(btn, text, flashLabel = "Copied!") {
+  const restoreText = btn.textContent;
+  await copyText(text);
+  btn.textContent = flashLabel;
+  setTimeout(() => { btn.textContent = restoreText; }, 1500);
+}
+
+els.shareLink.addEventListener("click", () =>
+  copyAndFlash(els.shareLink, buildShareUrl())
+);
+
+els.couponCopy.addEventListener("click", () =>
+  copyAndFlash(els.couponCopy, COUPON_CODE)
+);
 
 // On load: a `deck` param pre-fills the URL-mode input and switches to that
 // tab; recognized option params are applied to their controls, dispatching

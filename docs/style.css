@@ -13,6 +13,11 @@
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 * { box-sizing: border-box; }
+/* The UA sheet hides [hidden] with `display: none`, which any author
+   `display:` rule silently outranks — so a flex/grid element stays on screen
+   as an empty bordered box when JS sets `.hidden = true`. Restore the
+   attribute's meaning for every element. */
+[hidden] { display: none !important; }
 html, body { margin: 0; padding: 0; }
 body {
   background: radial-gradient(ellipse at top, #1a2447 0%, var(--bg) 60%);
@@ -234,6 +239,46 @@ progress::-moz-progress-bar { background: var(--accent); }
   font-size: 0.78rem;
 }
 .ship-dest select { margin-left: 6px; }
+
+.coupon-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 8px 0 0;
+  padding: 11px 14px;
+  background: rgba(92, 214, 160, 0.1);
+  border: 1px solid rgba(92, 214, 160, 0.45);
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+.coupon-code {
+  padding: 4px 12px;
+  background: rgba(92, 214, 160, 0.14);
+  border: 1px dashed rgba(92, 214, 160, 0.55);
+  border-radius: 6px;
+  color: var(--ok);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+.coupon-save { color: var(--muted); font-size: 0.78rem; }
+.coupon-copy {
+  /* margin-left:auto pins Copy to the right edge; on a wrapped narrow layout
+     it just starts the next line, which is fine. */
+  margin-left: auto;
+  padding: 6px 12px;
+  background: transparent;
+  border: 1px solid var(--ok);
+  border-radius: 6px;
+  color: var(--ok);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.coupon-copy:hover { background: rgba(92, 214, 160, 0.14); }
 .result-row {
   display: flex;
   align-items: center;

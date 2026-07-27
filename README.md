@@ -62,10 +62,12 @@ estimate, deduped tokens). Useful for batching multiple decks into one
 tcgplaytest order.
 
 The **cost estimate** under the results applies tcgplaytest's volume
-pricing to your card count, and assumes coupon code **HUEY** — 10% off
-the card subtotal, which you enter at their checkout. Shipping is charged
-in full on top; use the **Ship to** dropdown to switch between the US,
-Canada and international bands. Tax isn't included.
+pricing to your card count. A banner above it carries coupon code
+**HUEY** with a Copy button — 10% off the card subtotal, which you paste
+into their checkout — and the estimated total is the price *with* that
+code applied. Shipping is charged in full on top; use the **Ship to**
+dropdown to switch between the US, Canada and international bands. Tax
+isn't included.
 
 After a successful build from the Deck URL/ID tab (a fresh build, not an
 appended one), a **Copy share link** button appears — it copies a URL
