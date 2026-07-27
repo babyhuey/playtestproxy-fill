@@ -134,9 +134,18 @@ Sideboard
         </div>
       </div>
       <p id="skips-summary" class="hint" hidden></p>
-      <p id="cost-estimate" class="hint cost-estimate" hidden></p>
+      <p id="cost-estimate" class="hint cost-estimate" hidden>
+        <span id="cost-estimate-text"></span>
+        <label class="ship-dest">Ship to
+          <select id="opt-ship-dest">
+            <option value="us">United States</option>
+            <option value="ca">Canada</option>
+            <option value="intl">International</option>
+          </select>
+        </label>
+      </p>
       <div id="deck-stats" class="deck-stats" hidden></div>
-      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1. Choose <strong>"No Bleed"</strong> — tcgplaytest applies the print-bleed expansion server-side. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong>. The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.)</p>
+      <p class="hint">Then open <a href="https://www.tcgplaytest.com/?view=design" target="_blank" rel="noopener">tcgplaytest.com → Start Your Design</a>, extract the ZIP, and drag <strong>fronts/</strong> into the Fronts uploader on Step 1 — tcgplaytest expands the print bleed server-side and no longer asks about it. Then click Next, scroll to <strong>Sequential Backs</strong>, and drag <strong>backs/</strong> there (not the single "Upload Back" box above it). The slot numbers in filenames keep DFC face-2 art aligned with their fronts. (If you didn't pair backs, the ZIP only has fronts.) At checkout, enter coupon code <strong>HUEY</strong> for 10% off the card subtotal.</p>
       <div id="gallery" class="gallery"></div>
     </div>
 
