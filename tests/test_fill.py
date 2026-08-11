@@ -471,7 +471,7 @@ class TestScryfallWait:
 class TestMakeDefaultBack:
     def test_returns_image(self):
         img = fill.make_default_back()
-        # Bundled meme back is a normal-sized card image; just assert it loaded.
+        # Bundled stock back is a normal-sized card image; just assert it loaded.
         assert img.mode == "RGB"
         assert img.size[0] > 0 and img.size[1] > 0
 

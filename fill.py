@@ -1748,8 +1748,8 @@ DEFAULT_BACK_FILE = Path(__file__).parent / "assets" / "default_back.png"
 
 def make_default_back() -> Image.Image:
     """Default back image: the bundled `assets/default_back.png` (the
-    "You Wouldn't Proxy a Magic Card" meme back). Override via
-    --default-back."""
+    TCGPlaytest stock back, from tcgplaytest.com/card-back.jpg). Override
+    via --default-back."""
     if not DEFAULT_BACK_FILE.exists():
         raise FileNotFoundError(
             f"Bundled default back missing: {DEFAULT_BACK_FILE}. "
@@ -1796,7 +1796,7 @@ def main() -> int:
     ap.add_argument(
         "--default-back",
         help="Back image for non-DFC cards when --pair-backs is set. "
-        "Defaults to assets/default_back.png (a meme back) "
+        "Defaults to assets/default_back.png (the TCGPlaytest stock back) "
         "shipped with the repo.",
     )
     ap.add_argument(
