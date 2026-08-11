@@ -29,7 +29,9 @@ The frontend covers the same options as the CLI:
 - Token quantity — print one of each (default), or scale by deck-card minter
   count and optional doubler multiplier (Conservative / Standard / Aggressive)
 - Image quality — PNG (best, default) or Large JPG (~10× smaller and faster)
-- Custom default back (file upload or URL paste)
+- Custom default back — file upload, URL paste, or pick one of the
+  bundled presets (Playtest Copy, Lord of the Proxies, TCGPlaytest logo,
+  or the original "You Wouldn't Proxy" meme back)
 - Skip cards you own — upload a ManaBox export or any CSV with Name +
   Quantity columns and owned copies are subtracted from the deck before
   building (matched by card name; printing and foil are ignored)
@@ -201,9 +203,11 @@ slug matches the suffix of the generated filename (e.g. `045_Sol_Ring.png`
 
 ### Default back (non-DFC slots)
 
-The bundled `assets/default_back.png` (the TCGPlaytest stock back, from
-tcgplaytest.com/card-back.jpg) is used by default. Override with
-`--default-back PATH`.
+The bundled `assets/default_back.png` (a community "PROXY / Playtest
+Copy / NOT FOR SALE" back in the classic card-back style, found via
+r/mpcproxies) is used by default. Override with `--default-back PATH` —
+`assets/backs/` ships alternates (Lord of the Proxies, the TCGPlaytest
+logo back, and the original low-res "You Wouldn't Proxy" meme back).
 The web frontend has both a file picker and a URL paste field for the
 same purpose.
 
@@ -325,10 +329,11 @@ images are fetched at runtime from the public
 [Scryfall](https://scryfall.com/) API; please respect their
 [terms of service](https://scryfall.com/docs/api).
 
-The bundled `assets/default_back.png` is TCGPlaytest's own stock card
-back (tcgplaytest.com/card-back.jpg), included for convenience; no
-copyright claim is made on it. Replace with `--default-back` if you'd
-rather not ship it.
+The bundled default back and the alternates in `assets/backs/` are
+community-made proxy backs in the style of the classic card back
+(shared on r/mpcproxies and similar communities), plus TCGPlaytest's
+own logo back; they are fan art and no copyright claim is made on
+them. Replace with `--default-back` if you'd rather not ship them.
 
 If you believe content in this repo infringes your rights, please open
 an issue or email the maintainer; we'll act in good faith.

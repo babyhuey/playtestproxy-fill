@@ -446,8 +446,20 @@ async function fetchJsonScryfall(url) {
 
 const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath", "fuse"]);
 
+const BACK_PRESETS = {
+  default: { path: "assets/default_back.png", label: '— bundled "Playtest Copy" proxy back —' },
+  lord_of_the_proxies: { path: "assets/backs/lord_of_the_proxies.jpg", label: "— bundled Lord of the Proxies back —" },
+  tcgplaytest: { path: "assets/backs/tcgplaytest.jpg", label: "— bundled TCGPlaytest logo back —" },
+  wouldnt_proxy: { path: "assets/backs/wouldnt_proxy.png", label: '— bundled "You Wouldn\'t Proxy" meme back (low-res) —' },
+};
+
+function selectedBackPreset() {
+  const checked = document.querySelector('input[name="back-preset"]:checked');
+  return BACK_PRESETS[checked?.value] ? checked.value : "default";
+}
+
 async function loadCustomBackBlob() {
-  // Order of preference: uploaded file → pasted URL → bundled default.
+  // Order of preference: uploaded file → pasted URL → picked bundled preset.
   // A failure on the URL path is surfaced loudly to the user — silent
   // fallback to the bundled stock back is the wrong default.
   const fileEl = $("opt-back-file");
@@ -471,8 +483,9 @@ async function loadCustomBackBlob() {
     }
     return proxied.blob();
   }
-  const r = await fetch("assets/default_back.png");
-  if (!r.ok) throw new Error("default_back.png missing from /assets");
+  const preset = BACK_PRESETS[selectedBackPreset()];
+  const r = await fetch(preset.path);
+  if (!r.ok) throw new Error(`${preset.path} missing from /assets`);
   return r.blob();
 }
 
@@ -2670,6 +2683,7 @@ const OPTION_CONTROL_IDS = [
   "opt-pair-tokens", "opt-tokens-thorough", "opt-token-qty",
   "opt-image-quality", "opt-back-file", "opt-back-url",
   "opt-min-price", "opt-collection-file", "opt-collection-clear",
+  "back-preset-default", "back-preset-lotp", "back-preset-tcg", "back-preset-meme",
 ];
 
 function setOptionsLocked(locked) {
@@ -2701,8 +2715,17 @@ $("opt-back-file").addEventListener("change", (e) => {
   const f = e.target.files && e.target.files[0];
   $("back-file-name").textContent = f
     ? f.name
-    : '— bundled TCGPlaytest stock back —';
+    : BACK_PRESETS[selectedBackPreset()].label;
 });
+
+for (const radio of document.querySelectorAll('input[name="back-preset"]')) {
+  radio.addEventListener("change", () => {
+    const fileEl = $("opt-back-file");
+    if (!(fileEl.files && fileEl.files[0])) {
+      $("back-file-name").textContent = BACK_PRESETS[selectedBackPreset()].label;
+    }
+  });
+}
 
 $("opt-collection-file").addEventListener("change", (e) => {
   const f = e.target.files && e.target.files[0];
@@ -2819,6 +2842,8 @@ function buildShareUrl() {
   if (minPrice > 0) p.set("minprice", String(minPrice));
   const backUrl = $("opt-back-url").value.trim();
   if (backUrl) p.set("backurl", backUrl);
+  const preset = selectedBackPreset();
+  if (preset !== "default") p.set("backpreset", preset);
   return `${location.origin}${location.pathname}?${p.toString()}`;
 }
 
@@ -2891,6 +2916,12 @@ els.couponCopy.addEventListener("click", () =>
   }
   if (params.has("minprice")) $("opt-min-price").value = params.get("minprice");
   if (params.has("backurl")) $("opt-back-url").value = params.get("backurl");
+  if (params.has("backpreset") && BACK_PRESETS[params.get("backpreset")]) {
+    const radio = document.querySelector(
+      `input[name="back-preset"][value="${params.get("backpreset")}"]`
+    );
+    if (radio) { radio.checked = true; radio.dispatchEvent(new Event("change")); }
+  }
   setStatus("Loaded shared build settings — click Fetch & build.");
 })();
 
