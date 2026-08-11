@@ -200,8 +200,9 @@ slug matches the suffix of the generated filename (e.g. `045_Sol_Ring.png`
 
 ### Default back (non-DFC slots)
 
-The bundled `assets/default_back.png` (the "You Wouldn't Proxy a Magic
-Card" meme back) is used by default. Override with `--default-back PATH`.
+The bundled `assets/default_back.png` (the TCGPlaytest stock back, from
+tcgplaytest.com/card-back.jpg) is used by default. Override with
+`--default-back PATH`.
 The web frontend has both a file picker and a URL paste field for the
 same purpose.
 
@@ -307,9 +308,10 @@ images are fetched at runtime from the public
 [Scryfall](https://scryfall.com/) API; please respect their
 [terms of service](https://scryfall.com/docs/api).
 
-The bundled `assets/default_back.png` ("You Wouldn't Proxy a Magic Card")
-is fan parody — derived from a community meme, no copyright claim is
-made on it. Replace with `--default-back` if you'd rather not ship it.
+The bundled `assets/default_back.png` is TCGPlaytest's own stock card
+back (tcgplaytest.com/card-back.jpg), included for convenience; no
+copyright claim is made on it. Replace with `--default-back` if you'd
+rather not ship it.
 
 If you believe content in this repo infringes your rights, please open
 an issue or email the maintainer; we'll act in good faith.

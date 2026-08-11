@@ -449,7 +449,7 @@ const SINGLE_PIECE_LAYOUTS = new Set(["split", "flip", "adventure", "aftermath",
 async function loadCustomBackBlob() {
   // Order of preference: uploaded file → pasted URL → bundled default.
   // A failure on the URL path is surfaced loudly to the user — silent
-  // fallback to the bundled meme back is the wrong default.
+  // fallback to the bundled stock back is the wrong default.
   const fileEl = $("opt-back-file");
   if (fileEl.files && fileEl.files[0]) return fileEl.files[0];
   const urlEl = $("opt-back-url");
@@ -2699,7 +2699,7 @@ $("opt-back-file").addEventListener("change", (e) => {
   const f = e.target.files && e.target.files[0];
   $("back-file-name").textContent = f
     ? f.name
-    : '— bundled "You Wouldn\'t Proxy a Magic Card" —';
+    : '— bundled TCGPlaytest stock back —';
 });
 
 $("opt-collection-file").addEventListener("change", (e) => {
