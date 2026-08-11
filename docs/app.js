@@ -2628,7 +2628,9 @@ async function run() {
   } else {
     const message = append
       ? "Added. Click Download ZIP, or add another deck."
-      : "Done. Click Download ZIP, then drag-drop into TCGPlaytest.";
+      : opts.pairBacks
+        ? "Done. Click Download ZIP, then upload it as-is with TCGPlaytest's Upload Deck ZIP button."
+        : "Done. Click Download ZIP, extract, and drag the images into TCGPlaytest's Fronts uploader.";
     setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
   }
   els.go.disabled = false;

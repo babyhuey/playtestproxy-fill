@@ -14,7 +14,8 @@ Sequential Backs feature).
 
 Visit <https://babyhuey.github.io/playtestproxy-fill/>, paste your deck
 URL (or paste a plain decklist), click Fetch & build, download the ZIP,
-extract it, and drag the `fronts/` and `backs/` folders into tcgplaytest.
+and upload it as-is with tcgplaytest's **Upload Deck ZIP** button —
+fronts and backs pair automatically by slot number.
 
 The frontend covers the same options as the CLI:
 
@@ -207,6 +208,22 @@ The web frontend has both a file picker and a URL paste field for the
 same purpose.
 
 ## Step 2 — Upload
+
+### Deck ZIP (easiest, needs --pair-backs)
+
+tcgplaytest's **Upload Deck ZIP** button (Step 1 of the editor) takes a
+zip with `fronts/` + `backs/` folders and pairs them by filename order —
+exactly what `--pair-backs` produces. Zip the output and upload it in
+one shot:
+
+```bash
+cd out && zip -r deck.zip fronts backs
+```
+
+Then open <https://www.tcgplaytest.com/?view=design>, click **Upload
+Deck ZIP**, and continue at step 3 below. The web frontend's downloaded
+ZIP (with paired backs) uploads as-is. Note the zip appends to whatever
+draft is already in the editor.
 
 ### Manual
 
