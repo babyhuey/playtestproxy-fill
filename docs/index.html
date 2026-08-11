@@ -98,10 +98,17 @@ Sideboard
           <label class="upload-label">
             <input id="opt-back-file" type="file" accept="image/*">
             <span class="upload-button">Upload image</span>
-            <span id="back-file-name" class="back-file-name">— bundled TCGPlaytest stock back —</span>
+            <span id="back-file-name" class="back-file-name">— bundled "Playtest Copy" proxy back —</span>
           </label>
           <input id="opt-back-url" type="text" placeholder="…or paste an image URL">
         </div>
+        <div class="back-presets" role="radiogroup" aria-label="Bundled back presets">
+          <label class="back-preset"><input type="radio" id="back-preset-default" name="back-preset" value="default" checked><img src="assets/backs/default_thumb.jpg" alt="Playtest Copy back"><span>Playtest Copy</span></label>
+          <label class="back-preset"><input type="radio" id="back-preset-lotp" name="back-preset" value="lord_of_the_proxies"><img src="assets/backs/lord_of_the_proxies_thumb.jpg" alt="Lord of the Proxies back"><span>Lord of the Proxies</span></label>
+          <label class="back-preset"><input type="radio" id="back-preset-tcg" name="back-preset" value="tcgplaytest"><img src="assets/backs/tcgplaytest_thumb.jpg" alt="TCGPlaytest logo back"><span>TCGPlaytest logo</span></label>
+          <label class="back-preset"><input type="radio" id="back-preset-meme" name="back-preset" value="wouldnt_proxy"><img src="assets/backs/wouldnt_proxy_thumb.jpg" alt="You Wouldn't Proxy a Magic Card back"><span>"You Wouldn't Proxy" <em>(low-res)</em></span></label>
+        </div>
+        <p class="hint small">The picked preset is used when no file or URL is set above. The "You Wouldn't Proxy" back is only 292×400 and will trip tcgplaytest's low-resolution warning — it still prints, just soft.</p>
       </div>
       <div class="back-source">
         <div class="back-source-label">Skip cards you own (optional)</div>
