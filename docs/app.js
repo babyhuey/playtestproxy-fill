@@ -451,6 +451,7 @@ const BACK_PRESETS = {
   lord_of_the_proxies: { path: "assets/backs/lord_of_the_proxies.jpg", label: "— bundled Lord of the Proxies back —" },
   tcgplaytest: { path: "assets/backs/tcgplaytest.jpg", label: "— bundled TCGPlaytest logo back —" },
   wouldnt_proxy: { path: "assets/backs/wouldnt_proxy.png", label: '— bundled "You Wouldn\'t Proxy" meme back (low-res) —' },
+  spongebob: { path: "assets/backs/spongebob.png", label: '— bundled "iS iT a ReAl cArD?" SpongeBob back (low-res) —' },
 };
 
 function selectedBackPreset() {
@@ -2684,6 +2685,7 @@ const OPTION_CONTROL_IDS = [
   "opt-image-quality", "opt-back-file", "opt-back-url",
   "opt-min-price", "opt-collection-file", "opt-collection-clear",
   "back-preset-default", "back-preset-lotp", "back-preset-tcg", "back-preset-meme",
+  "back-preset-sb",
 ];
 
 function setOptionsLocked(locked) {
