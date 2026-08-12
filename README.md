@@ -31,7 +31,9 @@ The frontend covers the same options as the CLI:
 - Image quality — PNG (best, default) or Large JPG (~10× smaller and faster)
 - Custom default back — file upload, URL paste, or pick one of the
   bundled presets (Playtest Copy, Lord of the Proxies, TCGPlaytest logo,
-  or the original "You Wouldn't Proxy" meme back)
+  the original "You Wouldn't Proxy" meme back, or the SpongeBob
+  "iS iT a ReAl cArD?" back — the last two are meme-resolution and may
+  trip tcgplaytest's low-res warning)
 - Skip cards you own — upload a ManaBox export or any CSV with Name +
   Quantity columns and owned copies are subtracted from the deck before
   building (matched by card name; printing and foil are ignored)
@@ -207,7 +209,8 @@ The bundled `assets/default_back.png` (a community "PROXY / Playtest
 Copy / NOT FOR SALE" back in the classic card-back style, found via
 r/mpcproxies) is used by default. Override with `--default-back PATH` —
 `assets/backs/` ships alternates (Lord of the Proxies, the TCGPlaytest
-logo back, and the original low-res "You Wouldn't Proxy" meme back).
+logo back, the original low-res "You Wouldn't Proxy" meme back, and the
+SpongeBob "iS iT a ReAl cArD?" back).
 The web frontend has both a file picker and a URL paste field for the
 same purpose.
 
