@@ -299,11 +299,14 @@ upload.py <images_dir>
 
 - Deck-builder traffic from the web frontend that CORS-blocks
   (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through
-  [corsproxy.io](https://corsproxy.io/); Scryfall and mtgdecks.net send
+  the project's own Cloudflare Worker (`worker/cors-proxy.js`, deployed
+  as `playtestproxy-cors`); Scryfall and mtgdecks.net send
   `Access-Control-Allow-Origin: *` and are fetched directly (with a
-  corsproxy fallback for mtgdecks in case that ever changes). The
-  Archidekt / Moxfield JSON APIs are undocumented but have proven
-  stable. The footer of the web app discloses the proxy relationship.
+  Worker fallback for mtgdecks in case that ever changes). corsproxy.io
+  was dropped in Aug 2026 when it went key-required and its console
+  couldn't register `*.github.io` origins. The Archidekt / Moxfield
+  JSON APIs are undocumented but have proven stable. The footer of the
+  web app discloses the proxy relationship.
 - Card images come straight from Scryfall's CDN. When the CDN returns a
   404 (usually a negatively-cached miss on one format), both the CLI and
   frontend retry the `large` / `normal` JPG variants, then fall back to
