@@ -174,7 +174,7 @@ Sideboard
   <section class="card help">
     <h2>How it works</h2>
     <ol>
-      <li>Fetches the deck from Archidekt / Moxfield (JSON), Scryfall / Deckbox / TappedOut / EDHREC (text exports). The deck-builder APIs are locked to their own origins so the request is routed through a public CORS proxy where direct fetch fails.</li>
+      <li>Fetches the deck from Archidekt / Moxfield (JSON), Scryfall / Deckbox / TappedOut / EDHREC (text exports). The deck-builder APIs are locked to their own origins so the request is routed through this site's own Cloudflare Worker proxy where direct fetch fails.</li>
       <li>For each card, pulls the exact printing's PNG from Scryfall — Secret Lair / alt-art selections come through faithfully.</li>
       <li>Bundles the unmodified Scryfall PNGs into a ZIP for you to download.</li>
     </ol>
@@ -183,7 +183,7 @@ Sideboard
 </main>
 
 <footer>
-  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through <a href="https://corsproxy.io/" target="_blank" rel="noopener">corsproxy.io</a> — that operator can read the requests. Scryfall (cards + decks) and the bundled image are fetched directly; a card image that Scryfall's CDN fails to serve falls back through the <a href="https://images.weserv.nl/" target="_blank" rel="noopener">images.weserv.nl</a> proxy.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through this site's own Cloudflare Worker (<a href="https://github.com/babyhuey/playtestproxy-fill/blob/main/worker/cors-proxy.js" target="_blank" rel="noopener">source</a>), so no third-party proxy operator sees the requests — only Cloudflare, which already fronts most of these APIs. Scryfall (cards + decks) and the bundled image are fetched directly; a card image that Scryfall's CDN fails to serve falls back through the <a href="https://images.weserv.nl/" target="_blank" rel="noopener">images.weserv.nl</a> proxy.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 

@@ -23,24 +23,23 @@ const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
 const SCRYFALL_DECK_EXPORT = (id) => `https://api.scryfall.com/decks/${id}/export/text`;
 const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg`;
-// corsproxy.io went key-required in Aug 2026: `?key=<key>&url=<encoded>`;
-// keyless requests get 401 `{"error":"A valid API key is required..."}`.
-// The key below is free-tier (10k requests + 1GB/month) and locked to the
-// babyhuey.github.io origin in the corsproxy console, so shipping it in this
-// public file is their intended browser-app model — but it also means the
-// proxy 401s from localhost; test deck fetches against the deployed site.
-const CORS_PROXY_KEY = "517b01fb";
+// Deck-builder APIs are origin-locked, so requests route through our own
+// Cloudflare Worker (worker/cors-proxy.js) instead of a third-party proxy.
+// corsproxy.io was dropped in Aug 2026: it went key-required, and its console
+// can't register *.github.io origins (github.io is a public-suffix domain, so
+// every Pages site is its own registrable domain — their domain normalizer
+// strips the subdomain and the key then 401s from the real origin). The
+// Worker only proxies the allowlisted deck hosts; keep its allowlist in sync
+// when adding a deck source.
 const CORS_PROXY = (url) =>
-  `https://corsproxy.io/?key=${CORS_PROXY_KEY}&url=${encodeURIComponent(url)}`;
+  `https://playtestproxy-cors.babyhuey23.workers.dev/?url=${encodeURIComponent(url)}`;
 
 function cacheBust(url) {
-  // Deck-builder APIs answer through corsproxy.io with
-  // `cache-control: public, max-age=3600, s-maxage=3600`, so both the browser
-  // AND corsproxy's shared edge cache would serve an hour-stale deck — hiding a
-  // printing swap or custom-art edit the user just made upstream (reproduces
-  // even in a private window, since the staleness lives in the shared cache).
-  // A unique query param is a fresh cache key at every layer, forcing a real
-  // refetch. Deck APIs ignore the unknown param.
+  // Deck hosts serve `cache-control: public, max-age=3600`, so the browser
+  // (and any cache between the proxy Worker and the deck host) can serve an
+  // hour-stale deck — hiding a printing swap or custom-art edit the user just
+  // made upstream. A unique query param is a fresh cache key at every layer,
+  // forcing a real refetch. Deck APIs ignore the unknown param.
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}_cb=${Date.now()}`;
 }
@@ -276,7 +275,7 @@ function sleepAbortable(ms) {
 }
 
 async function withRetry(fn, attempts = 3, baseDelay = 400) {
-  // 400ms base, exponential — defending against transient corsproxy /
+  // 400ms base, exponential — defending against transient proxy /
   // Scryfall hiccups, not against logic bugs. 4xx is final and bypasses retry.
   // 429 throws a RateLimitError carrying the server's Retry-After (or our
   // 32s fallback) and overrides the exponential delay — Scryfall's 30s
@@ -302,7 +301,7 @@ async function withRetry(fn, attempts = 3, baseDelay = 400) {
 }
 
 class FatalFetchError extends Error {}  // 4xx — don't retry through proxy
-class ProxyAuthError extends FatalFetchError {}  // corsproxy rejected OUR key, not the deck
+class ProxyAuthError extends FatalFetchError {}  // proxy Worker refused OUR request, not the deck
 class RateLimitError extends Error {
   // delayMs: how long withRetry should pause before the next attempt. Sourced
   // from the response's Retry-After header when present, otherwise from
@@ -324,7 +323,7 @@ function parseRetryAfter(header) {
 }
 
 async function parseJsonStrict(r) {
-  // corsproxy.io can return 200 with an HTML rate-limit page; r.json() then
+  // A proxied fetch can come back 200 with an HTML error page; r.json() then
   // throws "Unexpected token <" which is useless. Validate content-type.
   const ct = r.headers.get("content-type") || "";
   if (!ct.includes("json")) {
@@ -352,14 +351,14 @@ async function fetchJson(url) {
     }
     const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" }, signal: buildAbort?.signal });
     if (!r.ok) {
-      // A 401/403 whose body mentions "API key" is corsproxy rejecting OUR
-      // key (invalid, inactive, or this origin not registered in the
-      // corsproxy console) — blame the proxy, not the deck host.
-      if (r.status === 401 || r.status === 403) {
+      // A 403 with the Worker's own "host not allowed" body means the deck
+      // host isn't in the Worker's allowlist (out of sync with this file) —
+      // blame the proxy, not the deck.
+      if (r.status === 403) {
         const body = await r.text().catch(() => "");
-        if (/api key/i.test(body)) {
+        if (/host not allowed/i.test(body)) {
           throw new ProxyAuthError(
-            "corsproxy.io rejected this site's API key (invalid, inactive, or origin not registered). " +
+            "The site's proxy Worker refused to fetch this deck host (allowlist out of sync). " +
               "This is a site configuration problem, not a problem with your deck."
           );
         }
@@ -438,7 +437,7 @@ async function fetchBlob(url, { noCache = false } = {}) {
 
 async function fetchJsonScryfall(url) {
   // Scryfall has open CORS — never proxy. Footer promises "Scryfall is fetched
-  // directly". The generic fetchJson() falls through to corsproxy.io on 5xx,
+  // directly". The generic fetchJson() falls through to the proxy Worker on 5xx,
   // which would leak the user's full card list to the proxy operator during
   // any Scryfall outage. Retry direct instead; if Scryfall is down, the proxy
   // would just forward the same upstream error anyway.
@@ -1045,7 +1044,7 @@ async function fetchEdhrecDecklist(deckHash) {
 
 async function fetchProxiedText(url, label) {
   // Try direct first; some sources CORS-allow, most don't. Fall through to
-  // corsproxy.io on failure. 4xx anywhere is fatal — the deck is private
+  // the proxy Worker on failure. 4xx anywhere is fatal — the deck is private
   // or the id is wrong; retrying through the proxy won't help.
   let r;
   try {
@@ -1075,24 +1074,13 @@ async function fetchScryfallDeckText(deckId) {
 }
 
 async function fetchDeckboxText(setId) {
-  // Deckbox's `?format=tcg` export ships `N Card Name` lines. Three things
-  // can come back as HTML instead:
-  //   1. Deckbox login redirect (private set) — the common case
-  //   2. corsproxy.io rate-limit page (200 with HTML body) — same hazard
-  //      `parseJsonStrict` documents for the JSON path; a public set would
-  //      be misreported as private without this branch
-  //   3. Some unexpected upstream HTML — generic fallback
-  // We sniff a wider window (500 chars) so `<!DOCTYPE html>` plus the
-  // service-identifying string both fit before the cutoff.
+  // Deckbox's `?format=tcg` export ships `N Card Name` lines. A Deckbox
+  // login redirect (private set — the common case) or other upstream
+  // hiccup comes back as HTML instead. We sniff a wide window (500 chars)
+  // so `<!DOCTYPE html>` fits before the cutoff.
   const text = await fetchProxiedText(DECKBOX_EXPORT(setId), "Deckbox");
   const head = text.trimStart().slice(0, 500).toLowerCase();
   if (head.includes("<html") || head.includes("<!doctype")) {
-    if (head.includes("corsproxy")) {
-      throw new Error(
-        "corsproxy.io rate-limited the Deckbox request. Wait a minute and try again, " +
-        "or copy the decklist into the Paste decklist tab."
-      );
-    }
     throw new Error(
       `Deckbox set '${setId}' looks private (export returned HTML). ` +
       "Make the set public, or copy the decklist into the Paste decklist tab.",
@@ -1135,7 +1123,7 @@ async function fetchMtgdecksText(path) {
     if (r && r.status >= 400 && r.status < 500) {
       throw new FatalFetchError(`${r.status} ${r.statusText}`);
     }
-    // Fallback to the corsproxy in case the direct CORS allowance ever flips.
+    // Fallback to the proxy Worker in case the direct CORS allowance ever flips.
     r = await fetch(CORS_PROXY(url));
     if (!r.ok) {
       if (r.status >= 400 && r.status < 500) {
@@ -2281,7 +2269,7 @@ async function loadJobs(opts) {
   const sourceLabel = source === "archidekt" ? "Archidekt" : "Moxfield";
   setStatus(`Fetching deck from ${sourceLabel}...`);
   const base = source === "archidekt" ? ARCHIDEKT(args[0]) : MOXFIELD(args[0]);
-  // Default to the cached deck (cheap; spares corsproxy + the deck host). Only
+  // Default to the cached deck (cheap; spares the proxy + the deck host). Only
   // bypass the cache when the user ticked "Force-refresh" — i.e. they just
   // edited the deck upstream and need the change to land now.
   const url = opts.freshDeck ? cacheBust(base) : base;
@@ -2297,9 +2285,9 @@ async function loadJobs(opts) {
     }
     throw new Error(`Failed to fetch deck: ${e.message}`);
   }
-  // Cheap shape check before we trust the response. corsproxy.io can MITM
-  // these endpoints; an injected payload that doesn't match expectations
-  // should fail loudly here instead of feeding garbage downstream.
+  // Cheap shape check before we trust the response. Anything between us and
+  // the deck host could hand back an unexpected payload; one that doesn't
+  // match expectations should fail loudly instead of feeding garbage downstream.
   if (source === "archidekt" && !Array.isArray(deck.cards)) {
     throw new Error("Archidekt response missing `cards` array — proxy or upstream tampering?");
   }
