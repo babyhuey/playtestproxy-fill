@@ -1,0 +1,7 @@
+name = "playtestproxy-cors"
+main = "cors-proxy.js"
+compatibility_date = "2026-08-01"
+
+kv_namespaces = [
+  { binding = "STATS", id = "fc5ada062bab4322bdfd6c2620c4b078" }
+]

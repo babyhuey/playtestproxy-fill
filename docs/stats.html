@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>playtestproxy-fill — usage</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .stats-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    .stats-table th, .stats-table td { text-align: left; padding: 0.4rem 0.75rem; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }
+    .stats-table th:not(:first-child), .stats-table td:not(:first-child) { text-align: right; }
+    .stats-table .breakdown { font-size: 0.85em; opacity: 0.75; text-align: left; }
+    .stats-table tfoot td { font-weight: 600; border-top: 2px solid rgba(128, 128, 128, 0.4); }
+  </style>
+</head>
+<body>
+<header>
+  <h1>playtestproxy-fill usage</h1>
+  <p>Anonymous daily counters from the proxy Worker — page views, first-time browsers, completed builds by deck source. No IPs or identifiers are stored.</p>
+</header>
+<main>
+  <section class="card">
+    <div id="stats-status">Loading…</div>
+    <table class="stats-table" id="stats-table" hidden>
+      <thead>
+        <tr><th>Day (UTC)</th><th>Views</th><th>New browsers</th><th>Builds</th><th class="breakdown">By source</th></tr>
+      </thead>
+      <tbody></tbody>
+      <tfoot></tfoot>
+    </table>
+    <p class="hint small"><a href="index.html">← back to the builder</a></p>
+  </section>
+</main>
+<script>
+(async () => {
+  const status = document.getElementById("stats-status");
+  const table = document.getElementById("stats-table");
+  try {
+    const r = await fetch("https://playtestproxy-cors.babyhuey23.workers.dev/stats");
+    if (!r.ok) throw new Error(`stats endpoint returned ${r.status}`);
+    const { days } = await r.json();
+    const dates = Object.keys(days).sort().reverse();
+    if (!dates.length) { status.textContent = "No data yet."; return; }
+    const tbody = table.querySelector("tbody");
+    const totals = { views: 0, uniques: 0, builds: 0 };
+    for (const day of dates) {
+      const d = days[day];
+      const builds = Object.values(d.builds).reduce((a, b) => a + b, 0);
+      totals.views += d.views; totals.uniques += d.uniques; totals.builds += builds;
+      const breakdown = Object.entries(d.builds).sort((a, b) => b[1] - a[1])
+        .map(([s, n]) => `${s} ${n}`).join(" · ");
+      const tr = document.createElement("tr");
+      for (const val of [day, d.views, d.uniques, builds, breakdown]) {
+        const td = document.createElement("td");
+        td.textContent = String(val);
+        tr.appendChild(td);
+      }
+      tr.lastChild.className = "breakdown";
+      tbody.appendChild(tr);
+    }
+    const tf = document.createElement("tr");
+    for (const val of ["Total", totals.views, totals.uniques, totals.builds, ""]) {
+      const td = document.createElement("td");
+      td.textContent = String(val);
+      tf.appendChild(td);
+    }
+    table.querySelector("tfoot").appendChild(tf);
+    status.hidden = true;
+    table.hidden = false;
+  } catch (e) {
+    status.textContent = `Couldn't load stats: ${e.message}`;
+  }
+})();
+</script>
+</body>
+</html>
