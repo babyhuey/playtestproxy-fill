@@ -183,7 +183,7 @@ Sideboard
 </main>
 
 <footer>
-  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through this site's own Cloudflare Worker (<a href="https://github.com/babyhuey/playtestproxy-fill/blob/main/worker/cors-proxy.js" target="_blank" rel="noopener">source</a>), so no third-party proxy operator sees the requests — only Cloudflare, which already fronts most of these APIs. Scryfall (cards + decks) and the bundled image are fetched directly; a card image that Scryfall's CDN fails to serve falls back through the <a href="https://images.weserv.nl/" target="_blank" rel="noopener">images.weserv.nl</a> proxy.</span>
+  <span>Deck-builder API traffic (Archidekt, Moxfield, Deckbox, TappedOut, EDHREC) is routed through this site's own Cloudflare Worker (<a href="https://github.com/babyhuey/playtestproxy-fill/blob/main/worker/cors-proxy.js" target="_blank" rel="noopener">source</a>), so no third-party proxy operator sees the requests — only Cloudflare, which already fronts most of these APIs. The Worker also keeps anonymous daily usage counts (page views and completed builds; no IPs or identifiers are stored). Scryfall (cards + decks) and the bundled image are fetched directly; a card image that Scryfall's CDN fails to serve falls back through the <a href="https://images.weserv.nl/" target="_blank" rel="noopener">images.weserv.nl</a> proxy.</span>
   <span class="version" id="version-info">loading…</span>
 </footer>
 

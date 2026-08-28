@@ -306,7 +306,10 @@ upload.py <images_dir>
   was dropped in Aug 2026 when it went key-required and its console
   couldn't register `*.github.io` origins. The Archidekt / Moxfield
   JSON APIs are undocumented but have proven stable. The footer of the
-  web app discloses the proxy relationship.
+  web app discloses the proxy relationship. The Worker also keeps
+  anonymous daily usage counters in Workers KV (page views, first-time
+  browsers, completed builds by deck source — aggregate integers only),
+  shown at [`stats.html`](https://babyhuey.github.io/playtestproxy-fill/stats.html).
 - Card images come straight from Scryfall's CDN. When the CDN returns a
   404 (usually a negatively-cached miss on one format), both the CLI and
   frontend retry the `large` / `normal` JPG variants, then fall back to

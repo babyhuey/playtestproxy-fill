@@ -31,8 +31,28 @@ const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg
 // strips the subdomain and the key then 401s from the real origin). The
 // Worker only proxies the allowlisted deck hosts; keep its allowlist in sync
 // when adding a deck source.
-const CORS_PROXY = (url) =>
-  `https://playtestproxy-cors.babyhuey23.workers.dev/?url=${encodeURIComponent(url)}`;
+const WORKER_BASE = "https://playtestproxy-cors.babyhuey23.workers.dev";
+const CORS_PROXY = (url) => `${WORKER_BASE}/?url=${encodeURIComponent(url)}`;
+
+// Anonymous usage counters, aggregated per-day in the Worker's KV (see
+// worker/cors-proxy.js; readable at /stats). No identifiers leave the
+// browser — "new" is a localStorage first-visit flag, nothing more.
+// Fire-and-forget: a failed ping must never affect a build.
+function sendPing(event, src) {
+  let qs = `e=${event}`;
+  if (event === "view") {
+    try {
+      if (!localStorage.getItem("ptp-seen")) {
+        localStorage.setItem("ptp-seen", "1");
+        qs += "&new=1";
+      }
+    } catch { /* storage blocked (private mode) — count the view, skip uniqueness */ }
+  } else if (src) {
+    qs += `&src=${encodeURIComponent(src)}`;
+  }
+  fetch(`${WORKER_BASE}/ping?${qs}`).catch(() => {});
+}
+let lastBuildSource = null;
 
 function cacheBust(url) {
   // Deck hosts serve `cache-control: public, max-age=3600`, so the browser
@@ -2207,6 +2227,7 @@ async function loadJobs(opts) {
       setProgress(i, n);
       setStatus(`Resolving ${i}/${n}: ${name}`);
     });
+    lastBuildSource = "decklist";
     return { jobs, deckLabel: "Pasted decklist", unresolved };
   }
 
@@ -2217,6 +2238,7 @@ async function loadJobs(opts) {
     );
   }
   const { source, args } = detected;
+  lastBuildSource = source;
 
   if (source === "deckstats" || source === "mtggoldfish") {
     // Auto-fallback: flip the UI over to Paste decklist and pre-pop the
@@ -2652,6 +2674,7 @@ async function run() {
         ? "Done. Click Download ZIP, then upload it as-is with TCGPlaytest's Upload Deck ZIP button."
         : "Done. Click Download ZIP, extract, and drag the images into TCGPlaytest's Fronts uploader.";
     setStatus(hadFailures ? `${message} (some cards failed — see below)` : message, hadFailures ? "" : "ok");
+    sendPing("build", lastBuildSource);
   }
   els.go.disabled = false;
   hideCancelButton();
@@ -2966,3 +2989,5 @@ els.couponCopy.addEventListener("click", () =>
     el.textContent = "dev build";
   }
 })();
+
+sendPing("view");
