@@ -23,12 +23,15 @@ const MOXFIELD = (id) => `https://api2.moxfield.com/v3/decks/all/${id}`;
 const TAPPEDOUT_TXT = (slug) => `https://tappedout.net/mtg-decks/${slug}/?fmt=txt`;
 const SCRYFALL_DECK_EXPORT = (id) => `https://api.scryfall.com/decks/${id}/export/text`;
 const DECKBOX_EXPORT = (id) => `https://deckbox.org/sets/${id}/export?format=tcg`;
-// corsproxy.io's documented API is `?url=<encoded>`. Verified 2026-07-04
-// from a real browser (deployed GitHub Pages origin AND localhost) against
-// the Archidekt API: both this form and the legacy bare `?<encoded>` form
-// returned the deck JSON. curl gets 403 from both — the proxy blocks
-// non-browser clients, so re-verification must happen in a browser.
-const CORS_PROXY = (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+// corsproxy.io went key-required in Aug 2026: `?key=<key>&url=<encoded>`;
+// keyless requests get 401 `{"error":"A valid API key is required..."}`.
+// The key below is free-tier (10k requests + 1GB/month) and locked to the
+// babyhuey.github.io origin in the corsproxy console, so shipping it in this
+// public file is their intended browser-app model — but it also means the
+// proxy 401s from localhost; test deck fetches against the deployed site.
+const CORS_PROXY_KEY = "517b01fb";
+const CORS_PROXY = (url) =>
+  `https://corsproxy.io/?key=${CORS_PROXY_KEY}&url=${encodeURIComponent(url)}`;
 
 function cacheBust(url) {
   // Deck-builder APIs answer through corsproxy.io with
@@ -299,6 +302,7 @@ async function withRetry(fn, attempts = 3, baseDelay = 400) {
 }
 
 class FatalFetchError extends Error {}  // 4xx — don't retry through proxy
+class ProxyAuthError extends FatalFetchError {}  // corsproxy rejected OUR key, not the deck
 class RateLimitError extends Error {
   // delayMs: how long withRetry should pause before the next attempt. Sourced
   // from the response's Retry-After header when present, otherwise from
@@ -348,7 +352,20 @@ async function fetchJson(url) {
     }
     const r = await fetch(CORS_PROXY(url), { headers: { Accept: "application/json" }, signal: buildAbort?.signal });
     if (!r.ok) {
-      // The proxy faithfully forwards upstream status, so 4xx here is also
+      // A 401/403 whose body mentions "API key" is corsproxy rejecting OUR
+      // key (invalid, inactive, or this origin not registered in the
+      // corsproxy console) — blame the proxy, not the deck host.
+      if (r.status === 401 || r.status === 403) {
+        const body = await r.text().catch(() => "");
+        if (/api key/i.test(body)) {
+          throw new ProxyAuthError(
+            "corsproxy.io rejected this site's API key (invalid, inactive, or origin not registered). " +
+              "This is a site configuration problem, not a problem with your deck."
+          );
+        }
+        throw new FatalFetchError(`${r.status} ${r.statusText}`);
+      }
+      // The proxy faithfully forwards upstream status, so other 4xx here is
       // authoritative (deck not found / private). Surface it as fatal so
       // the user sees a clean message instead of "proxy 404".
       if (r.status >= 400 && r.status < 500) {
@@ -2272,6 +2289,7 @@ async function loadJobs(opts) {
   try {
     deck = await fetchJson(url);
   } catch (e) {
+    if (e instanceof ProxyAuthError) throw new Error(e.message);
     if (e instanceof FatalFetchError) {
       throw new Error(
         `${sourceLabel} returned ${e.message}. The deck doesn't exist, is private, or the URL is wrong.`
