@@ -30,10 +30,10 @@ The frontend covers the same options as the CLI:
   count and optional doubler multiplier (Conservative / Standard / Aggressive)
 - Image quality — PNG (best, default) or Large JPG (~10× smaller and faster)
 - Custom default back — file upload, URL paste, or pick one of the
-  bundled presets (Playtest Copy, Lord of the Proxies, TCGPlaytest logo,
-  the original "You Wouldn't Proxy" meme back, or the SpongeBob
-  "iS iT a ReAl cArD?" back — the last two are meme-resolution and may
-  trip tcgplaytest's low-res warning)
+  bundled presets (Playtest Copy, Lord of the Proxies, the original
+  "You Wouldn't Proxy" meme back, or the SpongeBob "iS iT a ReAl cArD?"
+  back — the last two are meme-resolution and may trip tcgplaytest's
+  low-res warning)
 - Skip cards you own — upload a ManaBox export or any CSV with Name +
   Quantity columns and owned copies are subtracted from the deck before
   building (matched by card name; printing and foil are ignored)
@@ -208,9 +208,9 @@ slug matches the suffix of the generated filename (e.g. `045_Sol_Ring.png`
 The bundled `assets/default_back.png` (a community "PROXY / Playtest
 Copy / NOT FOR SALE" back in the classic card-back style, found via
 r/mpcproxies) is used by default. Override with `--default-back PATH` —
-`assets/backs/` ships alternates (Lord of the Proxies, the TCGPlaytest
-logo back, the original low-res "You Wouldn't Proxy" meme back, and the
-SpongeBob "iS iT a ReAl cArD?" back).
+`assets/backs/` ships alternates (Lord of the Proxies, the original
+low-res "You Wouldn't Proxy" meme back, and the SpongeBob "iS iT a ReAl
+cArD?" back).
 The web frontend has both a file picker and a URL paste field for the
 same purpose.
 
@@ -340,9 +340,9 @@ images are fetched at runtime from the public
 
 The bundled default back and the alternates in `assets/backs/` are
 community-made proxy backs in the style of the classic card back
-(shared on r/mpcproxies and similar communities), plus TCGPlaytest's
-own logo back; they are fan art and no copyright claim is made on
-them. Replace with `--default-back` if you'd rather not ship them.
+(shared on r/mpcproxies and similar communities); they are fan art and
+no copyright claim is made on them. Replace with `--default-back` if
+you'd rather not ship them.
 
 If you believe content in this repo infringes your rights, please open
 an issue or email the maintainer; we'll act in good faith.
